@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import tomllib
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -308,9 +309,97 @@ def dumps(cfg: Config) -> str:
     return "\n".join(lines)
 
 
+_SECTION = re.compile(r"^\s*\[([A-Za-z0-9_]+)\]\s*$")
+_KEY = re.compile(r"^(\s*)([A-Za-z0-9_]+)(\s*)=")
+
+
+def _patch(text: str, cfg: Config) -> str:
+    """Rewrite the values of an existing config, keeping every comment.
+
+    The tuner adopts a setting by saving the file again. Regenerating it from
+    scratch dropped the comments that explain *why* each value is what it is -
+    the only documentation the file has - so values are edited in place and
+    anything the dataclasses do not own (prose, comments, ordering) survives.
+    """
+    out: list[str] = []
+    section: str | None = None
+    written: set[tuple[str, str]] = set()
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        header = _SECTION.match(line)
+        if header:
+            section = header.group(1)
+            out.append(line)
+            index += 1
+            continue
+        key = _KEY.match(line)
+        owner = getattr(cfg, section, None) if section else None
+        if key is None or owner is None or not is_dataclass(owner):
+            out.append(line)
+            index += 1
+            continue
+        name = key.group(2)
+        known = {f.name for f in fields(owner)}
+        if name not in known:
+            out.append(line)
+            index += 1
+            continue
+        value = getattr(owner, name)
+        written.add((section, name))
+        rest = line.split("=", 1)[1].lstrip()
+        if rest.startswith('"""') and '"""' not in rest[3:]:
+            # A multi-line string: replace the whole block, not just its first line.
+            index += 1
+            while index < len(lines) and '"""' not in lines[index]:
+                index += 1
+            index += 1
+            out.append(f"{key.group(1)}{name} = {_fmt(value)}")
+            continue
+        out.append(f"{key.group(1)}{name} = {_fmt(value)}")
+        index += 1
+
+    for f in fields(cfg):
+        if f.name == "source" or not is_dataclass(getattr(cfg, f.name)):
+            continue
+        section_obj = getattr(cfg, f.name)
+        missing = [sf for sf in fields(section_obj) if (f.name, sf.name) not in written]
+        if not missing:
+            continue
+        block = [f"{sf.name} = {_fmt(getattr(section_obj, sf.name))}" for sf in missing]
+        at = _section_end(out, f.name)
+        if at is None:
+            out.extend(["", f"[{f.name}]", *block])
+        else:
+            out[at:at] = block
+    return "\n".join(out) + "\n"
+
+
+def _section_end(lines: list[str], name: str) -> int | None:
+    """The index just past the last setting line of ``[name]``."""
+    start = None
+    for i, line in enumerate(lines):
+        header = _SECTION.match(line)
+        if header and header.group(1) == name:
+            start = i + 1
+            break
+    if start is None:
+        return None
+    end = start
+    for i in range(start, len(lines)):
+        if _SECTION.match(lines[i]):
+            break
+        if _KEY.match(lines[i]):
+            end = i + 1
+    return end
+
+
 def save(cfg: Config, path: str | os.PathLike[str] | None = None) -> Path:
     default = cfg.source or (cfg.data_dir / "config.toml")
     target = Path(os.path.expanduser(str(path))) if path else default
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(dumps(cfg), encoding="utf-8")
+    existing = target.read_text(encoding="utf-8") if target.is_file() else None
+    target.write_text(_patch(existing, cfg) if existing else dumps(cfg), encoding="utf-8")
+    cfg.source = target
     return target

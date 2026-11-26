@@ -169,6 +169,76 @@ class TestValidation(ConfigTestCase):
         self.assertFalse((self.tmp / "config.toml").exists())
 
 
+class TestSaveKeepsComments(ConfigTestCase):
+    """Saving after adopting a tuner setting must not erase the file's prose."""
+
+    COMMENTED = (
+        "# Hauhau configuration.\n"
+        "# Edit freely.\n"
+        "\n"
+        "[model]\n"
+        "gguf = \"/tmp/m.gguf\"\n"
+        "n_ctx = 8192\n"
+        "# Why this number: measured on this machine.\n"
+        "n_threads = 4\n"
+        "\n"
+        "[agent]\n"
+        "name = \"Hau\"\n"
+        "personality = \"\"\"You are {name}.\n"
+        "Keep it short.\"\"\"\n"
+    )
+
+    def write(self, text: str) -> Path:
+        path = self.tmp / "config.toml"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_comments_and_prose_survive_a_value_change(self) -> None:
+        path = self.write(self.COMMENTED)
+        cfg, _ = load(path)
+        cfg.model.n_ctx = 16384
+        saved = config_mod.save(cfg, path).read_text(encoding="utf-8")
+        self.assertIn("# Hauhau configuration.", saved)
+        self.assertIn("# Edit freely.", saved)
+        self.assertIn("# Why this number: measured on this machine.", saved)
+        self.assertIn("n_ctx = 16384", saved)
+        self.assertNotIn("n_ctx = 8192", saved)
+
+    def test_a_multi_line_string_is_replaced_whole(self) -> None:
+        path = self.write(self.COMMENTED)
+        cfg, _ = load(path)
+        cfg.agent.personality = "You are {name}. Be brief."
+        saved = config_mod.save(cfg, path).read_text(encoding="utf-8")
+        self.assertNotIn("Keep it short.", saved)
+        again, _ = load(path)
+        self.assertEqual(again.agent.personality, "You are {name}. Be brief.")
+
+    def test_a_missing_key_is_added_to_its_section(self) -> None:
+        path = self.write("[model]\ngguf = \"/tmp/m.gguf\"\n\n[agent]\nname = \"Hau\"\n")
+        cfg, _ = load(path)
+        cfg.model.n_threads = 6
+        saved = config_mod.save(cfg, path).read_text(encoding="utf-8")
+        model_section = saved.split("[agent]")[0]
+        self.assertIn("n_threads = 6", model_section)
+        again, _ = load(path)
+        self.assertEqual(again.model.n_threads, 6)
+        self.assertEqual(again.agent.name, "Hau")
+
+    def test_an_unknown_key_is_left_alone(self) -> None:
+        path = self.write("[model]\ngguf = \"/tmp/m.gguf\"\ncustom_knob = 3\n")
+        cfg, _ = load(path)
+        config_mod.save(cfg, path)
+        self.assertIn("custom_knob = 3", path.read_text(encoding="utf-8"))
+
+    def test_a_new_file_is_written_in_full(self) -> None:
+        target = self.tmp / "fresh.toml"
+        cfg = Config()
+        cfg.model.gguf = "/tmp/m.gguf"
+        config_mod.save(cfg, target)
+        again, _ = load(target)
+        self.assertEqual(again.model.gguf, "/tmp/m.gguf")
+
+
 class TestGgufDiscovery(ConfigTestCase):
     def test_env_override_wins(self) -> None:
         os.environ["HAUHAU_GGUF"] = "/tmp/custom.gguf"

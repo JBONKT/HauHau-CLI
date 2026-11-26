@@ -510,6 +510,7 @@ class Repl:
                     store,
                     run,
                     self.cfg.agent.personality,
+                    tries=3,
                     progress=progress.update,
                 )
             except LLMError as exc:

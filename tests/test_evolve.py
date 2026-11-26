@@ -235,6 +235,96 @@ class TestEvolvePrompt(unittest.TestCase):
         self.assertIn("rewrite failed", result.reason)
 
 
+class TestMultipleAttempts(unittest.TestCase):
+    """One rewrite is usually a tie; several, keeping the best, can still win."""
+
+    class ScriptedClient(FakeClient):
+        def __init__(self, texts: list[str]) -> None:
+            super().__init__()
+            self.texts = list(texts)
+
+        def chat(self, messages, tools=None, **kwargs) -> Completion:
+            self.calls.append({"messages": messages, "tools": tools, **kwargs})
+            return Completion(content=self.texts.pop(0), tool_calls=[], finish_reason="stop")
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = PromptStore(Path(self._tmp.name) / "prompts")
+        self.current = "You are {name}. Be careful. " + "c" * 250
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def scripted(self, scores: list[tuple[int, int]]):
+        calls: list[str] = []
+
+        def run(text: str) -> SuiteResult:
+            passed, total = scores.pop(0)
+            calls.append(text)
+            result = SuiteResult(passed=passed, total=total)
+            if passed < total:
+                result.failures = [("python-version", "called rag_query (wanted read_file)")]
+            return result
+
+        return run, calls
+
+    def test_a_later_attempt_can_be_the_one_that_wins(self) -> None:
+        client = self.ScriptedClient(["You are {name}. Tie. " + "t" * 250, "You are {name}. Win. " + "w" * 250])
+        run, _calls = self.scripted([(4, 12), (4, 12), (9, 12)])
+        result = evolve_prompt(client, self.store, run, self.current, tries=3)
+        self.assertTrue(result.accepted, result.reason)
+        self.assertEqual(result.attempts, 2)
+        self.assertIn("Win", self.store.text(result.version))
+
+    def test_it_stops_at_the_first_winner(self) -> None:
+        client = self.ScriptedClient(["You are {name}. Win. " + "w" * 250, "You are {name}. Later. " + "l" * 250])
+        run, calls = self.scripted([(4, 12), (9, 12)])
+        evolve_prompt(client, self.store, run, self.current, tries=3)
+        self.assertEqual(len(client.calls), 1, "no further attempts after an adoption")
+        self.assertEqual(len(calls), 2, "baseline plus one candidate")
+
+    def test_attempts_are_asked_at_different_temperatures(self) -> None:
+        client = self.ScriptedClient(["x" * 400, "y" * 400, "z" * 400])
+        run, _ = self.scripted([(4, 12), (3, 12), (3, 12), (3, 12)])
+        evolve_prompt(client, self.store, run, self.current, tries=3)
+        self.assertEqual([c["temperature"] for c in client.calls], [0.4, 0.7, 0.9])
+
+    def test_every_attempt_is_named_in_the_reason(self) -> None:
+        client = self.ScriptedClient(["a" * 400, self.current, "b" * 400])
+        run, _ = self.scripted([(4, 12), (3, 12), (3, 12)])
+        result = evolve_prompt(client, self.store, run, self.current, tries=3)
+        self.assertFalse(result.accepted)
+        self.assertIn("attempt 1", result.reason)
+        self.assertIn("attempt 2", result.reason)
+        self.assertIn("same prompt", result.reason)
+        self.assertIn("attempt 3", result.reason)
+
+    def test_a_repeated_candidate_is_not_scored_twice(self) -> None:
+        client = self.ScriptedClient(["d" * 400, "d" * 400])
+        run, calls = self.scripted([(4, 12), (3, 12)])
+        evolve_prompt(client, self.store, run, self.current, tries=2)
+        self.assertEqual(len(calls), 2, "the duplicate is skipped before the suite runs")
+
+    def test_a_failure_after_a_scored_candidate_keeps_the_verdict(self) -> None:
+        class HalfwayClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.count = 0
+
+            def chat(self, messages, tools=None, **kwargs) -> Completion:
+                self.count += 1
+                if self.count == 1:
+                    return Completion(content="e" * 400, tool_calls=[], finish_reason="stop")
+                raise LLMError("down")
+
+        run, calls = self.scripted([(4, 12), (3, 12)])
+        result = evolve_prompt(HalfwayClient(), self.store, run, self.current, tries=2)
+        self.assertFalse(result.accepted)
+        self.assertIn("no improvement", result.reason)
+        self.assertIn("rewrite failed", result.reason)
+        self.assertEqual(len(calls), 2)
+
+
 class TestVersionNumbers(unittest.TestCase):
     """A rollback point must never be overwritten."""
 

@@ -57,6 +57,13 @@ Tasks from the behavioural test suite that the current prompt FAILS:
 {failures}
 
 Rewrite the prompt so those failures stop happening. Keep what already works.
+
+How to read a failure: "called X (wanted Y)" means the agent reached for the
+wrong tool, so the prompt has to say which kind of question is answered from
+which source - the contents of a file on disk are read with a file tool, never
+recalled from memory. "answered in prose" means it talked instead of acting.
+"answer did not contain" means it answered before checking anything.
+
 Hard rules:
 - Third person instructions to the agent, no examples of conversations.
 - Keep it under {limit} characters.
@@ -88,6 +95,7 @@ class Evolution:
     reason: str
     version: int | None = None
     text: str = ""
+    attempts: int = 0
 
 
 class PromptStore:
@@ -234,9 +242,16 @@ def evolve_prompt(
     current: str,
     *,
     max_chars: int = MAX_CHARS,
+    tries: int = 1,
+    temperatures: tuple[float, ...] = (0.4, 0.7, 0.9),
     progress: Callable[[str], None] | None = None,
 ) -> Evolution:
-    """Ask the model for a better prompt; adopt it only if the suite improves."""
+    """Ask the model for a better prompt; adopt it only if the suite improves.
+
+    One rewrite from a 2B model usually lands on the same score as the prompt it
+    replaced, so ``tries`` asks for several and keeps the first that wins. The
+    gate is unchanged: nothing is adopted without a strictly better suite score.
+    """
     if progress is not None:
         progress("scoring the current prompt")
     baseline = run(current)
@@ -247,42 +262,69 @@ def evolve_prompt(
 
     failures = "\n".join(f"- {name}: {detail}" for name, detail in baseline.failures) or "- (none)"
     prompt = REWRITE_PROMPT.format(current=current, failures=failures, limit=max_chars - 100)
-    if progress is not None:
-        progress("asking the model for a new prompt")
-    try:
-        completion = client.chat(
-            [{"role": "user", "content": prompt}], None, think=False, temperature=0.4, max_tokens=900
-        )
-    except LLMError as exc:
-        return Evolution(baseline.score, 0.0, False, f"rewrite failed: {exc}")
+    attempts = max(1, tries)
+    seen = {current.strip()}
+    notes: list[str] = []
+    best: tuple[float, str] | None = None
 
-    candidate = _clean(completion.content)
-    reason = validate(candidate, current=current)
-    if reason is not None:
-        return Evolution(baseline.score, 0.0, False, f"candidate rejected: {reason}")
-    if candidate.strip() == current.strip():
-        return Evolution(baseline.score, baseline.score, False, "the model returned the same prompt")
+    def label(index: int) -> str:
+        return f"attempt {index + 1}: " if attempts > 1 else ""
 
-    if progress is not None:
-        progress("scoring the candidate prompt")
-    scored = run(candidate)
-    if scored.score <= baseline.score:
-        return Evolution(
-            baseline.score,
-            scored.score,
-            False,
-            f"no improvement ({baseline.summary()} → {scored.summary()})",
-            text=candidate,
-        )
+    for index in range(attempts):
+        temperature = temperatures[index % len(temperatures)]
+        if progress is not None:
+            progress(f"asking the model for a new prompt {index + 1}/{attempts}")
+        try:
+            completion = client.chat(
+                [{"role": "user", "content": prompt}],
+                None,
+                think=False,
+                temperature=temperature,
+                max_tokens=900,
+            )
+        except LLMError as exc:
+            if not notes:
+                return Evolution(baseline.score, 0.0, False, f"rewrite failed: {exc}")
+            notes.append(f"{label(index)}rewrite failed: {exc}")
+            break
 
-    parent = store.active_number()
-    version = store.add(candidate, parent=parent, score=scored.score)
-    store.activate(version.number)
+        candidate = _clean(completion.content)
+        reason = validate(candidate, current=current)
+        if reason is not None:
+            notes.append(f"{label(index)}candidate rejected: {reason}")
+            continue
+        if candidate.strip() in seen:
+            notes.append(f"{label(index)}the model returned the same prompt")
+            continue
+        seen.add(candidate.strip())
+
+        if progress is not None:
+            progress("scoring the candidate prompt")
+        scored = run(candidate)
+        if best is None or scored.score > best[0]:
+            best = (scored.score, candidate)
+        if scored.score > baseline.score:
+            parent = store.active_number()
+            version = store.add(candidate, parent=parent, score=scored.score)
+            store.activate(version.number)
+            return Evolution(
+                baseline.score,
+                scored.score,
+                True,
+                f"adopted v{version.number} ({baseline.summary()} → {scored.summary()})",
+                version=version.number,
+                text=candidate,
+                attempts=index + 1,
+            )
+        notes.append(f"{label(index)}no improvement ({baseline.summary()} → {scored.summary()})")
+
+    if best is None:
+        return Evolution(baseline.score, 0.0, False, "; ".join(notes) or "no candidate was produced")
     return Evolution(
         baseline.score,
-        scored.score,
-        True,
-        f"adopted v{version.number} ({baseline.summary()} → {scored.summary()})",
-        version=version.number,
-        text=candidate,
+        best[0],
+        False,
+        "; ".join(notes) or f"no improvement ({baseline.summary()})",
+        text=best[1],
+        attempts=len(notes),
     )

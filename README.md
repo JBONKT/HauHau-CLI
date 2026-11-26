@@ -365,14 +365,25 @@ yourself, so the tuner cannot smuggle in `--host` or a different model path.
 A value is adopted only if it beats the best by 2 %. On this machine the honest
 answer was *nothing*: 29.5 and 29.9 tok/s against a 29.7 baseline is noise, so
 the config was left alone. Adopted values are snapshotted and written to
-`config.toml`, and every trial is appended to `evolve/tuning.jsonl`.
+`config.toml`, and every trial is appended to `evolve/tuning.jsonl`. Saving
+edits the file's values in place, so the comments that explain why each one is
+set the way it is survive an adoption — regenerating the file from the
+dataclasses silently deleted them once.
 
 **`/evolve` — the prompt rewrite, gated.** Seeds `v1` with the current prompt,
-scores it, asks the model for an improved version using the failing tasks as
-feedback, scores that, and **adopts only on a strictly higher score**. Measured
-here: a deliberately weak poetic prompt scored 10/14 (71 %), the rewrite reached
-14/14 and was adopted as `v2`; a rewrite of the already-good prompt also scored
-13/14 and was *rejected*, so the agent did not churn.
+scores it, then asks the model for up to three rewrites at rising temperature
+using the failing tasks as feedback, scoring each, and **adopts the first that
+scores strictly higher**. Measured here: a deliberately weak poetic prompt
+scored 10/14 (71 %), the rewrite reached 14/14 and was adopted as `v2`.
+
+Against the current 13/14 prompt the gate has held nine times, and the spread is
+the interesting part — three attempts at 0.4/0.7/0.9 scored 12/14, 13/14 and
+11/14; a rewrite with thinking on named the exact routing rule the failure asks
+for and still scored 13/14. Hand-written candidates that added one routing
+sentence reached 13/14 and 10/14. One rewrite is a coin flip, so several are
+asked for; nothing wins, because the last failure is the model's tool choice on
+one phrasing, not the prompt's clarity. That is what a gate is for: the file
+says `kept the current prompt`, and the reason is now in the audit trail.
 
 **`/prompt [vN]` — history and rollback.** Versions live in
 `<data_dir>/evolve/prompts/versions/v<N>.md` with a JSONL index and an `active`
