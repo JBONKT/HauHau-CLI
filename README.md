@@ -33,6 +33,12 @@ next turn works); `/perf`; `--resume last` and an explicit session id; `--think`
 traceback); piped output (answer only on stdout); and the agent starting and
 stopping its own server.
 
+The full-screen interface is verified in a terminal emulator, not by eye: a pty
+run is rendered through `pyte` and asserted on — 24×100 and 14×50, header on row
+0, chrome pinned to the bottom, a long transcript scrolled out of a fixed frame,
+`PgUp` freezing the view, typing resuming the newest line, and a live
+`SIGWINCH` resize re-wrapping the text.
+
 ## Setup (macOS)
 
 Prerequisites, both from Homebrew:
@@ -87,20 +93,33 @@ Runtime state — memory, audit log, sessions, snapshots, server log — lives i
 
 ## The interface
 
+On a terminal on both ends this is a **fixed, full-screen layout**: nothing
+ever scrolls the terminal itself, the frame is redrawn in place.
+
 ```
-╭─ Hauhau ──────────────────────────────────────────────────╮
-│ Gemma-4-E2B…Q4_K_P.gguf                                   │
-│ 8192 ctx · 4 threads · 8 GB RAM · 11 memories · prompt v2 │
-│ /Users/johan/Documents/HauHau-CLI                         │
-│ http://127.0.0.1:8080 · /help for commands                │
-╰───────────────────────────────────────────────────────────╯
+ Hauhau · model Gemma-4-E2B…Q4_K_P.gguf · ctx 8192 · threads 4 · ram 8 GB   <- header
+ 11.0s · 53 tok · 27 tok/s · /help for commands · Ctrl-D exits · PgUp/PgDn  <- stats
+────────────────────────────────── chat (scrolls inside this frame) ───────
 ❯ how much disk is left?
   ⚙ shell  df -h /
     ✓ /dev/disk3s3s1  228Gi  13Gi  109Gi  11%  /  +1 lines · /show
 
 The volume is 11% full (109 GB free).
-  11.0s · 53 tok · 27 tok/s
+────────────────────────────────────────────────────────────────────────────
+ ready · write a message and press Enter                                   <- hint
+❯ _                                                                        <- input
 ```
+
+- **One screen, four fixed rows of chrome**: header, stats, hint, input. The
+  transcript gets whatever is left, is wrapped to the terminal width, and is
+  sliced to fit — the newest lines stay visible while a turn streams. `PgUp`/
+  `PgDn` (also `Ctrl-B`/`Ctrl-F`, arrows) scroll *inside that frame*; the hint
+  row says so and typing jumps back to the newest line.
+- **Everything rich lands in the chat window**: `/status` panels, `/mem` tables
+  and help boxes are captured through a `rich` console routed into the
+  transcript, so no command can paint over the layout.
+- **`--plain` (automatic when piped, or `TERM=dumb`)** keeps the streaming
+  one-line-at-a-time interface for scripts, `jq`, and editors.
 
 - **Answers render as Markdown**, not raw tokens. The model emits `**bold**`,
   bullets and fences constantly, so tokens accumulate into a Live region that
@@ -121,9 +140,10 @@ The volume is 11% full (109 GB free).
   `/help tune` prints usage for one command. A mistyped command gets a
   suggestion: `/modle → did you mean /model?`.
 - **Prompt:** `Tab` completes `/commands` *and* their arguments (`/prompt v` →
-  `v1 v2`, `/help ev` → `eval evolve`), `Esc`+`Enter` adds a newline, `Ctrl-C`
-  cancels generation without leaving, `Ctrl-D` exits. The bottom bar carries the
-  context size, memory count, prompt version and whether shell commands ask first.
+  `v1 v2`, `/help ev` → `eval evolve`), `Ctrl-C` cancels generation without
+  leaving (`Ctrl-C` twice, or `Ctrl-D`, exits) — in the full-screen interface it
+  restarts the backend to abort a stuck request. The stats row carries the token
+  count and rate of the last turn.
 - **Piped output stays clean**: `hauhau "what is in /tmp" | jq` gets only the
   answer on stdout — no banner, no colour, no session chatter. Markdown is left
   raw so it stays greppable.
@@ -136,7 +156,7 @@ plain text.
 
 ```bash
 .venv/bin/ruff check hauhau tests                      # clean
-.venv/bin/python -m unittest discover -s tests -t .    # 472 tests
+.venv/bin/python -m unittest discover -s tests -t .    # 496 tests
 ```
 
 ## Assumptions this build corrects
@@ -169,7 +189,8 @@ Three model quirks are handled in code, each verified against the live server:
 
 ```
 hauhau/
-  cli.py        REPL, slash commands, Rich streaming UI
+  cli.py        REPL, slash commands, picks the screen or stream UI
+  tui.py        full-screen UI: fixed frame, wrapped transcript, own scrolling
   agent.py      tool loop, system prompt, context compression
   llm.py        llama.cpp client: SSE streaming, native tools, think toggle
   server.py     owns the llama-server child process

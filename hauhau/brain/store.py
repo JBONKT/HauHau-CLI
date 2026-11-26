@@ -12,11 +12,31 @@ import array
 import math
 import re
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 
 from ..util import jaccard, norm_hash, normalize, tokens_of
+
+
+def _locked(method):
+    """Serialize DB access.
+
+    The full-screen UI runs turns on a worker thread and the self-learning
+    pass runs on its own, while the connection is created on the main thread;
+    ``check_same_thread=False`` without a lock would leave concurrent cursors
+    interleaving statements on one connection. RLock, because public methods
+    chain into each other.
+    """
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 KINDS = ("semantic", "procedural", "episodic", "preference")
 
@@ -265,16 +285,18 @@ class MemoryStore:
         self.dedupe_jaccard = dedupe_jaccard
         self.dedupe_containment = dedupe_containment
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(str(path))
+        self._lock = threading.RLock()
+        self.db = sqlite3.connect(str(path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         try:
-            self.db.executescript(SCHEMA)
-            # Rebuild the index *before* migrating: the cleanup UPDATEs below fire
-            # the FTS triggers, and a delete against an index that was never built
-            # for these rows made SQLite report "database disk image is malformed".
-            self.db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
-            self.db.commit()
-            self._migrate()
+            with self._lock:
+                self.db.executescript(SCHEMA)
+                # Rebuild the index *before* migrating: the cleanup UPDATEs below fire
+                # the FTS triggers, and a delete against an index that was never built
+                # for these rows made SQLite report "database disk image is malformed".
+                self.db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+                self.db.commit()
+                self._migrate()
         except sqlite3.OperationalError:
             # A restored backup on a read-only mount can still be searched; the
             # old unconditional rebuild made memory impossible there.
@@ -326,6 +348,7 @@ class MemoryStore:
         self.db.execute("UPDATE memories SET last_used_at = ? WHERE last_used_at > ?", (now, now))
         self.db.commit()
 
+    @_locked
     def close(self) -> None:
         self.db.close()
 
@@ -354,6 +377,7 @@ class MemoryStore:
             )
         self.db.commit()
 
+    @_locked
     def write(
         self,
         kind: str,
@@ -413,6 +437,7 @@ class MemoryStore:
         self.db.commit()
         return int(cur.lastrowid), True
 
+    @_locked
     def forget(self, row_id: int) -> bool:
         cur = self.db.execute("DELETE FROM memories WHERE id = ?", (row_id,))
         self.db.commit()
@@ -431,6 +456,7 @@ class MemoryStore:
         age_days = max(0.0, (now - reference) / 86400.0)
         return math.pow(0.5, age_days / self.half_life_days)
 
+    @_locked
     def search(
         self,
         query: str,
@@ -521,6 +547,7 @@ class MemoryStore:
                 self.db.rollback()
         return top
 
+    @_locked
     def recent(self, kind: str | None = None, limit: int = 20) -> list[Hit]:
         sql = "SELECT id, kind, text, tags, importance, uses, created_at, last_used_at FROM memories"
         params: tuple = ()
@@ -534,6 +561,7 @@ class MemoryStore:
             for r in self.db.execute(sql, params)
         ]
 
+    @_locked
     def compact(self) -> int:
         """Merge near-duplicate memories written before a dedupe change.
 
@@ -624,6 +652,7 @@ class MemoryStore:
         self.db.commit()
         return absorbed
 
+    @_locked
     def prune(self, min_weight: float = 0.02, keep_uses: int = 1) -> int:
         """Drop stale, never-reused memories. Returns the number removed."""
         now = time.time()
@@ -639,6 +668,7 @@ class MemoryStore:
             self.db.commit()
         return len(doomed)
 
+    @_locked
     def stats(self) -> dict:
         counts = {row["kind"]: row["n"] for row in self.db.execute(
             "SELECT kind, COUNT(*) AS n FROM memories GROUP BY kind")}

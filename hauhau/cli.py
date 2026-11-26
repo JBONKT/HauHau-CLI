@@ -41,6 +41,7 @@ from .llm import LLMError
 from .profiler import apply_recommendations, probe, recommend
 from .server import ServerManager
 from .tools import build_registry
+from .tui import ScreenApp, ScreenUI
 from .ui import (
     ACCENT,
     COMMANDS,
@@ -679,6 +680,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", help="path to a .gguf file (overrides config)")
     parser.add_argument("--server-url", help="reuse an existing llama-server here")
     parser.add_argument("--no-server", action="store_true", help="never start llama-server ourselves")
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="streaming terminal interface instead of the full-screen one (automatic when piped)",
+    )
     parser.add_argument("--no-brain", action="store_true", help="disable persistent memory")
     parser.add_argument("--confirm", action="store_true", help="ask before every shell command")
     parser.add_argument("--think", action="store_true", help="enable the model's reasoning output")
@@ -744,10 +750,33 @@ def _session_path(cfg, resume: str | None) -> tuple[Path, str | None]:
     return fresh, f"no session named {resume!r} - starting a new one"
 
 
+def _wants_full_screen() -> bool:
+    """The full-screen interface needs a real terminal on both ends."""
+    if os.environ.get("TERM") in ("", "dumb"):
+        return False
+    try:
+        if not sys.stdin.isatty():
+            return False
+    except (AttributeError, ValueError):
+        return False
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     console = make_console()
     ui = RichUI(console)
+    # The full-screen interface renders into its own capture console; the plain
+    # streaming one stays for pipes, --plain and TERM=dumb.
+    term_console = console
+    full_screen = _wants_full_screen() and not args.plain
+    if full_screen:
+        screen_ui = ScreenUI()
+        console = screen_ui.console
+        ui = screen_ui
 
     try:
         cfg, warnings = config_mod.load(args.config)
@@ -835,7 +864,9 @@ def main(argv: list[str] | None = None) -> int:
         stats = brain.stats() if brain else {"total": 0}
     except Exception:  # a broken brain.db must not block the CLI
         stats = {"total": 0}
-    if console.is_terminal:  # a boxed banner is noise when piped
+    # A boxed banner is the stream interface's header; the full-screen one draws
+    # its own, and a box is noise when piped.
+    if console.is_terminal and not full_screen:
         banner(
             console,
             name=cfg.agent.name,
@@ -918,6 +949,62 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if failed else 0
 
     # --- interactive ---------------------------------------------------
+
+    def submit(text: str) -> None:
+        """One entered line: either a slash command or a chat turn."""
+        if text.startswith("/"):
+            try:
+                repl.handle(text)
+            except Exception as exc:  # a command bug must not end the session
+                audit.log(
+                    "command.error",
+                    command=text.split(maxsplit=1)[0],
+                    error=f"{exc.__class__.__name__}: {exc}",
+                )
+                error_panel(console, f"{text.split(maxsplit=1)[0]} failed: {exc}")
+            return
+        try:
+            agent.run_turn(text)
+            ui.newline()
+        except LLMError as exc:
+            ui.interrupt()
+            error_panel(console, str(exc))
+            if revive_backend():
+                note(console, "backend restarted - ask again", WARN)
+        except KeyboardInterrupt:
+            ui.interrupt()
+            note(console, "interrupted", WARN)
+            revive_backend()
+
+    if full_screen:
+        # The full-screen interface owns the whole terminal: whatever the session
+        # prints (including rich panels from /status and friends) is captured
+        # into its chat window.
+        def screen_stats() -> dict:
+            return {
+                "name": cfg.agent.name,
+                "model": os.path.basename(os.path.expanduser(cfg.model.gguf or "model.gguf")),
+                "ctx": cfg.model.n_ctx,
+                "threads": cfg.model.n_threads,
+                "ram": f"{profile.ram_gb:g} GB",
+                "workspace": short_name(str(cfg.workspace)),
+                "state": "thinking…" if ui.busy else "ready",
+            }
+
+        screen = ScreenApp(
+            ui,
+            submit=submit,
+            restart_backend=revive_backend,
+            should_exit=lambda: not repl.running,
+            stats=screen_stats,
+        )
+        try:
+            screen.run()
+        finally:
+            finish()
+            note(term_console, "bye")
+        return 0
+
     history_file = cfg.data_dir / "history"
     history_file.parent.mkdir(parents=True, exist_ok=True)
     def toolbar() -> str:
@@ -960,26 +1047,7 @@ def main(argv: list[str] | None = None) -> int:
             text = line.strip()
             if not text:
                 continue
-            if text.startswith("/"):
-                try:
-                    repl.handle(text)
-                except Exception as exc:  # a command bug must not end the session
-                    audit.log("command.error", command=text.split(maxsplit=1)[0],
-                              error=f"{exc.__class__.__name__}: {exc}")
-                    error_panel(console, f"{text.split(maxsplit=1)[0]} failed: {exc}")
-                continue
-            try:
-                agent.run_turn(text)
-                ui.newline()
-            except LLMError as exc:
-                ui.interrupt()
-                error_panel(console, str(exc))
-                if revive_backend():
-                    note(console, "backend restarted - ask again", WARN)
-            except KeyboardInterrupt:
-                ui.interrupt()
-                note(console, "interrupted", WARN)
-                revive_backend()
+            submit(text)
     finally:
         finish()
         if console.is_terminal:
