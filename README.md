@@ -21,21 +21,54 @@ native tool use with full terminal access, and the persistent brain with
 post-session self-learning. Phases 4–6 (auto-tuning hill-climb, prompt
 self-evolution, soak testing) are **not** built — see [Not built yet](#not-built-yet).
 
-Requires Python 3.11+ and a `llama-server` on `PATH`.
+## Setup (macOS)
+
+Prerequisites, both from Homebrew:
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -e .
-.venv/bin/hauhau                       # interactive
-.venv/bin/hauhau "what is in /tmp?"    # one-shot
-
-.venv/bin/pip install -e ".[dev]"      # lint tooling
-.venv/bin/ruff check hauhau tests      # clean
-.venv/bin/python -m unittest discover -s tests -t .   # 133 tests
+brew install python llama.cpp      # python 3.11+, llama-server on PATH
 ```
 
-Configuration lives in `config.toml` (see `hauhau --profile` for what the
-profiler recommends on this hardware). Runtime state — memory, audit log,
-sessions — lives in `~/.hauhau`, never in the repo.
+Then one command, which is safe to re-run after a pull or a Python upgrade:
+
+```bash
+./scripts/setup.sh
+```
+
+It verifies Python and `llama-server`, checks the model file exists, builds
+`.venv`, installs the package, creates `~/.hauhau`, and drops a launcher at
+`~/.local/bin/hauhau` that works from any directory. It prints what it found and
+fails loudly rather than half-installing.
+
+```bash
+hauhau                              # interactive
+hauhau "what is in my Downloads?"   # one-shot
+hauhau --resume last "continue"     # pick up the previous session
+hauhau --profile                    # what hardware the tuner sees
+```
+
+**The model.** `config.toml` points `[model] gguf` at a local GGUF (currently
+`~/modeller/gguf/Gemma-4-E2B-…-Q4_K_P.gguf`, 3.2 GB). Any Gemma-4-E2B GGUF works;
+put it anywhere, update that line, or set `HAUHAU_GGUF`. Nothing is downloaded at
+runtime.
+
+**What "it manages the server" means.** The first turn starts `llama-server` with
+the configured context, threads and Metal offload, and stops it on exit —
+verified: no process survives a normal quit. If a run is killed hard (`kill -9`,
+closing the terminal mid-turn) a stray server can survive; `pkill llama-server`
+clears it. To use your own long-lived server instead, pass
+`--server-url http://127.0.0.1:8080` (or `--no-server`), and it will be reused
+untouched.
+
+Runtime state — memory, audit log, sessions, snapshots, server log — lives in
+`~/.hauhau`, never in the repo.
+
+## Development
+
+```bash
+.venv/bin/ruff check hauhau tests                      # clean
+.venv/bin/python -m unittest discover -s tests -t .    # 134 tests
+```
 
 ## Assumptions this build corrects
 
