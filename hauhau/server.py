@@ -8,6 +8,7 @@ already listening on the configured URL, it is reused untouched.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import os
 import subprocess
 import time
@@ -22,6 +23,7 @@ class ServerManager:
         self.cfg = cfg
         self.audit = audit
         self._proc: subprocess.Popen | None = None
+        self._log = None  # kept so stop() can close the server.log handle
         self._log_path = cfg.data_dir / "logs" / "server.log"
         atexit.register(self.stop)
 
@@ -70,17 +72,21 @@ class ServerManager:
         log = self._log_path.open("a", encoding="utf-8")
         log.write(f"\n=== {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} starting ===\n")
         log.flush()
+        self._log = log
         self._proc = self._popen(args, log)
 
         deadline = time.monotonic() + self.cfg.model.startup_timeout
         while time.monotonic() < deadline:
             if self._proc.poll() is not None:
-                raise LLMError(
-                    f"llama-server exited with code {self._proc.returncode}; see {self._log_path}"
-                )
+                # A half-started server must not survive the error path: the CLI
+                # exits, so nobody would ever stop the process.
+                code = self._proc.returncode
+                self.stop()
+                raise LLMError(f"llama-server exited with code {code}; see {self._log_path}")
             if client.health():
                 return client
             time.sleep(0.5)
+        self.stop()
         raise LLMError(
             f"llama-server did not become healthy in {self.cfg.model.startup_timeout}s; see {self._log_path}"
         )
@@ -111,7 +117,17 @@ class ServerManager:
                 self._proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self._proc.wait(timeout=5)
         self._proc = None
+        self._close_log()
+
+    def _close_log(self) -> None:
+        """Drop the append handle; one descriptor leaked per start otherwise."""
+        if self._log is not None:
+            with contextlib.suppress(OSError):
+                self._log.close()
+            self._log = None
 
     def status(self) -> dict:
         return {

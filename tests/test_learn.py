@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from hauhau.brain import Brain
-from hauhau.brain.learn import Learner, build_transcript, parse_drafts
+from hauhau.brain.learn import Learner, build_transcript, parse_drafts, worth_distilling
 from hauhau.config import Config
 from hauhau.llm import Completion, LLMError
 
@@ -94,7 +94,9 @@ class TestLearner(unittest.TestCase):
         self.brain = Brain(self.cfg)
         self.messages = [
             {"role": "user", "content": "when you run the test suite here, always use pytest with the -x flag"},
-            {"role": "assistant", "content": "Noted."},
+            {"role": "assistant", "content": "Understood - checking the existing test command first."},
+            {"role": "tool", "name": "shell", "content": "pytest -x -q\n42 passed"},
+            {"role": "assistant", "content": "Noted: pytest -x is what works here."},
         ]
 
     def tearDown(self) -> None:
@@ -128,9 +130,60 @@ class TestLearner(unittest.TestCase):
         learner = Learner(self.cfg, FakeClient(error=LLMError("down")), self.brain)
         self.assertEqual(learner.distill(self.messages), ([], []))
 
+    def test_trivial_greeting_costs_no_model_pass(self) -> None:
+        """A hello is not a session: no 20s exit delay to learn nothing."""
+        client = FakeClient()
+        learner = Learner(self.cfg, client, self.brain)
+        drafts, written = learner.distill(
+            [
+                {"role": "user", "content": "hej"},
+                {"role": "assistant", "content": "Hej! Vad kan jag hjälpa dig med?"},
+            ]
+        )
+        self.assertEqual((drafts, written), ([], []))
+        self.assertEqual(client.calls, [], "no model pass for a greeting")
+
+    def test_worth_distilling_rules(self) -> None:
+        greeting = [{"role": "user", "content": "hej"}, {"role": "assistant", "content": "Hej!"}]
+        self.assertFalse(worth_distilling(greeting))
+        self.assertFalse(worth_distilling([]))
+        one_long = [
+            {"role": "user", "content": "why is the build failing " + "x" * 400},
+            {"role": "assistant", "content": "because of the cache"},
+        ]
+        self.assertTrue(worth_distilling(one_long))
+        two_turns = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "thanks"},
+        ]
+        self.assertTrue(worth_distilling(two_turns))
+        with_tool = [*greeting, {"role": "tool", "name": "shell", "content": "ok"}]
+        self.assertTrue(worth_distilling(with_tool))
+
     def test_no_turns_yields_nothing(self) -> None:
         learner = Learner(self.cfg, FakeClient(), self.brain)
         self.assertEqual(learner.distill([{"role": "assistant", "content": "hi"}]), ([], []))
+
+    def test_generic_draft_is_rejected(self) -> None:
+        """The 2B model calls "echo MEM_OK worked" a procedure; it is noise."""
+        payload = (
+            '[{"kind":"procedural","text":"The user executes the command echo MEM_OK to confirm success."}]'
+        )
+        client = FakeClient([payload])
+        drafts, written = Learner(self.cfg, client, self.brain).distill(self.messages)
+        self.assertEqual(drafts, [])
+        self.assertEqual(written, [])
+        self.assertEqual(self.brain.stats()["total"], 0)
+
+    def test_concrete_draft_survives_the_guard(self) -> None:
+        payload = (
+            '[{"kind":"procedural","text":"Ruff is configured with line length 120 in pyproject.toml."},'
+            ' {"kind":"preference","text":"The user wants short answers."}]'
+        )
+        drafts, written = Learner(self.cfg, FakeClient([payload]), self.brain).distill(self.messages)
+        self.assertEqual(len(drafts), 2, "path-bearing procedure and a plain preference both stay")
+        self.assertEqual(len(written), 2)
 
     def test_prompt_lists_already_known_memories(self) -> None:
         self.brain.remember("semantic", "The model lives in /Users/johan/modeller/gguf.")

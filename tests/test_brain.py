@@ -45,6 +45,34 @@ class TestRememberRecall(TestBrain):
         block = self.brain.context_block("durable fact machine setup")
         self.assertLessEqual(len(block), 200)
 
+    def test_injection_does_not_count_as_a_use(self) -> None:
+        """Automatic injection must not inflate ``uses`` (it disabled /prune)."""
+        row_id, _ = self.brain.remember("semantic", "The postgres port here is 5432 on localhost.", importance=0.7)
+        for _ in range(10):
+            self.brain.context_block("which postgres port do I use")
+        row = self.brain.store.db.execute("SELECT uses FROM memories WHERE id = ?", (row_id,)).fetchone()
+        self.assertEqual(row["uses"], 0, "prompt injection is not a deliberate reuse")
+        # ...but an explicit recall is, and it is what keeps a memory alive.
+        self.brain.recall("which postgres port do I use")
+        row = self.brain.store.db.execute("SELECT uses FROM memories WHERE id = ?", (row_id,)).fetchone()
+        self.assertEqual(row["uses"], 1)
+
+    def test_context_block_never_splits_a_memory(self) -> None:
+        """Half a sentence reads as a fact; skip it and say so instead."""
+        self.cfg.brain.inject_max_chars = 320
+        for i in range(6):
+            self.brain.remember(
+                "semantic", f"Fact {i} about the build server: the artifact cache is at /srv/cache/{i}.", importance=0.6
+            )
+        block = self.brain.context_block("build server artifact cache")
+        self.assertLessEqual(len(block), 320)
+        body = block.split("\n", 1)[1]
+        for line in body.splitlines():
+            if line.startswith("- (") or not line.startswith("- ["):
+                continue
+            self.assertTrue(line.endswith(")"), f"truncated memory: {line!r}")
+            self.assertIn("/srv/cache/", line)
+
     def test_disabled_brain_injects_nothing(self) -> None:
         self.cfg.brain.enabled = False
         self.assertEqual(self.brain.context_block("anything"), "")

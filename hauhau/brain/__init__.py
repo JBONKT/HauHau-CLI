@@ -5,7 +5,6 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from ..util import clip_text
 from .embed import Embedder
 from .store import Hit, MemoryStore
 
@@ -30,24 +29,49 @@ class Brain:
         vector = self.embedder.embed(text) if self.embedder.enabled else None
         return self.store.write(kind, text, tags, importance, vector)
 
-    def recall(self, query: str, k: int | None = None, kinds: list[str] | None = None) -> list[Hit]:
+    def recall(
+        self, query: str, k: int | None = None, kinds: list[str] | None = None, record: bool = True
+    ) -> list[Hit]:
         k = k or self.cfg.brain.top_k
         vector = self.embedder.embed(query) if self.embedder.enabled else None
-        return self.store.search(query, k, vector, kinds)
+        return self.store.search(query, k, vector, kinds, record_use=record)
 
     def context_block(self, query: str) -> str:
-        """Format relevant memories for the system prompt, or '' when empty."""
+        """Format relevant memories for the system prompt, or '' when empty.
+
+        Memories are whole units of meaning, so the block is assembled memory by
+        memory until the prompt budget is spent. Clipping the joined string cut
+        sentences mid-word ("/srv/... che lives at") and presented the fragments
+        as facts. Automatic injection does not count as a use: only deliberate
+        recalls do, otherwise ``prune`` can never forget anything.
+        """
         if not self.cfg.brain.enabled:
             return ""
-        hits = self.recall(query)
+        hits = self.recall(query, record=False)
         if not hits:
             return ""
-        lines = ["What you remember from earlier sessions (may be incomplete or stale):"]
         budget = self.cfg.brain.inject_max_chars
+        lines = ["What you remember from earlier sessions (may be incomplete or stale):"]
+        used = len(lines[0]) + 1
+        withheld = 0
         for hit in hits:
             when = time.strftime("%Y-%m-%d", time.localtime(hit.created_at))
-            lines.append(f"- [{hit.kind}] {hit.text} ({when}, used {hit.uses}x)")
-        return clip_text("\n".join(lines), budget)
+            suffix = f" ({when}{f', used {hit.uses}x' if hit.uses else ''})"
+            line = f"- [{hit.kind}] {hit.text}{suffix}"
+            room = budget - used - 1
+            if len(line) > room:
+                if len(lines) > 1:
+                    withheld += 1
+                    continue
+                # Never drop the best match: show as much of it as fits.
+                line = line[: max(0, room - 1)].rstrip() + "…"
+            lines.append(line)
+            used += len(line) + 1
+        if withheld:
+            note_line = f"- ({withheld} more memories withheld: prompt budget spent)"
+            if used + len(note_line) <= budget:
+                lines.append(note_line)
+        return "\n".join(lines)
 
     def stats(self) -> dict:
         stats = self.store.stats()

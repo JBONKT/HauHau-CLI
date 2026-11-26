@@ -204,14 +204,16 @@ class TestCommands(ReplTestCase):
     def test_learn_with_nothing_durable(self) -> None:
         self.agent.messages = [{"role": "user", "content": "hello there friend"}]
         self.repl.handle("/learn")
-        self.assertIn("nothing durable", self.text())
+        self.assertIn("too thin", self.text())
+        self.assertEqual(self.brain.stats()["total"], 0)
 
     def test_learn_stores_extracted_memories(self) -> None:
         self.client.replies = [
             '[{"kind":"preference","text":"The user prefers helix as their editor.","importance":0.8}]'
         ]
         self.agent.messages = [
-            {"role": "user", "content": "I always use helix as my editor and never vim, remember that"}
+            {"role": "user", "content": "I always use helix as my editor and never vim, remember that"},
+            {"role": "tool", "name": "shell", "content": "helix --version\nhelix 25.01"},
         ]
         self.repl.handle("/learn")
         self.assertIn("helix", self.text())

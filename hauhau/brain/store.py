@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import array
 import math
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -89,6 +90,13 @@ _COMMON_TOKENS = frozenset({
 })
 
 
+# With a concrete path in common, a little less lexical overlap is enough: the
+# distiller writes "The release checklist is in docs/release.md and linting uses
+# ruff…" as one row and "The project utilizes a release checklist located in
+# docs/release.md" as another, scoring 0.75 containment against a 0.80 threshold.
+SHARED_ARTIFACT_CONTAINMENT = 0.6
+
+
 def _index_keys(tokens: set[str]) -> set[str]:
     """Distinctive tokens only: enough to find candidate duplicates."""
     return {tok for tok in tokens if len(tok) >= 4 and tok not in _COMMON_TOKENS}
@@ -99,13 +107,27 @@ def _numbers(text: str) -> frozenset[str]:
     return frozenset(tok for tok in tokens_of(text) if tok.isdigit())
 
 
-def _numbers_agree(left: frozenset[str], right: frozenset[str]) -> bool:
-    """Same test, on number sets that were computed once.
+_ARTIFACT = re.compile(
+    r"(?:~|\b/(?:Users|opt|etc|usr|var|srv|home|private|Applications)\b)[\w./~-]*"
+    r"|\b[\w-]+\.(?:py|toml|json|md|txt|gguf|sh|zsh|bash|db|ya?ml|cfg|ini|env)\b"
+)
 
-    The string version re-tokenised both sides on every comparison, which showed
-    up as 1,000,000 regex calls and ~17s for a single compact() of 2000 rows.
+
+def _artifacts(text: str) -> frozenset[str]:
+    """Concrete files, paths and URLs a memory points at."""
+    return frozenset(match.group(0).lower() for match in _ARTIFACT.finditer(text))
+
+
+def _numbers_agree(left: frozenset[str], right: frozenset[str]) -> bool:
+    """Do two number sets permit a merge?
+
+    Only a *conflict* blocks one: "port 5432" against "port 5433" is two facts,
+    but "docs/release.md, line-length 120" against "docs/release.md" is the same
+    fact with less detail. The sets are precomputed because the string version
+    re-tokenised both sides on every pair - 1,000,000 regex calls, ~17s per
+    compact() of 2000 rows.
     """
-    return left == right
+    return not left or not right or left == right
 
 
 def _pack(vec: list[float]) -> bytes:
@@ -189,17 +211,19 @@ class MemoryStore:
         now = time.time()
         digest = norm_hash(text)
 
-        row = self.db.execute(
-            "SELECT id FROM memories WHERE norm_hash = ? AND kind = ?", (digest, kind)
-        ).fetchone()
+        # Dedupe ignores the kind label: the distiller writes the same fact as
+        # both "semantic" and "procedural" in one pass, and two rows saying the
+        # same thing crowd each other out of a top-k prompt.
+        row = self.db.execute("SELECT id FROM memories WHERE norm_hash = ?", (digest,)).fetchone()
         if row:
             self._bump(row["id"], now, new_text=text)
             return int(row["id"]), False
 
         candidates = tokens_of(text)
         new_numbers = _numbers(text)
+        new_artifacts = _artifacts(text)
         for cand in self.db.execute(
-            "SELECT id, text FROM memories WHERE kind = ? ORDER BY last_used_at DESC LIMIT 400", (kind,)
+            "SELECT id, text FROM memories ORDER BY last_used_at DESC LIMIT 400"
         ):
             other = tokens_of(cand["text"])
             if not other:
@@ -210,9 +234,12 @@ class MemoryStore:
             # "X files are located at P"), which Jaccard scores too low. Both are
             # overridden by the numbers: "port 5432" and "port 5433" are
             # different facts, however similar the wording.
+            shortest = min(len(candidates), len(other))
+            containment = overlap / shortest
             similar = (
                 jaccard(candidates, other) >= self.dedupe_jaccard
-                or overlap / min(len(candidates), len(other)) >= self.dedupe_containment
+                or containment >= self.dedupe_containment
+                or (containment >= SHARED_ARTIFACT_CONTAINMENT and bool(new_artifacts & _artifacts(cand["text"])))
             )
             if similar and _numbers_agree(new_numbers, _numbers(cand["text"])):
                 self._bump(int(cand["id"]), now, new_text=text)
@@ -233,8 +260,16 @@ class MemoryStore:
         return cur.rowcount > 0
 
     # --- reads ---------------------------------------------------------
-    def _decay(self, created_at: float, now: float) -> float:
-        age_days = max(0.0, (now - created_at) / 86400.0)
+    def _decay(self, created_at: float, last_used_at: float, now: float) -> float:
+        """Freshness halves every ``half_life_days``, counted from reinforcement.
+
+        A fact re-confirmed today is fresh again: decay from ``created_at``
+        alone would sink a memory that is still being used, which is the
+        opposite of what a decay model is for. ``last_used_at`` is the newer
+        of the two whenever the memory was merged or deliberately recalled.
+        """
+        reference = max(created_at, last_used_at or 0.0)
+        age_days = max(0.0, (now - reference) / 86400.0)
         return math.pow(0.5, age_days / self.half_life_days)
 
     def search(
@@ -243,7 +278,15 @@ class MemoryStore:
         k: int = 5,
         query_embedding: list[float] | None = None,
         kinds: list[str] | None = None,
+        record_use: bool = True,
     ) -> list[Hit]:
+        """Rank memories for ``query``.
+
+        ``record_use`` exists because the agent injects a memory block into
+        every prompt: counting that as a "use" made ``uses`` meaningless and
+        immunised every memory against ``prune`` after a single session. Only
+        deliberate recalls (``/mem``, ``rag_query``) and write-merges count.
+        """
         now = time.time()
         base: dict[int, float] = {}
 
@@ -278,11 +321,14 @@ class MemoryStore:
 
         hits: list[Hit] = []
         placeholders = ",".join("?" * len(base))
-        sql = f"SELECT id, kind, text, tags, importance, uses, created_at FROM memories WHERE id IN ({placeholders})"
+        sql = (
+            "SELECT id, kind, text, tags, importance, uses, created_at, last_used_at "
+            f"FROM memories WHERE id IN ({placeholders})"
+        )
         for r in self.db.execute(sql, tuple(base)):
             if kinds and r["kind"] not in kinds:
                 continue
-            decay = self._decay(r["created_at"], now)
+            decay = self._decay(r["created_at"], r["last_used_at"], now)
             # Both factors are <= 1.0, so the score stays within 0..1 and /mem
             # never shows a "perfect" match as 1.23. Importance nudges the rank
             # by at most 20%.
@@ -291,7 +337,7 @@ class MemoryStore:
 
         hits.sort(key=lambda h: h.score, reverse=True)
         top = hits[:k]
-        if top:
+        if top and record_use:
             self.db.executemany(
                 "UPDATE memories SET uses = uses + 1, last_used_at = ? WHERE id = ?",
                 [(now, h.id) for h in top],
@@ -319,78 +365,79 @@ class MemoryStore:
         timestamp. Returns how many rows were absorbed.
         """
         absorbed = 0
-        for kind in KINDS:
-            rows = list(
-                self.db.execute(
-                    "SELECT id, text, uses, created_at, importance FROM memories WHERE kind = ? "
-                    "ORDER BY created_at ASC",
-                    (kind,),
-                )
+        rows = list(
+            self.db.execute(
+                "SELECT id, text, uses, created_at, importance FROM memories ORDER BY created_at ASC"
             )
-            kept: list[dict] = []
-            # Two texts that share no token can never pass either similarity test,
-            # so index the survivors by token instead of comparing every pair:
-            # the naive version took 16s on 2000 rows.
-            index: dict[str, list[dict]] = {}
-            for row in rows:
-                tokens = tokens_of(row["text"])
-                keys = _index_keys(tokens)
-                seen: set[int] = set()
-                candidates: list[dict] = []
-                for token in keys:
-                    for survivor in index.get(token, ()):
-                        if id(survivor) not in seen:
-                            seen.add(id(survivor))
-                            candidates.append(survivor)
-                if not keys:
-                    # Nothing distinctive to look up; compare the long way.
-                    candidates = list(kept)
-                match = None
-                nums = _numbers(row["text"])
-                for survivor in candidates:
-                    other = survivor["tokens"]
-                    overlap = len(tokens & other)
-                    similar = (
-                        jaccard(tokens, other) >= self.dedupe_jaccard
-                        or overlap / min(len(tokens), len(other)) >= self.dedupe_containment
-                    )
-                    if similar and _numbers_agree(nums, survivor["nums"]):
-                        match = survivor
-                        break
-                if match is None:
-                    entry = {
-                        "id": row["id"], "text": row["text"], "tokens": tokens, "nums": nums,
-                        "uses": row["uses"], "created_at": row["created_at"],
-                        "importance": row["importance"], "dirty": False,
-                    }
-                    kept.append(entry)
-                    for token in keys:
-                        index.setdefault(token, []).append(entry)
-                    continue
-                richest = max(match["text"], row["text"], key=len)
-                match["uses"] += row["uses"] + 1
-                match["importance"] = max(match["importance"], row["importance"])
-                match["dirty"] = True
-                if richest != match["text"]:
-                    match["text"] = richest
-                    match["tokens"] = tokens_of(richest)
-                    match["nums"] = _numbers(richest)
-                    for token in _index_keys(match["tokens"]):
-                        bucket = index.setdefault(token, [])
-                        if match not in bucket:
-                            bucket.append(match)
-                self.db.execute("DELETE FROM memories WHERE id = ?", (row["id"],))
-                absorbed += 1
-            for survivor in kept:
-                # Only touched rows are rewritten: every UPDATE fires the FTS
-                # trigger, and rewriting all 2000 unchanged rows took ~17s.
-                if not survivor["dirty"]:
-                    continue
-                self.db.execute(
-                    "UPDATE memories SET text = ?, norm_hash = ?, uses = ?, importance = ? WHERE id = ?",
-                    (survivor["text"], norm_hash(survivor["text"]), survivor["uses"],
-                     survivor["importance"], survivor["id"]),
+        )
+        kept: list[dict] = []
+        # Two texts that share no token can never pass either similarity test,
+        # so index the survivors by token instead of comparing every pair:
+        # the naive version took 16s on 2000 rows.
+        index: dict[str, list[dict]] = {}
+        for row in rows:
+            tokens = tokens_of(row["text"])
+            keys = _index_keys(tokens)
+            seen: set[int] = set()
+            candidates: list[dict] = []
+            for token in keys:
+                for survivor in index.get(token, ()):
+                    if id(survivor) not in seen:
+                        seen.add(id(survivor))
+                        candidates.append(survivor)
+            if not keys:
+                # Nothing distinctive to look up; compare the long way.
+                candidates = list(kept)
+            match = None
+            nums = _numbers(row["text"])
+            arts = _artifacts(row["text"])
+            for survivor in candidates:
+                other = survivor["tokens"]
+                overlap = len(tokens & other)
+                containment = overlap / min(len(tokens), len(other))
+                similar = (
+                    jaccard(tokens, other) >= self.dedupe_jaccard
+                    or containment >= self.dedupe_containment
+                    or (containment >= SHARED_ARTIFACT_CONTAINMENT and bool(arts & survivor["arts"]))
                 )
+                if similar and _numbers_agree(nums, survivor["nums"]):
+                    match = survivor
+                    break
+            if match is None:
+                entry = {
+                    "id": row["id"], "text": row["text"], "tokens": tokens, "nums": nums,
+                    "arts": arts, "uses": row["uses"], "created_at": row["created_at"],
+                    "importance": row["importance"], "dirty": False,
+                }
+                kept.append(entry)
+                for token in keys:
+                    index.setdefault(token, []).append(entry)
+                continue
+            richest = max(match["text"], row["text"], key=len)
+            match["uses"] += row["uses"] + 1
+            match["importance"] = max(match["importance"], row["importance"])
+            match["dirty"] = True
+            if richest != match["text"]:
+                match["text"] = richest
+                match["tokens"] = tokens_of(richest)
+                match["nums"] = _numbers(richest)
+                match["arts"] = _artifacts(richest)
+                for token in _index_keys(match["tokens"]):
+                    bucket = index.setdefault(token, [])
+                    if match not in bucket:
+                        bucket.append(match)
+            self.db.execute("DELETE FROM memories WHERE id = ?", (row["id"],))
+            absorbed += 1
+        for survivor in kept:
+            # Only touched rows are rewritten: every UPDATE fires the FTS
+            # trigger, and rewriting all 2000 unchanged rows took ~17s.
+            if not survivor["dirty"]:
+                continue
+            self.db.execute(
+                "UPDATE memories SET text = ?, norm_hash = ?, uses = ?, importance = ? WHERE id = ?",
+                (survivor["text"], norm_hash(survivor["text"]), survivor["uses"],
+                 survivor["importance"], survivor["id"]),
+            )
         self.db.commit()
         return absorbed
 
@@ -398,10 +445,10 @@ class MemoryStore:
         """Drop stale, never-reused memories. Returns the number removed."""
         now = time.time()
         doomed = []
-        for r in self.db.execute("SELECT id, created_at, importance, uses FROM memories"):
+        for r in self.db.execute("SELECT id, created_at, last_used_at, importance, uses FROM memories"):
             if r["uses"] >= keep_uses:
                 continue
-            weight = self._decay(r["created_at"], now) * r["importance"]
+            weight = self._decay(r["created_at"], r["last_used_at"], now) * r["importance"]
             if weight < min_weight:
                 doomed.append(int(r["id"]))
         if doomed:

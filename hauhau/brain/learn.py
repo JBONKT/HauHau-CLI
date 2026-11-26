@@ -7,15 +7,23 @@ latency than it saves on a 27 tok/s machine.
 
 from __future__ import annotations
 
+import contextlib
+import getpass
 import json
 import math
+import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..llm import LLMError
 
 # Below this, a session is too thin to be worth a model pass.
 MIN_TRANSCRIPT_CHARS = 40
+# A greeting with a one-line answer can exceed the threshold above, and a model
+# pass costs ~20s at 27 tok/s on this machine. Only a session with real work in
+# it - a tool call, a second turn, or a long exchange - earns the exit delay.
+MIN_SIGNAL_CHARS = 400
 
 PROMPT = """You are reviewing a finished terminal session to write long-term memory.
 
@@ -27,6 +35,8 @@ Extract only durable, reusable knowledge:
 
 Rules: one self-contained sentence per memory, written in the third person.
 No narration, no transient details (temp paths, one-off PIDs), no secrets.
+Never record that a command succeeded, a test string, an echo, or a one-off
+verification: "ran echo OK to check the shell" is not knowledge.
 Record only what is specific to this machine, this project, or this user - never
 generic advice that any assistant already knows. A procedural memory must name
 the actual command or path that worked.
@@ -52,6 +62,47 @@ class Draft:
     importance: float = 0.5
 
 
+# A fact or procedure is worth keeping only if it names something concrete: a
+# path, a filename, a version, a port, a URL, a flag. Without this guard a 2B
+# model happily records "ran echo OK to confirm the shell worked" as a procedure
+# - generic, useless, and it crowds out the real memories at retrieval time.
+_SPECIFIC = re.compile(
+    r"(~/|\s/(?:Users|opt|etc|usr|var|srv|home|private|Applications)/"
+    r"|\b[\w.-]+\.(?:py|toml|json|md|txt|gguf|sh|zsh|bash|db|ya?ml|cfg|ini|env|toml)\b"
+    r"|\b\d+\.\d+(?:\.\d+)?\b"
+    r"|https?://"
+    r"|(?<!\w)--?[a-z][a-z0-9-]+"
+    r"|:\d{2,5}\b)",
+    re.IGNORECASE,
+)
+
+# Kinds that must be concrete; a preference may legitimately be a plain sentence
+# ("the user wants answers in Swedish").
+_NEEDS_SPECIFICS = {"semantic", "procedural"}
+
+
+def _anchors(cfg) -> tuple[str, ...]:
+    """Words that tie a memory to this machine, project or user."""
+    words = [
+        getattr(cfg.agent, "name", ""),
+        Path(cfg.workspace).name if getattr(cfg, "workspace", None) else "",
+        Path(os.path.expanduser(cfg.model.gguf)).stem if getattr(cfg.model, "gguf", "") else "",
+    ]
+    with contextlib.suppress(Exception):
+        words.append(getpass.getuser())
+    return tuple(w.lower() for w in words if w and len(w) > 2)
+
+
+def durable(draft: Draft, anchors: tuple[str, ...] = ()) -> bool:
+    """Reject generic advice the agent should not need a memory for."""
+    if draft.kind not in _NEEDS_SPECIFICS:
+        return True
+    if _SPECIFIC.search(draft.text):
+        return True
+    low = draft.text.lower()
+    return any(anchor in low for anchor in anchors)
+
+
 def build_transcript(messages: list[dict], max_chars: int = 6000) -> str:
     lines: list[str] = []
     for msg in messages:
@@ -71,6 +122,15 @@ def build_transcript(messages: list[dict], max_chars: int = 6000) -> str:
     if len(transcript) > max_chars:
         transcript = transcript[-max_chars:]
     return transcript
+
+
+def worth_distilling(messages: list[dict]) -> bool:
+    """Cheap pre-check: is there anything a model pass could learn from?"""
+    if any(m.get("role") == "tool" for m in messages):
+        return True
+    if sum(1 for m in messages if m.get("role") == "user") >= 2:
+        return True
+    return len(build_transcript(messages)) >= MIN_SIGNAL_CHARS
 
 
 def parse_drafts(raw: str) -> list[Draft]:
@@ -146,7 +206,7 @@ class Learner:
         if turns < min_turns:
             return [], []
         transcript = build_transcript(messages)
-        if len(transcript) < MIN_TRANSCRIPT_CHARS:
+        if len(transcript) < MIN_TRANSCRIPT_CHARS or not worth_distilling(messages):
             return [], []
         prompt = PROMPT.replace("{known}", self._known_block()).replace("{transcript}", transcript)
         try:
@@ -161,7 +221,10 @@ class Learner:
             if self.audit:
                 self.audit.log("learn.error", error=str(exc))
             return [], []
-        drafts = parse_drafts(completion.content)
+        parsed = parse_drafts(completion.content)
+        anchors = _anchors(self.cfg)
+        drafts = [d for d in parsed if durable(d, anchors)]
+        rejected = len(parsed) - len(drafts)
         written: list[tuple[int, bool]] = []
         for draft in drafts:
             try:
@@ -171,5 +234,5 @@ class Learner:
             except ValueError:
                 continue
         if self.audit:
-            self.audit.log("learn", drafts=len(drafts), written=len(written))
+            self.audit.log("learn", drafts=len(drafts), written=len(written), rejected=rejected)
         return drafts, written

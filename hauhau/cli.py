@@ -15,7 +15,7 @@ from . import config as config_mod
 from .agent import Agent
 from .audit import Audit
 from .brain import Brain
-from .brain.learn import Learner
+from .brain.learn import Learner, worth_distilling
 from .llm import LLMError
 from .profiler import apply_recommendations, probe, recommend
 from .server import ServerManager
@@ -180,6 +180,9 @@ class Repl:
             return
         if not self.agent.messages:
             note(self.console, "nothing to learn from yet")
+            return
+        if not worth_distilling(self.agent.messages):
+            note(self.console, "this session is too thin to learn from (one short turn, no tool use)", WARN)
             return
         note(self.console, "distilling this session…")
         try:
@@ -404,6 +407,7 @@ def main(argv: list[str] | None = None) -> int:
     except LLMError as exc:
         error_panel(console, str(exc))
         audit.close()
+        manager.stop()
         return 1
 
     brain = None
@@ -455,21 +459,41 @@ def main(argv: list[str] | None = None) -> int:
     repl = Repl(cfg, client, manager, brain, learner, agent, audit, ui, session_path)
 
     def finish() -> None:
-        if brain is not None and agent.messages:
-            try:
-                _, written = learner.distill(agent.messages)
-                if written and console.is_terminal:
-                    new = sum(1 for _, created in written if created)
-                    note(
-                        console,
-                        f"learned {len(written)} memories ({new} new, {len(written) - new} merged)",
-                    )
-            except LLMError:
-                pass
-        if agent.messages:
-            agent.persist(session_path)
-        audit.close()
-        manager.stop()
+        """Learn from the session, then shut down - in that order, always.
+
+        The shutdown lives in ``finally`` because a failure in the learning pass
+        or in the session save used to skip ``manager.stop()`` and leave a
+        llama-server running after the CLI had exited.
+        """
+        try:
+            if brain is not None and agent.messages and worth_distilling(agent.messages):
+                if console.is_terminal:
+                    note(console, "distilling this session into memory…")
+                try:
+                    _, written = learner.distill(agent.messages)
+                    if console.is_terminal:
+                        if written:
+                            new = sum(1 for _, created in written if created)
+                            note(
+                                console,
+                                f"learned {len(written)} memories ({new} new, {len(written) - new} merged)",
+                            )
+                        else:
+                            note(console, "nothing durable to keep from this session")
+                except KeyboardInterrupt:  # Ctrl-C during the pass: skip it
+                    if console.is_terminal:
+                        note(console, "skipped learning this session", WARN)
+                except Exception as exc:  # learning must never block shutdown
+                    audit.log("learn.error", error=f"{exc.__class__.__name__}: {exc}")
+            if agent.messages:
+                try:
+                    agent.persist(session_path)
+                except OSError as exc:
+                    if console.is_terminal:
+                        note(console, f"could not save the session: {exc}", WARN)
+        finally:
+            audit.close()
+            manager.stop()
 
     # --- one-shot ------------------------------------------------------
     if args.prompt:

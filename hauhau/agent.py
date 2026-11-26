@@ -202,18 +202,68 @@ class Agent:
             self.audit.log("tool", name=call.name, ok=result.ok, args=call.arguments[:400])
 
     # --- context management --------------------------------------------
+    def summary_cap_tokens(self) -> int:
+        """How large the running summary may get, in tokens.
+
+        The summary is re-injected on every call, so an uncapped one crowds out
+        the conversation: each compression append grew it until the prompt was
+        over budget no matter how many messages were trimmed away.
+        """
+        return max(120, self.cfg.agent.context_budget_tokens // 3)
+
     def compress_if_needed(self, force: bool = False) -> bool:
         a = self.cfg.agent
         budget = a.context_budget_tokens
         used = estimate_messages_tokens(self.messages) + estimate_tokens(self.summary)
+        # Fold an oversized summary first: trimming messages cannot help when
+        # the summary alone is over budget, and that was a permanent dead end.
+        folded = self._cap_summary()
         if not force and used <= budget:
-            return False
+            return folded
         cut = self._safe_split(a.keep_recent_turns * 2)
         if cut <= 0:
-            return False
+            return folded
         dropped, self.messages = self.messages[:cut], self.messages[cut:]
         self.summary = self._summarise(dropped) or self.summary
+        self._cap_summary()
         return True
+
+    def _cap_summary(self) -> bool:
+        """Compress the summary into itself when it exceeds the cap."""
+        cap = self.summary_cap_tokens()
+        if estimate_tokens(self.summary) <= cap:
+            return False
+        folded = self._fold_summary(self.summary, cap)
+        if folded == self.summary:
+            return False
+        self.summary = folded
+        return True
+
+    def _fold_summary(self, text: str, cap: int) -> str:
+        """Return a shorter version of ``text``. Always makes progress."""
+        prompt = (
+            "Merge these notes into at most 8 dense bullet points, oldest first. Keep names, paths, "
+            "commands and decisions. Do not add anything new.\n\n" + text
+        )
+        folded = ""
+        try:
+            completion = self.client.chat(
+                [{"role": "user", "content": prompt}],
+                None,
+                think=False,
+                max_tokens=max(120, min(400, cap)),
+                temperature=0.2,
+            )
+        except LLMError:
+            folded = ""
+        else:
+            folded = completion.content.strip()
+        if folded and estimate_tokens(folded) < estimate_tokens(text):
+            return folded
+        # No model, a refusal, or a reply that grew: keep the newest notes.
+        marker = "…earlier notes dropped…\n"
+        room = max(80, cap * 4 - len(marker))
+        return marker + text[-room:].lstrip()
 
     def _safe_split(self, keep: int) -> int:
         """Index at which it is safe to cut the transcript.

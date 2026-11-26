@@ -23,13 +23,19 @@ class Audit:
             if created:
                 os.chmod(path, 0o600)
 
-    def log(self, kind: str, **fields: Any) -> None:
+    def log(self, event: str, **fields: Any) -> None:
+        """Append one JSON line.
+
+        The parameter is ``event``, not ``kind``, so callers can log their own
+        ``kind=`` field: ``rag_write`` passed ``kind=`` straight into a
+        parameter of the same name and crashed on every call.
+        """
         if not self.enabled:
             return
         record = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "session": self.session_id,
-            "event": kind,
+            "event": event,
             **fields,
         }
         line = json.dumps(record, ensure_ascii=False, default=str)

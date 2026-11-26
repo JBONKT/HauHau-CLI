@@ -40,10 +40,23 @@ class TestWrite(StoreTestCase):
         self.assertFalse(created)
         self.assertEqual(self.store.stats()["total"], 1)
 
-    def test_different_kind_is_not_merged(self) -> None:
+    def test_near_duplicate_merges_across_kinds(self) -> None:
+        # Observed live: one learn pass wrote the same fact as "semantic" and as
+        # "procedural". The kind is a label; the sentence is the memory.
+        first, _ = self.store.write("semantic", "The release checklist is in docs/release.md.")
+        second, created = self.store.write("procedural", "The release checklist lives in docs/release.md.")
+        self.assertFalse(created)
+        self.assertEqual(first, second)
+        row = self.store.db.execute("SELECT kind FROM memories").fetchone()
+        self.assertEqual(row["kind"], "semantic", "the first label wins")
+
+    def test_different_fact_in_another_kind_is_kept(self) -> None:
         self.store.write("semantic", "Deploys happen from the main branch.")
-        _, created = self.store.write("procedural", "Deploys happen from the main branch.")
+        _, created = self.store.write(
+            "procedural", "Run pytest -x before a deploy so a failure stops the push."
+        )
         self.assertTrue(created)
+        self.assertEqual(self.store.stats()["total"], 2)
 
     def test_containment_catches_rephrased_fact(self) -> None:
         # Observed live: the same path fact stored twice because Jaccard (0.61)
@@ -65,6 +78,31 @@ class TestWrite(StoreTestCase):
         _, created = self.store.write("semantic", "The staging database listens on port 5433.")
         self.assertTrue(created, "different ports must not merge")
         self.assertEqual(self.store.stats()["total"], 2)
+
+    def test_shared_file_merges_at_lower_containment(self) -> None:
+        # Observed live: one learn pass wrote both of these (0.70 containment,
+        # under the 0.80 threshold) and they filled two of the five prompt slots.
+        self.store.write(
+            "procedural", "The release checklist is in docs/release.md and linting uses ruff with a line-length of 120."
+        )
+        _, created = self.store.write(
+            "semantic", "The project utilizes a release checklist located in docs/release.md."
+        )
+        self.assertFalse(created)
+        self.assertEqual(self.store.stats()["total"], 1)
+
+    def test_shared_file_does_not_merge_different_facts(self) -> None:
+        # A number present on one side only is detail, not contradiction...
+        self.store.write("semantic", "The deploy script bin/deploy.sh takes about 2.5 minutes to run.")
+        _, created = self.store.write("semantic", "The deploy script bin/deploy.sh takes a while to run.")
+        self.assertFalse(created, "same file, number only on one side")
+        # ...but two different branches are two facts.
+        with tempfile.TemporaryDirectory() as other_dir:
+            other = MemoryStore(Path(other_dir) / "other.db", half_life_days=30.0, dedupe_jaccard=0.9)
+            other.write("semantic", "Deploys come from the staging-branch pipeline on merges.")
+            _, created = other.write("semantic", "Deploys come from the production-branch pipeline on tags.")
+            other.close()
+        self.assertTrue(created)
 
     def test_identical_numbers_still_merge(self) -> None:
         # Same fact plus an extra clause: containment clears the threshold and the
@@ -237,10 +275,31 @@ class TestCompaction(StoreTestCase):
 class TestMaintenance(StoreTestCase):
     def test_prune_drops_stale_unused(self) -> None:
         row_id, _ = self.store.write("episodic", "Session about a throwaway temp file.", importance=0.1)
-        self.store.db.execute("UPDATE memories SET created_at = ? WHERE id = ?", (time.time() - 86400 * 400, row_id))
+        # An untouched memory has always had last_used_at == created_at; backdate both.
+        old = time.time() - 86400 * 400
+        self.store.db.execute(
+            "UPDATE memories SET created_at = ?, last_used_at = ? WHERE id = ?", (old, old, row_id)
+        )
         self.store.db.commit()
         self.assertEqual(self.store.prune(min_weight=0.05), 1)
         self.assertEqual(self.store.stats()["total"], 0)
+
+    def test_reinforced_memory_outranks_a_stale_one(self) -> None:
+        """Decay counts from the last reinforcement, not from creation."""
+        old_id, _ = self.store.write(
+            "semantic", "Deploys go through the staging-docker pipeline at ci.example.", importance=0.8
+        )
+        self.store.write("semantic", "The weather widget uses a greyscale palette.", importance=0.8)
+        long_ago = time.time() - 86400 * 400
+        self.store.db.execute(
+            "UPDATE memories SET created_at = ?, last_used_at = ? WHERE id = ?",
+            (long_ago, time.time(), old_id),
+        )
+        self.store.db.commit()
+        hits = self.store.search("staging-docker pipeline deploy", k=1)
+        self.assertEqual(hits[0].id, old_id)
+        # A 400-day-old memory re-confirmed today must not score as a dead one.
+        self.assertGreater(hits[0].score, 0.5)
 
     def test_prune_keeps_used_memory(self) -> None:
         row_id, _ = self.store.write("semantic", "Never delete the .env file.", importance=0.9)

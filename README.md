@@ -76,6 +76,11 @@ clears it. To use your own long-lived server instead, pass
 `--server-url http://127.0.0.1:8080` (or `--no-server`), and it will be reused
 untouched.
 
+If a startup fails (bad model path, `llama-server` exits, health timeout) the
+child it spawned is stopped before the error surfaces, and the `server.log`
+handle is closed on every `stop()`; otherwise each attempt leaked a process or a
+descriptor.
+
 Runtime state — memory, audit log, sessions, snapshots, server log — lives in
 `~/.hauhau`, never in the repo.
 
@@ -117,7 +122,7 @@ plain text.
 
 ```bash
 .venv/bin/ruff check hauhau tests                      # clean
-.venv/bin/python -m unittest discover -s tests -t .    # 261 tests
+.venv/bin/python -m unittest discover -s tests -t .    # 278 tests
 ```
 
 ## Assumptions this build corrects
@@ -169,17 +174,40 @@ failed tool result, never a failed turn.
 token overlap — both Jaccard (same length, reworded) and containment (same fact
 plus an extra clause, which Jaccard scores too low to catch). A merge keeps the
 richer phrasing and sums reuse counts. Retrieval is FTS5 BM25 with recency decay
-(`half_life_days`) and a reuse boost; hits bump their own counter.
+(`half_life_days`); the decay clock starts at the last *reinforcement*, so a fact
+you re-confirm today is fresh again instead of sinking for being old.
 `/compact` retro-merges duplicates that predate a threshold change.
+
+Only a deliberate recall (`/mem <query>`, `rag_query`) or a merge counts as a
+use. The memory block injected into every prompt deliberately does not: counting
+it made `uses` meaningless within one session and, because `/prune` spares used
+memories, it immunised the whole brain against forgetting.
+
+Deduplication ignores the kind label — the distiller writes one fact as both
+`semantic` and `procedural` in a single pass — and a shared file or path lowers
+the bar, since `docs/release.md` in both texts means the same fact twice. A
+number present on one side only is treated as detail, not contradiction; two
+different numbers (`port 5432` vs `5433`) still stay apart.
 
 **Self-learning.** On exit (or `/learn`) the transcript is distilled into
 `preference` / `semantic` / `procedural` / `episodic` memories. The prompt is
 primed with what is *already* remembered so the model stops restating known
 facts. This runs once per session, not per turn — at 27 tok/s a per-turn pass
-would cost more latency than it saves.
+would cost more latency than it saves, so the exit pass prints
+`distilling this session into memory…` and a session with no real work in it
+(one short turn, no tool call) skips the pass entirely.
+
+A 2B model will happily report "ran `echo OK` to check the shell" as a durable
+procedure. Facts and procedures therefore have to name something concrete — a
+path, filename, version, port, URL or flag — or mention this project, machine or
+user, or they are dropped before they are written (`learn.rejected` in the audit
+log counts them). Preferences are exempt: "wants short answers" is legitimately
+a plain sentence.
 
 **Context.** Above `context_budget_tokens` the oldest turns are summarised by a
-cheap non-streaming call. Trimming only ever cuts at a `user` boundary, so an
+cheap non-streaming call, and the summary itself is capped at a third of the
+budget: it is re-injected every turn, and an uncapped one grew until no amount
+of trimming could bring the prompt back under budget. Trimming only ever cuts at a `user` boundary, so an
 assistant `tool_calls` message is never separated from its `tool` result.
 
 **Token budget.** `[generation] max_tokens` applies to *every* call, tool turns
@@ -224,7 +252,12 @@ into `~/.hauhau/.snapshots`. The denylist is checked *before* execution.
 
 `/compact` merges memories that say the same thing. `/prune` is the forgetting
 half of the decay model: it drops memories that are stale *and* were never
-retrieved again (an optional weight argument makes it stricter).
+deliberately recalled again (an optional weight argument makes it stricter).
+
+The injected block is assembled memory by memory until `inject_max_chars` is
+spent, then says how many were withheld. Clipping the joined string instead cut
+sentences mid-word — `/srv/… che lives at` — and presented the fragments as
+facts.
 
 ## Not built yet
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -133,6 +134,48 @@ class TestEnsure(ServerTestCase):
             manager.ensure()
         self.assertIn("exited with code 3", str(ctx.exception))
         self.assertIn("server.log", str(ctx.exception))
+
+
+class TestFailedStartupLeavesNothingBehind(ServerTestCase):
+    def _stub_server(self, name: str = "stub-server") -> tuple[Path, Path]:
+        """A fake llama-server that records its pid and then blocks."""
+        pidfile = self.root / f"{name}.pid"
+        script = self.root / name
+        script.write_text(f"#!/bin/sh\necho $$ > '{pidfile}'\nexec sleep 30\n")
+        script.chmod(0o755)
+        return script, pidfile
+
+    def test_failed_startup_kills_the_child_it_spawned(self) -> None:
+        # The CLI exits on a startup error, so an unkilled child is an orphan.
+        script, pidfile = self._stub_server()
+        (self.root / "model.gguf").write_text("stub")
+        self.cfg.model.llama_server = str(script)
+        self.cfg.model.startup_timeout = 1.0
+        manager = ServerManager(self.cfg)
+        with mock.patch.object(manager, "client", return_value=FakeClient(healthy=False)), \
+                self.assertRaises(LLMError) as ctx:
+            manager.ensure()
+        self.assertIn("did not become healthy", str(ctx.exception))
+        pid = int(pidfile.read_text().strip())
+        with self.assertRaises(OSError, msg=f"orphan llama-server survived startup failure (pid {pid})"):
+            os.kill(pid, 0)
+
+    def test_stop_closes_the_log_handle(self) -> None:
+        script, _ = self._stub_server("stub-server-2")
+        (self.root / "model.gguf").write_text("stub")
+        self.cfg.model.llama_server = str(script)
+        manager = ServerManager(self.cfg)
+        # Unhealthy before the spawn (so ensure() actually starts one), healthy after.
+        probe = mock.MagicMock()
+        probe.health.side_effect = [False, True]
+        probe.chat.return_value = "unused"
+        with mock.patch.object(manager, "client", return_value=probe):
+            manager.ensure()
+        handle = manager._log
+        self.assertIsNotNone(handle)
+        manager.stop()
+        self.assertIsNone(manager._log)
+        self.assertTrue(handle.closed, "server.log handle leaked")
 
 
 class TestStop(ServerTestCase):

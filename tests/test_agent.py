@@ -226,6 +226,29 @@ class TestCompression(AgentTestCase):
         self.assertLess(len(agent.messages), 4)
         self.assertEqual(agent.messages[0]["content"], "c" * 200)
 
+    def test_oversized_summary_is_folded(self) -> None:
+        """A summary that outgrew the budget used to block compression forever."""
+        client = FakeClient([reply("- we discussed disks\n- df showed 40 GB free")])
+        agent = self.make_agent(client, context_budget_tokens=600, keep_recent_turns=1)
+        agent.summary = "old note about the machine. " * 400  # ~3k tokens on its own
+        agent.messages = [
+            {"role": "user", "content": "a" * 200},
+            {"role": "assistant", "content": "b" * 200},
+            {"role": "user", "content": "c" * 200},
+            {"role": "assistant", "content": "d" * 200},
+        ]
+        self.assertTrue(agent.compress_if_needed())
+        self.assertLessEqual(len(agent.summary), agent.summary_cap_tokens() * 4 + 40)
+        self.assertIn("df", agent.summary)
+        # Settles: a second pass has nothing left to do, so no model thrash.
+        self.assertFalse(agent.compress_if_needed())
+
+    def test_fold_summary_falls_back_when_the_model_returns_nothing(self) -> None:
+        agent = self.make_agent(FakeClient([reply("")]), context_budget_tokens=600)
+        folded = agent._fold_summary("x" * 4000, 200)
+        self.assertLess(len(folded), 4000)
+        self.assertIn("earlier notes dropped", folded)
+
     def test_never_cuts_between_tool_call_and_result(self) -> None:
         agent = self.make_agent(FakeClient([]))
         agent.messages = [

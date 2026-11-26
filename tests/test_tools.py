@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from hauhau.audit import Audit
+from hauhau.brain import Brain
 from hauhau.config import Config
 from hauhau.tools import build_registry
 
@@ -30,6 +31,58 @@ class ToolTestCase(unittest.TestCase):
         tool = self.registry.get(name)
         assert tool is not None, name
         return tool.run(args)
+
+
+class TestMemoryTools(unittest.TestCase):
+    """The agent's own memory tools, with the real brain and real audit log."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.cfg = Config()
+        self.cfg.logging.data_dir = str(self.root / "data")
+        self.cfg.brain.enabled = True
+        self.cfg.brain.embeddings_url = ""
+        self.audit = Audit(self.cfg.audit_path, "test-memory")
+        self.brain = Brain(self.cfg, self.audit)
+        self.registry = build_registry(self.cfg, self.audit, self.brain)
+
+    def tearDown(self) -> None:
+        self.brain.close()
+        self.audit.close()
+        self._tmp.cleanup()
+
+    def run_tool(self, name: str, **args):
+        tool = self.registry.get(name)
+        assert tool is not None, name
+        return tool.run(args)
+
+    def test_rag_write_stores_and_audits(self) -> None:
+        # Regression: Audit.log named its first parameter ``kind``, so the tool's
+        # own kind= argument crashed every single rag_write call.
+        result = self.run_tool(
+            "rag_write", text="Deploys use the staging pipeline at ci.example/stage.", kind="procedural"
+        )
+        self.assertTrue(result.ok, result.content)
+        self.assertIn("stored", result.content)
+        self.assertEqual(self.brain.stats()["total"], 1)
+        entries = self.audit.tail(5)
+        self.assertTrue(
+            any(e.get("event") == "rag_write" and e.get("memory_kind") == "procedural" for e in entries),
+            entries,
+        )
+
+    def test_rag_write_rejects_empty_text(self) -> None:
+        result = self.run_tool("rag_write", text="   ")
+        self.assertFalse(result.ok)
+        self.assertIn("text", result.content)
+
+    def test_rag_query_finds_what_was_written(self) -> None:
+        self.run_tool("rag_write", text="The model lives at ~/modeller/gguf in this project.")
+        result = self.run_tool("rag_query", query="where does the model live")
+        self.assertTrue(result.ok, result.content)
+        self.assertIn("modeller/gguf", result.content)
+        self.assertTrue(any(e.get("event") == "rag_query" for e in self.audit.tail(5)))
 
 
 class TestShell(ToolTestCase):

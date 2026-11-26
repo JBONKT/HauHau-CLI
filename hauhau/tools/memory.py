@@ -19,7 +19,7 @@ def build(cfg, audit, brain) -> list[Tool]:
             row_id, created = brain.remember(kind, text, str(tags), float(args.get("importance") or 0.5))
         except ValueError as exc:
             return fail(f"rag_write: {exc}")
-        audit.log("rag_write", id=row_id, kind=kind, created=created)
+        audit.log("rag_write", id=row_id, memory_kind=kind, created=created)
         return ok(f"{'stored' if created else 'merged into existing memory'} #{row_id} [{kind}]")
 
     def rag_query(args: dict) -> ToolResult:
