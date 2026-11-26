@@ -216,13 +216,26 @@ class Agent:
         return True
 
     def _safe_split(self, keep: int) -> int:
-        """Index at which it is safe to cut: the next ``user`` message."""
+        """Index at which it is safe to cut the transcript.
+
+        A turn always starts with a ``user`` message, so cutting there can never
+        separate an assistant ``tool_calls`` message from its ``tool`` results.
+        Prefers the latest such boundary that still leaves ``keep`` messages, and
+        otherwise falls back to the earliest one: a context over budget must make
+        progress, or it grows until the window overflows.
+        """
         if len(self.messages) <= keep:
             return 0
-        idx = len(self.messages) - keep
-        while idx < len(self.messages) and self.messages[idx].get("role") != "user":
-            idx += 1
-        return idx if idx < len(self.messages) else 0
+        boundaries = [
+            i for i, m in enumerate(self.messages) if i > 0 and m.get("role") == "user"
+        ]
+        if not boundaries:
+            return 0
+        target = max(0, len(self.messages) - keep)
+        for index in boundaries:
+            if index >= target:
+                return index
+        return boundaries[0]
 
     def _summarise(self, dropped: list[dict]) -> str:
         transcript = []

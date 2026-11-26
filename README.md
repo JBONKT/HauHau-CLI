@@ -21,6 +21,17 @@ native tool use with full terminal access, and the persistent brain with
 post-session self-learning. Phases 4–6 (auto-tuning hill-climb, prompt
 self-evolution, soak testing) are **not** built — see [Not built yet](#not-built-yet).
 
+### Verified end to end
+
+Exercised against the live model on this machine, not just unit-tested:
+multi-step tool turns; cross-session recall; distillation, merging and
+`/prune`/`/compact`; context compression (summarises, then reports
+`summarised yes`); Ctrl-C mid-answer (the child `llama-server` survives and the
+next turn works); `/perf`; `--resume last` and an explicit session id; `--think`;
+`--no-brain`; `--no-server` and a missing model file (clear errors, no
+traceback); piped output (answer only on stdout); and the agent starting and
+stopping its own server.
+
 ## Setup (macOS)
 
 Prerequisites, both from Homebrew:
@@ -101,7 +112,7 @@ plain text.
 
 ```bash
 .venv/bin/ruff check hauhau tests                      # clean
-.venv/bin/python -m unittest discover -s tests -t .    # 200 tests
+.venv/bin/python -m unittest discover -s tests -t .    # 245 tests
 ```
 
 ## Assumptions this build corrects
@@ -193,8 +204,12 @@ into `~/.hauhau/.snapshots`. The denylist is checked *before* execution.
 
 ## Slash commands
 
-`/help` `/tools` `/mem [query]` `/compact` `/remember` `/forget` `/learn`
-`/model` `/perf` `/config` `/audit` `/context` `/clear` `/save` `/quit`
+`/help` `/tools` `/mem [query]` `/compact` `/prune` `/remember` `/forget`
+`/learn` `/model` `/perf` `/config` `/audit` `/context` `/clear` `/save` `/quit`
+
+`/compact` merges memories that say the same thing. `/prune` is the forgetting
+half of the decay model: it drops memories that are stale *and* were never
+retrieved again (an optional weight argument makes it stricter).
 
 ## Not built yet
 

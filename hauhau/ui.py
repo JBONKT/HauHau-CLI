@@ -56,6 +56,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/tools", "tools the model can call"),
     ("/mem", "memory stats, or search memories"),
     ("/compact", "merge near-duplicate memories"),
+    ("/prune", "forget stale memories that were never reused"),
     ("/remember", "store a fact yourself"),
     ("/forget", "delete a memory by id"),
     ("/learn", "distil this session into long-term memory"),

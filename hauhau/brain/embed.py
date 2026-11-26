@@ -39,6 +39,9 @@ class Embedder:
             vector = data["data"][0]["embedding"]
             return [float(x) for x in vector]
         except (urllib.error.URLError, KeyError, IndexError, ValueError, TimeoutError) as exc:
+            close = getattr(exc, "close", None)
+            if callable(close):
+                close()
             # One failure disables vectors for the session instead of retrying
             # on every turn; keyword retrieval keeps working.
             self._broken = True

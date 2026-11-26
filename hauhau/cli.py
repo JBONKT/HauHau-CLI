@@ -67,6 +67,7 @@ class Repl:
             "/tools": self.cmd_tools,
             "/mem": self.cmd_mem,
             "/compact": self.cmd_compact,
+            "/prune": self.cmd_prune,
             "/remember": self.cmd_remember,
             "/forget": self.cmd_forget,
             "/learn": self.cmd_learn,
@@ -132,6 +133,24 @@ class Repl:
         absorbed = self.brain.store.compact()
         after = self.brain.stats()["total"]
         note(self.console, f"merged {absorbed} duplicate memories ({before} → {after})", OK)
+
+    def cmd_prune(self, arg: str) -> None:
+        if self.brain is None:
+            note(self.console, "memory is disabled (--no-brain)", WARN)
+            return
+        try:
+            min_weight = float(arg) if arg.strip() else 0.02
+        except ValueError:
+            note(self.console, "usage: /prune [min_weight]", WARN)
+            return
+        before = self.brain.stats()["total"]
+        removed = self.brain.store.prune(min_weight=min_weight)
+        after = self.brain.stats()["total"]
+        note(
+            self.console,
+            f"pruned {removed} stale memories ({before} → {after})",
+            OK if removed else WARN,
+        )
 
     def cmd_remember(self, arg: str) -> None:
         if self.brain is None or not arg.strip():
@@ -317,15 +336,23 @@ def _apply_args(cfg, args) -> None:
         cfg.agent.max_steps = args.max_steps
 
 
-def _session_path(cfg, resume: str | None) -> Path:
+def _session_path(cfg, resume: str | None) -> tuple[Path, str | None]:
+    """Resolve the session file, returning (path, warning).
+
+    An unknown --resume id must not become a new file named after the id: that
+    wrote an extensionless stray into the sessions directory.
+    """
     cfg.sessions_dir.mkdir(parents=True, exist_ok=True)
-    if resume:
-        if resume == "last":
-            existing = sorted(cfg.sessions_dir.glob("*.json"))
-            return existing[-1] if existing else cfg.sessions_dir / f"{time.strftime('%Y%m%dT%H%M%S')}.json"
-        candidate = cfg.sessions_dir / f"{resume}.json"
-        return candidate if candidate.exists() else cfg.sessions_dir / f"{resume}"
-    return cfg.sessions_dir / f"{time.strftime('%Y%m%dT%H%M%S')}.json"
+    fresh = cfg.sessions_dir / f"{time.strftime('%Y%m%dT%H%M%S')}.json"
+    if not resume:
+        return fresh, None
+    if resume == "last":
+        existing = sorted(cfg.sessions_dir.glob("*.json"))
+        return (existing[-1], None) if existing else (fresh, None)
+    candidate = cfg.sessions_dir / (resume if resume.endswith(".json") else f"{resume}.json")
+    if candidate.is_file():
+        return candidate, None
+    return fresh, f"no session named {resume!r} - starting a new one"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -364,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
             for change in changes:
                 note(console, f"  {change}")
 
-    session_path = _session_path(cfg, args.resume)
+    session_path, session_warning = _session_path(cfg, args.resume)
     session_id = session_path.stem
     audit = Audit(cfg.audit_path, session_id, cfg.logging.audit)
     manager = ServerManager(cfg, audit)
@@ -390,9 +417,21 @@ def main(argv: list[str] | None = None) -> int:
             return False
         return answer.strip().lower() in ("y", "yes")
 
+    def revive_backend() -> bool:
+        """Make sure a backend exists after an interrupt or a failed turn."""
+        if not cfg.model.manage_server:
+            return False
+        try:
+            manager.ensure()
+            return True
+        except LLMError:
+            return False
+
     registry = build_registry(cfg, audit, brain, confirm if cfg.tools.shell_confirm else None)
     agent = Agent(cfg, client, registry, brain, audit, ui)
     learner = Learner(cfg, client, brain, audit)
+    if session_warning:
+        note(console, session_warning, WARN)
     if args.resume and session_path.exists() and agent.load(session_path):
         note(console, f"resumed {agent.turn_count()} turns from {session_path.name}")
 
@@ -472,9 +511,12 @@ def main(argv: list[str] | None = None) -> int:
             except LLMError as exc:
                 ui.interrupt()
                 error_panel(console, str(exc))
+                if revive_backend():
+                    note(console, "backend restarted - ask again", WARN)
             except KeyboardInterrupt:
                 ui.interrupt()
                 note(console, "interrupted", WARN)
+                revive_backend()
     finally:
         finish()
         if console.is_terminal:

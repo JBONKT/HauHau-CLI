@@ -142,6 +142,41 @@ class TestSearch(StoreTestCase):
         self.assertTrue(all(h.kind == "preference" for h in hits))
 
 
+class TestVectors(StoreTestCase):
+    """Hybrid retrieval: the keyword half and the vector half, separately."""
+
+    def test_embedding_is_stored(self) -> None:
+        self.store.write("semantic", "Vector fact.", embedding=[1.0, 0.0, 0.0])
+        self.assertEqual(self.store.stats()["with_embeddings"], 1)
+
+    def test_vector_only_match_is_found(self) -> None:
+        # No shared keywords with the query: only the vector can match this.
+        self.store.write("semantic", "Quarterly revenue grew.", embedding=[1.0, 0.0, 0.0])
+        self.assertEqual(self.store.search("zzz unrelated keywords"), [])
+        hits = self.store.search("zzz unrelated keywords", query_embedding=[1.0, 0.0, 0.0])
+        self.assertEqual(len(hits), 1)
+        self.assertIn("revenue", hits[0].text)
+
+    def test_orthogonal_vector_does_not_match(self) -> None:
+        self.store.write("semantic", "Quarterly revenue grew.", embedding=[1.0, 0.0, 0.0])
+        self.assertEqual(self.store.search("zzz", query_embedding=[0.0, 1.0, 0.0]), [])
+
+    def test_hybrid_prefers_keyword_and_vector_agreement(self) -> None:
+        self.store.write("semantic", "Deploy with make release.", embedding=[1.0, 0.0, 0.0])
+        self.store.write("semantic", "Deploy with scripts/release.sh.", embedding=[0.0, 1.0, 0.0])
+        hits = self.store.search("make release", query_embedding=[1.0, 0.0, 0.0])
+        self.assertEqual(hits[0].text, "Deploy with make release.")
+
+    def test_mismatched_dimensions_are_not_scored(self) -> None:
+        self.store.write("semantic", "Vector fact.", embedding=[1.0, 0.0, 0.0])
+        self.assertEqual(self.store.search("zzz", query_embedding=[1.0, 0.0]), [])
+
+    def test_memories_without_vectors_still_match_by_keyword(self) -> None:
+        self.store.write("semantic", "Plain keyword memory.")
+        hits = self.store.search("plain keyword", query_embedding=[1.0, 0.0, 0.0])
+        self.assertEqual(len(hits), 1)
+
+
 class TestCompaction(StoreTestCase):
     def test_merges_rows_written_before_dedupe_existed(self) -> None:
         # Simulate a legacy store: bypass write() dedupe with raw inserts.

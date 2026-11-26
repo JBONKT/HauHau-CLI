@@ -235,6 +235,30 @@ class TestCompression(AgentTestCase):
         ]
         self.assertEqual(agent._safe_split(2), 0, "trimming here would orphan the tool result")
 
+    def test_makes_progress_when_no_late_boundary_exists(self) -> None:
+        # Regression: with a small budget the tail can be one tool-loop turn, so
+        # no user message sits at the split point. Returning 0 there meant the
+        # transcript was never trimmed again and grew past the budget forever.
+        agent = self.make_agent(FakeClient([]))
+        agent.messages = [
+            {"role": "user", "content": "1"},
+            {"role": "assistant", "content": "2"},
+            {"role": "user", "content": "3"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "t"}]},
+            {"role": "tool", "tool_call_id": "t", "content": "out"},
+            {"role": "assistant", "content": "4"},
+        ]
+        self.assertEqual(agent._safe_split(2), 2, "must fall back to the earliest boundary")
+
+    def test_no_boundary_means_no_cut(self) -> None:
+        agent = self.make_agent(FakeClient([]))
+        agent.messages = [
+            {"role": "user", "content": "1"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "t"}]},
+            {"role": "tool", "tool_call_id": "t", "content": "out"},
+        ]
+        self.assertEqual(agent._safe_split(2), 0)
+
     def test_cuts_at_user_boundary(self) -> None:
         agent = self.make_agent(FakeClient([]))
         agent.messages = [

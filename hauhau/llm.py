@@ -85,6 +85,10 @@ class LlamaClient:
                 body = exc.read().decode("utf-8", "replace")[:600]
             except (OSError, ValueError):  # pragma: no cover - best effort
                 body = ""
+            finally:
+                # HTTPError is a file object holding the socket; leaving it open
+                # leaks a connection per failed request.
+                exc.close()
             raise LLMError(f"llama-server HTTP {exc.code} on {req.full_url}: {body}") from exc
         except urllib.error.URLError as exc:
             raise LLMError(

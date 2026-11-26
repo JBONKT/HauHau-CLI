@@ -160,6 +160,37 @@ class TestCommands(ReplTestCase):
         self.assertIn("merged 1 duplicate", self.text())
         self.assertEqual(self.brain.stats()["total"], 1)
 
+    def test_prune_removes_stale_memories(self) -> None:
+        import time as _time
+
+        old_ts = _time.time() - 86400 * 400
+        self.brain.store.db.execute(
+            "INSERT INTO memories (kind, text, tags, norm_hash, importance, uses, created_at, last_used_at)"
+            " VALUES ('episodic', 'a throwaway note', '', 'h', 0.1, 0, ?, ?)",
+            (old_ts, old_ts),
+        )
+        self.brain.store.db.commit()
+        self.repl.handle("/prune")
+        self.assertIn("pruned 1 stale memories", self.text())
+        self.assertEqual(self.brain.stats()["total"], 0)
+
+    def test_prune_keeps_used_memories(self) -> None:
+        row_id, _ = self.brain.remember("semantic", "Deploy uses make release.", importance=0.9)
+        self.brain.store.db.execute("UPDATE memories SET uses = 3 WHERE id = ?", (row_id,))
+        self.brain.store.db.commit()
+        self.repl.handle("/prune")
+        self.assertIn("pruned 0 stale memories", self.text())
+        self.assertEqual(self.brain.stats()["total"], 1)
+
+    def test_prune_rejects_a_bad_weight(self) -> None:
+        self.repl.handle("/prune abc")
+        self.assertIn("usage: /prune", self.text())
+
+    def test_prune_reports_when_memory_is_off(self) -> None:
+        self.repl.brain = None
+        self.repl.handle("/prune")
+        self.assertIn("memory is disabled", self.text())
+
     def test_quit_stops_loop(self) -> None:
         self.assertTrue(self.repl.running)
         self.repl.handle("/quit")
@@ -180,6 +211,69 @@ class TestCommands(ReplTestCase):
         self.repl.handle("/learn")
         self.assertIn("helix", self.text())
         self.assertEqual(self.brain.stats()["total"], 1)
+
+
+class TestSessionPath(unittest.TestCase):
+    def setUp(self) -> None:
+        import tempfile
+
+        from hauhau.config import Config
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config()
+        self.cfg.logging.data_dir = str(Path(self._tmp.name) / "data")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_new_session_gets_a_timestamped_json_path(self) -> None:
+        from hauhau.cli import _session_path
+
+        path, warning = _session_path(self.cfg, None)
+        self.assertTrue(path.name.endswith(".json"))
+        self.assertIsNone(warning)
+
+    def test_last_picks_the_newest_existing_session(self) -> None:
+        from hauhau.cli import _session_path
+
+        self.cfg.sessions_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("20260101T000000", "20260202T000000"):
+            (self.cfg.sessions_dir / f"{name}.json").write_text("{}")
+        path, warning = _session_path(self.cfg, "last")
+        self.assertEqual(path.stem, "20260202T000000")
+        self.assertIsNone(warning)
+
+    def test_last_with_no_sessions_starts_fresh(self) -> None:
+        from hauhau.cli import _session_path
+
+        path, warning = _session_path(self.cfg, "last")
+        self.assertTrue(path.name.endswith(".json"))
+        self.assertIsNone(warning)
+
+    def test_named_session_is_resolved(self) -> None:
+        from hauhau.cli import _session_path
+
+        self.cfg.sessions_dir.mkdir(parents=True, exist_ok=True)
+        target = self.cfg.sessions_dir / "abc.json"
+        target.write_text("{}")
+        self.assertEqual(_session_path(self.cfg, "abc"), (target, None))
+
+    def test_name_with_extension_is_accepted(self) -> None:
+        from hauhau.cli import _session_path
+
+        self.cfg.sessions_dir.mkdir(parents=True, exist_ok=True)
+        target = self.cfg.sessions_dir / "abc.json"
+        target.write_text("{}")
+        self.assertEqual(_session_path(self.cfg, "abc.json"), (target, None))
+
+    def test_unknown_name_warns_and_does_not_create_a_stray_file(self) -> None:
+        # Regression: this used to return <dir>/does-not-exist and then persist to it.
+        from hauhau.cli import _session_path
+
+        path, warning = _session_path(self.cfg, "does-not-exist")
+        self.assertTrue(path.name.endswith(".json"))
+        self.assertIn("no session named", warning)
+        self.assertFalse((self.cfg.sessions_dir / "does-not-exist").exists())
 
 
 class TestUI(ReplTestCase):

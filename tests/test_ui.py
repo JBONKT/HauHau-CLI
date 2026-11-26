@@ -300,6 +300,30 @@ class TestPromptChrome(unittest.TestCase):
     def test_completer_ignores_plain_text(self) -> None:
         self.assertEqual(list(SlashCompleter().get_completions(Document("hello"), None)), [])
 
+    def test_esc_enter_inserts_a_newline_instead_of_submitting(self) -> None:
+        import tempfile
+        from pathlib import Path as _Path
+
+        from prompt_toolkit.keys import Keys
+
+        from hauhau.ui import make_prompt_session
+
+        session = make_prompt_session(_Path(tempfile.mkdtemp()) / "hist", lambda: "tb")
+        bound = {tuple(b.keys) for b in session.key_bindings.bindings}
+        # prompt_toolkit normalises "enter" to ControlM.
+        self.assertIn((Keys.Escape, Keys.ControlM), bound)
+
+    def test_prompt_session_has_completion_and_history(self) -> None:
+        import tempfile
+        from pathlib import Path as _Path
+
+        from hauhau.ui import make_prompt_session
+
+        session = make_prompt_session(_Path(tempfile.mkdtemp()) / "hist", lambda: "tb")
+        self.assertIsInstance(session.completer, SlashCompleter)
+        self.assertTrue(session.complete_while_typing)
+        self.assertIsNotNone(session.bottom_toolbar)
+
     def test_prompt_glyph(self) -> None:
         self.assertEqual(PROMPT_GLYPH, "❯")  # noqa: RUF001 - the glyph under test
 

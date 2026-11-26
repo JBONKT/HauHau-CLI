@@ -70,7 +70,7 @@ class ServerManager:
         log = self._log_path.open("a", encoding="utf-8")
         log.write(f"\n=== {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} starting ===\n")
         log.flush()
-        self._proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        self._proc = self._popen(args, log)
 
         deadline = time.monotonic() + self.cfg.model.startup_timeout
         while time.monotonic() < deadline:
@@ -83,6 +83,21 @@ class ServerManager:
             time.sleep(0.5)
         raise LLMError(
             f"llama-server did not become healthy in {self.cfg.model.startup_timeout}s; see {self._log_path}"
+        )
+
+    def _popen(self, args: list[str], log) -> subprocess.Popen:
+        """Start the server in its own session.
+
+        Without ``start_new_session`` the child sits in the terminal's foreground
+        process group, so Ctrl-C during a long answer killed the model server and
+        every later turn failed with "Connection refused".
+        """
+        return subprocess.Popen(
+            args,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
         )
 
     def restart(self) -> LlamaClient:
