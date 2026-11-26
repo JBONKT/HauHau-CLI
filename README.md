@@ -136,7 +136,7 @@ plain text.
 
 ```bash
 .venv/bin/ruff check hauhau tests                      # clean
-.venv/bin/python -m unittest discover -s tests -t .    # 440 tests
+.venv/bin/python -m unittest discover -s tests -t .    # 462 tests
 ```
 
 ## Assumptions this build corrects

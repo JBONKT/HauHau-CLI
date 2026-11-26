@@ -73,7 +73,7 @@ _SPECIFIC = re.compile(
     r"|\b\d+\.\d+(?:\.\d+)?\b"
     r"|https?://"
     r"|(?<!\w)--?[a-z][a-z0-9-]+"
-    r"|:\d{2,5}\b)",
+    r"|:\d{3,5}\b)",  # a port, not a time of day ("meeting at 10:30")
     re.IGNORECASE,
 )
 
@@ -81,18 +81,31 @@ _SPECIFIC = re.compile(
 # ("the user wants answers in Swedish").
 _NEEDS_SPECIFICS = {"semantic", "procedural"}
 
+# A memory that quantifies over "anything" carries no information: it passed the
+# old guard whenever it also happened to name a flag.
+_VAGUE = re.compile(r"\b(?:anything|everything|something|things|stuff|whatever|etc)\b", re.IGNORECASE)
+
 # Naming a real tool, service or platform is as specific as naming a path: the
 # old rule rejected "the CI provider is GitHub Actions" while accepting
 # "remember to be brief at 10:30".
-# Deliberately *not* language or linter names: "the user runs python to check"
-# is the generic noise this guard exists to drop, while naming the platform,
-# the CI service or the deployment stage is durable machine knowledge.
-_TOOLING = re.compile(
-    r"\b(?:github|gitlab|bitbucket|actions|jenkins|circleci|homebrew|brew|docker|podman"
-    r"|kubernetes|postgres(?:ql)?|mysql|sqlite|redis|nginx|apache|macos|osx|linux|ubuntu"
-    r"|debian|windows|wsl|macbook|imac|emacs|neovim|vscode|pycharm|zsh\b|fish"
-    r"|llama\.cpp|ollama"
-    r"|staging|production|release branch|ci\b|gpu|cuda|metal|rocm)\b",
+# Naming the platform this machine runs on is durable knowledge on its own.
+_TOOLING_PLATFORM = re.compile(
+    r"\b(?:macos|osx|linux|ubuntu|debian|windows|wsl|macbook|imac|homebrew|brew"
+    r"|emacs|neovim|vscode|pycharm|zsh\b|fish|llama\.cpp|ollama|gpu|cuda|metal|rocm"
+    r"|staging|production|release branch)\b",
+    re.IGNORECASE,
+)
+
+# A service name alone is not: "the command ran under docker and exited zero"
+# names one too. It has to be stated as configuration.
+_TOOLING_SERVICE = re.compile(
+    r"\b(?:github|gitlab|bitbucket|actions|jenkins|circleci|docker|podman|kubernetes"
+    r"|postgres(?:ql)?|mysql|sqlite|redis|nginx|apache|ci)\b",
+    re.IGNORECASE,
+)
+_TOOLING_CONTEXT = re.compile(
+    r"\b(?:is|are|uses?|runs? on|provider|pipeline|deploys?|deployed|installed"
+    r"|configured|hosted|serves?)\b",
     re.IGNORECASE,
 )
 
@@ -110,22 +123,40 @@ def _anchors(cfg) -> tuple[str, ...]:
 
 
 def _kind(value: object) -> str:
-    """Only the four stored kinds survive; anything else is a plain fact."""
+    """Map a model-written label onto the four stored kinds.
+
+    Relabelling an unknown label "semantic" made ``durable()`` drop real
+    preferences: "preferences" is not "preference", but it is the same thing.
+    """
     kind = str(value or "semantic").strip().lower()
-    return kind if kind in KINDS else "semantic"
+    if kind in KINDS:
+        return kind
+    for prefix, mapped in (
+        ("pref", "preference"),
+        ("proced", "procedural"),
+        ("episod", "episodic"),
+        ("semantic", "semantic"),
+    ):
+        if kind.startswith(prefix):
+            return mapped
+    return "semantic"
 
 
 def durable(draft: Draft, anchors: tuple[str, ...] = ()) -> bool:
     """Reject generic advice the agent should not need a memory for.
 
-    An unrecognised kind fails *closed*: ``parse_drafts`` accepts whatever string
-    the model sends, so "procedure" (or "Semantic") used to bypass the guard and
-    store exactly the noise it exists to drop.
+    ``parse_drafts`` normalises the label first, and anything still unrecognised
+    is treated as strict: a new spelling of a kind must not be a way to store
+    the noise this guard exists to drop.
     """
     kind = (draft.kind or "").strip().lower()
     if kind in KINDS and kind not in _NEEDS_SPECIFICS:
         return True
-    if _SPECIFIC.search(draft.text) or _TOOLING.search(draft.text):
+    if _VAGUE.search(draft.text):
+        return False
+    if _SPECIFIC.search(draft.text) or _TOOLING_PLATFORM.search(draft.text):
+        return True
+    if _TOOLING_SERVICE.search(draft.text) and _TOOLING_CONTEXT.search(draft.text):
         return True
     low = draft.text.lower()
     return any(anchor in low for anchor in anchors)
@@ -236,9 +267,13 @@ class Learner:
         transcript = build_transcript(messages)
         if len(transcript) < MIN_TRANSCRIPT_CHARS or not worth_distilling(messages):
             return [], []
-        # Transcript first: memory text is model-written and may itself contain
-        # "{known}" or "{transcript}", which the old order spliced in.
-        prompt = PROMPT.replace("{transcript}", transcript).replace("{known}", self._known_block())
+        # Neither body may be re-scanned: the transcript can contain the literal
+        # "{known}" (an f-string in the code being discussed) and memory text can
+        # contain "{transcript}". Swapping the order only moved the hole, so both
+        # are substituted through a sentinel in one pass.
+        prompt = PROMPT.replace("{known}", "\x00KNOWN\x00")
+        prompt = prompt.replace("{transcript}", transcript)
+        prompt = prompt.replace("\x00KNOWN\x00", self._known_block())
         try:
             completion = self.client.chat(
                 [{"role": "user", "content": prompt}],

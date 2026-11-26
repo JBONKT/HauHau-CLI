@@ -398,11 +398,6 @@ class RichUI(UI):
         self.console.print(Text(f"· {text}", style=MUTED))
 
     def tool_call(self, name: str, args: str) -> None:
-        # Stop the spinner before the tool forks. Rich's status runs a refresh
-        # *thread*, and forking a multi-threaded process can leave the child
-        # waiting on a lock that thread held: the first `shell` call in a real
-        # terminal hung the whole REPL, while a piped run (no spinner) was fine.
-        self._stop_spinner()
         self.newline()
         detail = summarize_args(name, args)
         line = Text("  ")

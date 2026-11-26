@@ -179,6 +179,27 @@ class TestShell(ToolTestCase):
         self.assertFalse(marker.exists())
         self.assertTrue(any(e["event"] == "shell.denied" for e in self.audit.tail(5)))
 
+    def test_denylist_ignores_a_quoted_mention(self) -> None:
+        # Searching the whole command line refused `echo "rm -rf / is what the
+        # docs warn about"` - the pattern only appears inside the message.
+        self.cfg.tools.denylist = [r"rm\s+-rf\s+/"]
+        result = self.run_tool("shell", cmd='echo "rm -rf / is what the docs warn about"')
+        self.assertTrue(result.ok, result.content)
+        self.assertIn("docs warn", result.content)
+
+    def test_denylist_still_blocks_a_real_statement(self) -> None:
+        self.cfg.tools.denylist = [r"rm\s+-rf\s+/"]
+        for cmd in ("rm -rf /", "echo ok && rm -rf /", "printf 'x'; rm -rf /"):
+            self.assertFalse(self.run_tool("shell", cmd=cmd).ok, cmd)
+
+    def test_output_of_a_background_child_is_flagged_as_incomplete(self) -> None:
+        # The shell exits while the child still holds the pipe; reporting a clean
+        # exit=0 over the truncated output looks like a success.
+        result = self.run_tool("shell", cmd="(sleep 1; echo late) & echo early", timeout=20)
+        self.assertTrue(result.ok, result.content)
+        self.assertIn("early", result.content)
+        self.assertIn("background", result.content)
+
     def test_confirm_callback_can_decline(self) -> None:
         self.cfg.tools.shell_confirm = True
         registry = build_registry(self.cfg, self.audit, brain=None, confirm=lambda cmd: False)
@@ -435,11 +456,36 @@ class TestToolHardening(ToolTestCase):
         result = self.run_tool("grep", pattern="needle", path=str(self.root), ignore_case="false")
         self.assertIn("no matches", result.content)
 
+    def test_find_and_grep_agree_about_hidden_trees(self) -> None:
+        # grep skipped hidden directories while find walked them, so the same
+        # search reported different files depending on the tool.
+        hidden = self.root / ".work"
+        hidden.mkdir()
+        (hidden / "secret.txt").write_text("x")
+        (self.root / "visible.txt").write_text("x")
+        found = self.run_tool("find", pattern="*.txt", path=str(self.root)).content
+        self.assertIn("visible.txt", found)
+        self.assertNotIn("secret.txt", found)
+
     def test_find_caps_max_results(self) -> None:
         for i in range(5):
             (self.root / f"f{i}.txt").write_text("x")
         result = self.run_tool("find", pattern="*.txt", path=str(self.root), max_results=2)
         self.assertLessEqual(len(result.content.splitlines()), 2)
+
+
+class TestClipText(unittest.TestCase):
+    def test_never_exceeds_the_limit(self) -> None:
+        from hauhau.util import clip_text
+
+        for limit in (41, 60, 100, 320, 8000):
+            out = clip_text("x" * 20000, limit)
+            self.assertLessEqual(len(out), limit, f"limit {limit} produced {len(out)}")
+
+    def test_short_text_is_untouched(self) -> None:
+        from hauhau.util import clip_text
+
+        self.assertEqual(clip_text("hello", 100), "hello")
 
 
 class TestRegistryShape(ToolTestCase):

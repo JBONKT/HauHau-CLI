@@ -43,11 +43,6 @@ class Task:
     contains: tuple[str, ...] = ()
     exact: bool = False
 
-    @property
-    def kind(self) -> str:
-        return "tool" if self.tools_any else "text"
-
-
 # Written against the tool names in hauhau.tools. "shell" is accepted nearly
 # everywhere because it is the general-purpose escape hatch a small model
 # reaches for first; requiring a specific tool would measure the model's taste
@@ -87,7 +82,9 @@ DEFAULT_TASKS: tuple[Task, ...] = (
     Task("recall", "What do you remember about my release checklist?", ("rag_query",)),
     Task("store-fact", "Remember that deploys go through the staging pipeline.", ("rag_write",)),
     Task("exact-reply", "Reply with exactly: pong", contains=("pong",), exact=True),
-    Task("no-tool-answer", "In one short sentence: what does the ls command do?", contains=("list",)),
+    # "lists" is the natural answer; requiring the bare "list" token failed every
+    # correct reply and fed the evolution gate a false failure.
+    Task("no-tool-answer", "In one short sentence: what does the ls command do?", contains=("list", "lists")),
     Task("arithmetic", "What is 1+1? Answer with the number only.", contains=("2",)),
 )
 

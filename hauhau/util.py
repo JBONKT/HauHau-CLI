@@ -29,13 +29,28 @@ def estimate_messages_tokens(messages: Iterable[dict]) -> int:
 
 
 def clip_text(text: str, limit: int) -> str:
-    """Keep head and tail when a tool output exceeds the limit."""
+    """Keep head and tail when a tool output exceeds the limit.
+
+    The truncation marker counts against the limit: the old version trimmed to
+    ``limit`` and then appended ~28 characters, so every clipped tool result
+    was over budget.
+    """
     if limit <= 0 or len(text) <= limit:
         return text
-    head = int(limit * 0.7)
-    tail = limit - head
+    marker_room = 40  # "[NNNNN chars truncated]" plus the newlines around it
+    if limit <= marker_room:
+        return text[:limit]
+    budget = limit - marker_room
+    head = int(budget * 0.7)
+    tail = budget - head
     removed = len(text) - head - tail
-    return f"{text[:head]}\n...[{removed} chars truncated]...\n{text[-tail:]}"
+    marker = f"\n...[{removed} chars truncated]...\n"
+    overflow = head + tail + len(marker) - limit
+    if overflow > 0:
+        tail = max(0, tail - overflow)
+        removed = len(text) - head - tail
+        marker = f"\n...[{removed} chars truncated]...\n"
+    return text[:head] + marker + (text[-tail:] if tail else "")
 
 
 def snapshot_file(path: Path, dest_dir: Path) -> Path | None:

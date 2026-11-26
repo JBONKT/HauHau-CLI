@@ -103,6 +103,24 @@ class TestLearner(unittest.TestCase):
         self.brain.close()
         self._tmp.cleanup()
 
+    def test_a_transcript_mentioning_known_is_not_rescanned(self) -> None:
+        # The transcript can contain the literal "{known}" (an f-string in the
+        # code under discussion). Substituting in the wrong order spliced the
+        # memory block into the user text.
+        self.brain.remember("preference", "The user prefers terse answers here.", importance=0.8)
+        payload = '[{"kind":"semantic","text":"The project file is app.py here."}]'
+        client = FakeClient([payload])
+        messages = [
+            {"role": "user", "content": 'why does print(f"{known}") show the whole block?'},
+            {"role": "assistant", "content": "Because the placeholder is substituted first."},
+            {"role": "tool", "name": "read_file", "content": "learn.py:238  prompt = PROMPT.replace(...)"},
+        ]
+        Learner(self.cfg, client, self.brain).distill(messages)
+        self.assertTrue(client.calls, "the model was never asked")
+        prompt = client.calls[0]["messages"][0]["content"]
+        self.assertIn('print(f"{known}")', prompt)
+        self.assertNotIn("The user prefers terse answers here.\nBecause", prompt)
+
     def test_distilled_memories_are_stored(self) -> None:
         payload = (
             '[{"kind":"preference","text":"The user wants pytest run with the -x flag here.",'
@@ -232,12 +250,46 @@ class TestDurableKindValidation(unittest.TestCase):
         ):
             self.assertFalse(durable(Draft("procedural", text), ("hauhau", "johan")), text)
 
+    def test_a_near_miss_kind_label_keeps_the_preference(self) -> None:
+        # "preferences" became "semantic" and durable() then dropped the fact.
+        draft = parse_drafts(
+            '[{"kind": "preferences", "text": "The user prefers terse answers and no trailing summaries."}]'
+        )[0]
+        self.assertEqual(draft.kind, "preference")
+        self.assertTrue(durable(draft, ("hauhau",)))
+
+    def test_a_service_name_alone_is_not_durable_knowledge(self) -> None:
+        for text in (
+            "Ran the tests with pytest and they passed.",
+            "The command ran under docker and exited zero.",
+            "Checked the CI status and it was green.",
+        ):
+            self.assertFalse(durable(Draft("semantic", text), ("hauhau", "johan")), text)
+        self.assertTrue(
+            durable(Draft("semantic", "The CI provider for this repository is GitHub Actions."))
+        )
+
+    def test_a_time_of_day_is_not_a_port(self) -> None:
+        self.assertFalse(durable(Draft("semantic", "The meeting is at 10:30, remember to be brief.")))
+        self.assertTrue(durable(Draft("semantic", "The local server listens on localhost:8080.")))
+
+    def test_a_flag_does_not_make_a_vague_rule_durable(self) -> None:
+        # "always passes --verbose when debugging anything" passed the old guard
+        # on the strength of the flag alone.
+        self.assertFalse(durable(Draft("procedural", "The user always passes --verbose when debugging anything.")))
+
     def test_a_plain_preference_is_still_kept(self) -> None:
         self.assertTrue(durable(Draft("preference", "The user wants answers in Swedish.")))
 
     def test_parse_drafts_normalises_the_kind(self) -> None:
-        drafts = parse_drafts('[{"kind": "Procedure", "text": "Run make test before committing."}]')
-        self.assertEqual(drafts[0].kind, "semantic")
+        # "Procedure" is procedural (a near miss used to become "semantic"),
+        # while an unrecognised label is still a plain fact.
+        drafts = parse_drafts(
+            '[{"kind": "Procedure", "text": "Run make test before committing."},'
+            ' {"kind": "hunch", "text": "The user likes short answers."}]'
+        )
+        self.assertEqual(drafts[0].kind, "procedural")
+        self.assertEqual(drafts[1].kind, "semantic")
 
 if __name__ == "__main__":
     unittest.main()

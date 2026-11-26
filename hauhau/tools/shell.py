@@ -50,14 +50,24 @@ def _normalise(cmd: str) -> str:
 
 
 def _denylist_hit(cmd: str, patterns: list[str]) -> str | None:
-    normalised = _normalise(cmd)
+    """Match a pattern at the start of a statement, not anywhere in the line.
+
+    Searching the whole command refused ``echo "rm -rf / is what the docs warn
+    about"`` - the pattern only appears inside a quoted message, and the command
+    that would run is ``echo``. Each ``;``/``&&``/``||``/``|``-separated segment
+    is therefore matched from its start.
+    """
+    segments = [segment.strip() for segment in re.split(r"&&|\|\||;|\|", _normalise(cmd))]
     for pattern in patterns:
-        try:
-            if re.search(pattern, normalised, re.IGNORECASE):
-                return pattern
-        except re.error:
-            if pattern.lower() in normalised:
-                return pattern
+        for segment in segments:
+            if not segment:
+                continue
+            try:
+                if re.match(pattern, segment, re.IGNORECASE):
+                    return pattern
+            except re.error:
+                if segment.startswith(pattern.lower()):
+                    return pattern
     return None
 
 
@@ -105,7 +115,6 @@ def build(
                     "do not report any output."
                 )
 
-        started = time.monotonic()
         try:
             proc = subprocess.Popen(
                 ["bash", "-lc", cmd],
@@ -118,6 +127,8 @@ def build(
         except OSError as exc:
             audit.log("shell.error", cmd=cmd, error=str(exc))
             return fail(f"shell: could not run command: {exc}")
+        # Timed from the spawn: `bash -lc` startup is not the caller's budget.
+        started = time.monotonic()
 
         # Read until the child is gone, not until the pipe reaches EOF.
         # communicate() waits for *every* holder of the write end, so a daemon
@@ -127,6 +138,7 @@ def build(
         chunks: list[bytes] = []
         deadline = started + timeout
         timed_out = False
+        background = False
         stream = proc.stdout
         if stream is None:  # stdout=PIPE guarantees one; keep mypy honest
             _kill_tree(proc)
@@ -134,7 +146,8 @@ def build(
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                timed_out = True
+                # The deadline can pass in the same breath as the exit.
+                timed_out = proc.poll() is None
                 break
             ready, _, _ = select.select([stream], [], [], min(0.2, remaining))
             if ready:
@@ -145,6 +158,7 @@ def build(
             elif proc.poll() is not None:
                 # The command finished and nothing is buffered: stop here rather
                 # than waiting for an unrelated process to close the pipe.
+                background = True
                 break
         if timed_out:
             _kill_tree(proc)
@@ -170,6 +184,13 @@ def build(
         audit.log("shell", cmd=cmd, cwd=cwd, exit=proc.returncode, duration=round(duration, 3))
         body = clip_text(output.rstrip(), cfg.tools.max_output_chars)
         result = f"exit={proc.returncode}\n{body}" if body else f"exit={proc.returncode}\n(no output)"
+        if background:
+            # The shell exited while a background process may still be writing.
+            # Reporting exit=0 over truncated output looks like a clean success.
+            result += (
+                "\n(note: the shell exited before the output pipe closed; a background "
+                "process may still be writing, and its output is not in this result)"
+            )
         return ToolResult(proc.returncode == 0, result, {"exit": proc.returncode, "duration": duration})
 
     return [

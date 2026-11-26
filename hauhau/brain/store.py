@@ -203,21 +203,34 @@ def _mergeable(
         short_text, short_tokens, long_text, long_tokens = new_text, new_tokens, old_text, old_tokens
     else:
         short_text, short_tokens, long_text, long_tokens = old_text, old_tokens, new_text, new_tokens
-    if not long_text or len(short_text) >= 0.5 * len(long_text):
+    if len(short_text) >= 0.5 * len(long_text):
         return True
     # A much shorter memory is only a repetition when the long one says
     # everything it says; "Ruff" is the subject of a sentence, not a repeat of it.
     return len(short_tokens) >= 3 and short_tokens <= long_tokens
 
 
-def _merge_tags(old: str, new: str) -> str:
-    """Union of two tag lists - a merge used to drop the incoming tags."""
+def _merge_tags(old: str, new: str, limit: int = 400) -> str:
+    """Union of two tag lists, trimmed at a tag boundary.
+
+    A merge used to drop the incoming tags, and the first version of this
+    function then cut the joined string at 400 characters - which wrote half a
+    tag ("...tag056,t") into the row.
+    """
     parts = [p.strip() for p in (old or "").split(",") if p.strip()]
     for part in (new or "").split(","):
         part = part.strip()
         if part and part not in parts:
             parts.append(part)
-    return ",".join(parts)[:400]
+    kept: list[str] = []
+    length = 0
+    for part in parts:
+        added = len(part) + (1 if kept else 0)
+        if length + added > limit:
+            break
+        kept.append(part)
+        length += added
+    return ",".join(kept)
 
 
 def _pack(vec: list[float]) -> bytes:
@@ -290,6 +303,17 @@ class MemoryStore:
             if name not in cols:
                 self.db.execute(f"ALTER TABLE memories ADD COLUMN {name} {decl}")
         now = time.time()
+        # Five full-table UPDATEs on every open would rewrite a large brain.db
+        # for nothing; one probe decides whether any row needs repair.
+        damaged = self.db.execute(
+            "SELECT 1 FROM memories WHERE norm_hash IS NULL OR importance IS NULL"
+            " OR uses IS NULL OR created_at > ? OR last_used_at IS NULL"
+            " OR last_used_at = 0 OR last_used_at > ? LIMIT 1",
+            (now, now),
+        ).fetchone()
+        if not damaged:
+            self.db.commit()
+            return
         self.db.execute("UPDATE memories SET norm_hash = '' WHERE norm_hash IS NULL")
         self.db.execute("UPDATE memories SET importance = 0.5 WHERE importance IS NULL")
         self.db.execute("UPDATE memories SET uses = 0 WHERE uses IS NULL")
@@ -519,7 +543,7 @@ class MemoryStore:
         absorbed = 0
         rows = list(
             self.db.execute(
-                "SELECT id, text, uses, created_at, importance FROM memories ORDER BY created_at ASC"
+                "SELECT id, text, tags, uses, created_at, importance FROM memories ORDER BY created_at ASC"
             )
         )
         kept: list[dict] = []
@@ -536,9 +560,10 @@ class MemoryStore:
             seen: set[int] = set()
             candidates: list[dict] = []
             for token in keys:
-                # Cap the bucket: a very common word would otherwise compare
-                # this row against thousands of survivors.
-                for survivor in index.get(token, ())[-64:]:
+                # No cap: a window made compact() permanently blind to exactly
+                # the duplicates it exists to remove (write() merged them, so the
+                # second pass never ran).
+                for survivor in index.get(token, ()):
                     if id(survivor) not in seen:
                         seen.add(id(survivor))
                         candidates.append(survivor)
@@ -561,7 +586,8 @@ class MemoryStore:
                     break
             if match is None:
                 entry = {
-                    "id": row["id"], "text": row["text"], "tokens": tokens, "nums": nums,
+                    "id": row["id"], "text": row["text"], "tags": row["tags"] or "",
+                    "tokens": tokens, "nums": nums,
                     "arts": arts, "uses": row["uses"], "created_at": row["created_at"],
                     "importance": row["importance"], "dirty": False,
                 }
@@ -571,6 +597,7 @@ class MemoryStore:
                 continue
             richest = max(match["text"], row["text"], key=len)
             match["uses"] += row["uses"] + 1
+            match["tags"] = _merge_tags(match.get("tags", ""), row["tags"] or "")
             match["importance"] = max(match["importance"], row["importance"])
             match["dirty"] = True
             if richest != match["text"]:
@@ -590,8 +617,8 @@ class MemoryStore:
             if not survivor["dirty"]:
                 continue
             self.db.execute(
-                "UPDATE memories SET text = ?, norm_hash = ?, uses = ?, importance = ? WHERE id = ?",
-                (survivor["text"], norm_hash(survivor["text"]), survivor["uses"],
+                "UPDATE memories SET text = ?, norm_hash = ?, tags = ?, uses = ?, importance = ? WHERE id = ?",
+                (survivor["text"], norm_hash(survivor["text"]), survivor["tags"], survivor["uses"],
                  survivor["importance"], survivor["id"]),
             )
         self.db.commit()

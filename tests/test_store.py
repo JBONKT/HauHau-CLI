@@ -488,6 +488,47 @@ class TestStoreHardening(StoreTestCase):
             frozenset({"/users/johan/modeller/gguf."}),
         )
 
+    def test_compact_keeps_the_tags_of_both_rows(self) -> None:
+        now = time.time()
+        for text, tags in (
+            ("Uses uv for every python project here.", "python,packaging"),
+            ("Uses uv for every python project on this machine.", "tooling,venv"),
+        ):
+            self.store.db.execute(
+                "INSERT INTO memories (kind, text, tags, norm_hash, importance, uses, created_at, last_used_at)"
+                " VALUES ('semantic', ?, ?, ?, 0.5, 0, ?, ?)",
+                (text, tags, text, now, now),
+            )
+        self.store.db.commit()
+        self.assertEqual(self.store.compact(), 1)
+        tags = self.store.db.execute("SELECT tags FROM memories").fetchone()["tags"]
+        for expected in ("python", "packaging", "tooling", "venv"):
+            self.assertIn(expected, tags)
+
+    def test_compact_finds_a_duplicate_beyond_a_bucket_window(self) -> None:
+        # A capped bucket made compact() permanently blind to the duplicates it
+        # exists to remove: write() merged them, the second pass never saw them.
+        now = time.time()
+        rows = [("semantic", "deploy 42 staging", "", "h0")]
+        rows += [("semantic", f"deploy 42 staging {i}", "", f"h{i + 1}") for i in range(70)]
+        for kind, text, tags, digest in rows:
+            self.store.db.execute(
+                "INSERT INTO memories (kind, text, tags, norm_hash, importance, uses, created_at, last_used_at)"
+                " VALUES (?, ?, ?, ?, 0.5, 0, ?, ?)",
+                (kind, text, tags, digest, now, now),
+            )
+        self.store.db.commit()
+        self.assertGreaterEqual(self.store.compact(), 1)
+        self.assertLess(self.store.stats()["total"], len(rows))
+
+    def test_merge_tags_trims_at_a_tag_boundary(self) -> None:
+        from hauhau.brain.store import _merge_tags
+
+        old = ",".join(f"tag{i:03d}" for i in range(60))
+        merged = _merge_tags(old, "extra,tooling", limit=60)
+        self.assertLessEqual(len(merged), 60)
+        self.assertTrue(merged.split(",")[-1].startswith("tag"), merged)
+
     def test_legacy_database_is_migrated_on_open(self) -> None:
         import sqlite3
 

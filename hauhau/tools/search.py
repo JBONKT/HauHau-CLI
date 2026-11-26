@@ -70,7 +70,9 @@ def build(cfg, audit) -> list[Tool]:
         max_results = integer(args, "max_results", 200, minimum=1, maximum=2000)
         found: list[str] = []
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            # grep skips hidden trees; walking them here made the same search
+            # return different files depending on which tool was used.
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
             for name in filenames + dirnames:
                 if fnmatch.fnmatch(name, pattern):
                     found.append(str((Path(dirpath) / name).relative_to(root)))

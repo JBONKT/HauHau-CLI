@@ -274,6 +274,13 @@ class TestVersionNumbers(unittest.TestCase):
         self.assertEqual(f"{versions[0].score:.0%}", "90%")
 
 
+class TestProseTask(unittest.TestCase):
+    def test_the_natural_answer_passes(self) -> None:
+        task = Task("no-tool-answer", "what does ls do?", contains=("list", "lists"))
+        for answer in ("The ls command lists directory contents.", "ls lists files and directories."):
+            self.assertTrue(_judge(task, Completion(content=answer))[0], answer)
+
+
 class TestJudgeIsNotSubstring(unittest.TestCase):
     def test_a_longer_number_does_not_pass(self) -> None:
         task = Task("arithmetic", "What is 1+1? Answer with the number only.", contains=("2",))
