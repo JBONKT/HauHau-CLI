@@ -1,0 +1,19 @@
+[project]
+name = "hauhau"
+version = "0.1.0"
+description = "Conversational, self-learning CLI agent on a local Gemma GGUF via llama.cpp"
+requires-python = ">=3.11"
+dependencies = [
+    "rich>=13",
+    "prompt_toolkit>=3.0",
+]
+
+[project.scripts]
+hauhau = "hauhau.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hauhau*"]

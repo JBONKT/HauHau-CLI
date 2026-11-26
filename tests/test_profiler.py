@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+import unittest
+
+from hauhau.config import Config
+from hauhau.profiler import HardwareProfile, apply_recommendations, recommend
+
+
+def profile(**kwargs) -> HardwareProfile:
+    base = dict(
+        os_name="Darwin",
+        arch="arm64",
+        cpu="Apple M1",
+        cores=8,
+        ram_gb=8.0,
+        gpu="Apple Silicon (Metal)",
+        metal=True,
+        disk_free_gb=100.0,
+        llama_server="/opt/homebrew/bin/llama-server",
+        llama_version="12359",
+        notes=[],
+    )
+    base.update(kwargs)
+    return HardwareProfile(**base)
+
+
+class TestRecommend(unittest.TestCase):
+    def test_apple_silicon_full_offload(self) -> None:
+        rec = recommend(profile())
+        self.assertEqual(rec["n_gpu_layers"][0], 99)
+        self.assertEqual(rec["n_ctx"][0], 8192)
+        self.assertLessEqual(rec["n_threads"][0], 6)
+
+    def test_small_ram_keeps_context_small(self) -> None:
+        self.assertEqual(recommend(profile(ram_gb=8.0))["n_ctx"][0], 8192)
+        self.assertEqual(recommend(profile(ram_gb=16.0))["n_ctx"][0], 16384)
+        self.assertEqual(recommend(profile(ram_gb=64.0))["n_ctx"][0], 32768)
+
+    def test_cpu_only_machine_offloads_nothing(self) -> None:
+        rec = recommend(profile(metal=False, arch="x86_64", cores=4))
+        self.assertEqual(rec["n_gpu_layers"][0], 0)
+        self.assertEqual(rec["n_threads"][0], 3)
+
+    def test_oversized_model_warns(self) -> None:
+        rec = recommend(profile(ram_gb=8.0), model_bytes=int(6.5 * 1024**3))
+        self.assertIn("warn_quant", rec)
+        self.assertTrue(rec["warn_quant"][0])
+
+    def test_model_fitting_budget_does_not_warn(self) -> None:
+        rec = recommend(profile(ram_gb=8.0), model_bytes=int(3.2 * 1024**3))
+        self.assertNotIn("warn_quant", rec)
+
+
+class TestApply(unittest.TestCase):
+    def test_values_are_written_and_changes_described(self) -> None:
+        cfg = Config()
+        cfg.model.n_ctx = 2048
+        cfg.model.n_threads = 1
+        changes = apply_recommendations(cfg, profile())
+        self.assertEqual(cfg.model.n_ctx, 8192)
+        self.assertEqual(cfg.model.n_threads, 4)
+        self.assertTrue(any("n_ctx" in c for c in changes))
+
+    def test_already_correct_values_report_nothing(self) -> None:
+        cfg = Config()
+        cfg.model.n_ctx = 8192
+        cfg.model.n_threads = 4
+        cfg.model.n_gpu_layers = 99
+        self.assertEqual(apply_recommendations(cfg, profile()), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

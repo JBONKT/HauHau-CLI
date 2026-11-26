@@ -1,0 +1,239 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from hauhau.agent import Agent, UI
+from hauhau.config import Config
+from hauhau.llm import Completion, ToolCall, Usage
+from hauhau.tools.base import Registry, Tool, fail, ok
+
+
+class FakeClient:
+    """Scripted stand-in for LlamaClient."""
+
+    def __init__(self, completions: list[Completion]) -> None:
+        self.completions = list(completions)
+        self.calls: list[dict] = []
+
+    def chat(self, messages, tools=None, **kwargs) -> Completion:
+        self.calls.append({"messages": messages, "tools": tools, **kwargs})
+        if not self.completions:
+            return Completion(content="(ran out of scripted replies)", finish_reason="stop")
+        return self.completions.pop(0)
+
+
+def tool_call(name: str = "echo", args: str = '{"text":"hi"}', call_id: str = "c1") -> Completion:
+    return Completion(tool_calls=[ToolCall(id=call_id, name=name, arguments=args)], finish_reason="tool_calls")
+
+
+def reply(text: str) -> Completion:
+    return Completion(content=text, finish_reason="stop", usage=Usage(completion_tokens=5, tok_per_second=27.0))
+
+
+def make_registry(log: list) -> Registry:
+    def echo(args):
+        log.append(args.get("text"))
+        return ok(f"echoed {args.get('text')}")
+
+    return Registry([
+        Tool("echo", "Echo text back.", {"type": "object", "properties": {"text": {"type": "string"}},
+                                           "required": ["text"]}, echo),
+        Tool("boom", "Always raises.", {"type": "object", "properties": {}},
+             lambda args: (_ for _ in ()).throw(RuntimeError("kaboom"))),
+        Tool("denied", "Always fails cleanly.", {"type": "object", "properties": {}},
+             lambda args: fail("nope")),
+    ])
+
+
+class AgentTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.cfg = Config()
+        self.cfg.logging.data_dir = str(self.root / "data")
+        self.cfg.tools.workspace = str(self.root)
+        self.cfg.brain.enabled = False
+        self.log: list = []
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def make_agent(self, client, **cfg_overrides) -> Agent:
+        for key, value in cfg_overrides.items():
+            setattr(self.cfg.agent, key, value)
+        return Agent(self.cfg, client, make_registry(self.log), brain=None, ui=UI())
+
+
+class TestToolLoop(AgentTestCase):
+    def test_single_tool_call_then_answer(self) -> None:
+        client = FakeClient([tool_call(), reply("done: hi")])
+        agent = self.make_agent(client)
+        text = agent.run_turn("say hi")
+
+        self.assertEqual(text, "done: hi")
+        self.assertEqual(self.log, ["hi"])
+        roles = [m["role"] for m in agent.messages]
+        self.assertEqual(roles, ["user", "assistant", "tool", "assistant"])
+        self.assertEqual(agent.messages[1]["tool_calls"][0]["function"]["name"], "echo")
+        self.assertEqual(agent.messages[2]["tool_call_id"], "c1")
+        self.assertIn("echoed hi", agent.messages[2]["content"])
+
+    def test_tool_message_shape_matches_openai(self) -> None:
+        client = FakeClient([tool_call(), reply("ok")])
+        agent = self.make_agent(client)
+        agent.run_turn("go")
+        tool_msg = agent.messages[2]
+        self.assertEqual(tool_msg["role"], "tool")
+        self.assertEqual(tool_msg["name"], "echo")
+        self.assertIn("tool_call_id", tool_msg)
+
+    def test_tools_are_offered_on_first_call(self) -> None:
+        client = FakeClient([reply("no tools needed")])
+        agent = self.make_agent(client)
+        agent.run_turn("hello")
+        self.assertIsNotNone(client.calls[0]["tools"])
+        names = [t["function"]["name"] for t in client.calls[0]["tools"]]
+        self.assertIn("echo", names)
+
+    def test_multiple_tool_calls_in_one_turn(self) -> None:
+        multi = Completion(
+            tool_calls=[
+                ToolCall(id="a", name="echo", arguments='{"text":"one"}'),
+                ToolCall(id="b", name="echo", arguments='{"text":"two"}'),
+            ],
+            finish_reason="tool_calls",
+        )
+        client = FakeClient([multi, reply("both done")])
+        agent = self.make_agent(client)
+        agent.run_turn("do both")
+        self.assertEqual(self.log, ["one", "two"])
+        self.assertEqual([m["role"] for m in agent.messages].count("tool"), 2)
+
+    def test_unknown_tool_reports_available_tools(self) -> None:
+        client = FakeClient([tool_call(name="nope"), reply("adapted")])
+        agent = self.make_agent(client)
+        agent.run_turn("try")
+        self.assertIn("unknown tool", agent.messages[2]["content"])
+        self.assertIn("echo", agent.messages[2]["content"])
+
+    def test_crashing_tool_does_not_kill_the_turn(self) -> None:
+        client = FakeClient([tool_call(name="boom"), reply("recovered")])
+        agent = self.make_agent(client)
+        text = agent.run_turn("boom")
+        self.assertEqual(text, "recovered")
+        self.assertIn("kaboom", agent.messages[2]["content"])
+
+    def test_failed_tool_result_is_passed_through(self) -> None:
+        client = FakeClient([tool_call(name="denied"), reply("fine")])
+        agent = self.make_agent(client)
+        agent.run_turn("x")
+        self.assertIn("nope", agent.messages[2]["content"])
+
+    def test_malformed_arguments_are_reported_not_raised(self) -> None:
+        client = FakeClient([tool_call(args="{not json"), reply("handled")])
+        agent = self.make_agent(client)
+        text = agent.run_turn("x")
+        self.assertEqual(text, "handled")
+        self.assertIn("malformed JSON", agent.messages[2]["content"])
+
+    def test_step_budget_forces_final_answer_without_tools(self) -> None:
+        client = FakeClient([tool_call(call_id="1"), tool_call(call_id="2"), reply("forced")])
+        agent = self.make_agent(client, max_steps=2)
+        text = agent.run_turn("loop please")
+        self.assertEqual(text, "forced")
+        self.assertEqual(len(client.calls), 3)
+        self.assertIsNotNone(client.calls[1]["tools"])
+        self.assertIsNone(client.calls[2]["tools"], "final call must withhold tools")
+
+
+class TestCompression(AgentTestCase):
+    def test_short_conversation_is_untouched(self) -> None:
+        client = FakeClient([])
+        agent = self.make_agent(client)
+        agent.messages = [{"role": "user", "content": "hi"}]
+        self.assertFalse(agent.compress_if_needed())
+
+    def test_long_conversation_is_summarised(self) -> None:
+        client = FakeClient([reply("- user asked about disks\n- we checked df")])
+        agent = self.make_agent(client, context_budget_tokens=60, keep_recent_turns=1)
+        agent.messages = [
+            {"role": "user", "content": "a" * 200},
+            {"role": "assistant", "content": "b" * 200},
+            {"role": "user", "content": "c" * 200},
+            {"role": "assistant", "content": "d" * 200},
+        ]
+        self.assertTrue(agent.compress_if_needed())
+        self.assertIn("df", agent.summary)
+        self.assertLess(len(agent.messages), 4)
+        self.assertEqual(agent.messages[0]["content"], "c" * 200)
+
+    def test_never_cuts_between_tool_call_and_result(self) -> None:
+        agent = self.make_agent(FakeClient([]))
+        agent.messages = [
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+            {"role": "tool", "tool_call_id": "1", "content": "out"},
+        ]
+        self.assertEqual(agent._safe_split(2), 0, "trimming here would orphan the tool result")
+
+    def test_cuts_at_user_boundary(self) -> None:
+        agent = self.make_agent(FakeClient([]))
+        agent.messages = [
+            {"role": "user", "content": "1"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+            {"role": "tool", "tool_call_id": "1", "content": "out"},
+            {"role": "user", "content": "2"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        self.assertEqual(agent._safe_split(2), 3)
+        self.assertEqual(agent.messages[3]["role"], "user")
+
+
+class TestPrompt(AgentTestCase):
+    def test_system_prompt_has_workspace_and_date(self) -> None:
+        agent = self.make_agent(FakeClient([]))
+        prompt = agent.system_prompt("query")
+        self.assertIn(str(self.root), prompt)
+        self.assertIn("Today:", prompt)
+        self.assertIn(self.cfg.agent.name, prompt)
+
+    def test_memory_block_is_injected_when_present(self) -> None:
+        agent = self.make_agent(FakeClient([]))
+
+        class FakeBrain:
+            def context_block(self, query):
+                return "What you remember: the user runs macOS."
+
+        agent.brain = FakeBrain()
+        self.cfg.brain.enabled = True
+        self.assertIn("runs macOS", agent.system_prompt("what os"))
+
+
+class TestPersistence(AgentTestCase):
+    def test_persist_and_load_roundtrip(self) -> None:
+        agent = self.make_agent(FakeClient([reply("hello")]))
+        agent.run_turn("hi")
+        path = self.root / "sessions" / "s1.json"
+        agent.persist(path)
+
+        fresh = self.make_agent(FakeClient([]))
+        self.assertTrue(fresh.load(path))
+        self.assertEqual(fresh.messages, agent.messages)
+        self.assertEqual(fresh.turn_count(), 1)
+
+    def test_load_missing_file_returns_false(self) -> None:
+        agent = self.make_agent(FakeClient([]))
+        self.assertFalse(agent.load(self.root / "nope.json"))
+
+    def test_reset_clears_context(self) -> None:
+        agent = self.make_agent(FakeClient([reply("x")]))
+        agent.run_turn("hi")
+        agent.reset()
+        self.assertEqual(agent.messages, [])
+        self.assertEqual(agent.summary, "")
+
+
+if __name__ == "__main__":
+    unittest.main()

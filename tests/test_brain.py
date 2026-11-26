@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from hauhau.brain import Brain
+from hauhau.config import Config
+
+
+class TestBrain(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config()
+        self.cfg.logging.data_dir = str(Path(self._tmp.name) / "data")
+        self.brain = Brain(self.cfg)
+
+    def tearDown(self) -> None:
+        self.brain.close()
+        self._tmp.cleanup()
+
+
+class TestRememberRecall(TestBrain):
+    def test_remember_then_recall(self) -> None:
+        row_id, created = self.brain.remember("semantic", "The model is a Gemma 4 E2B GGUF at Q4_K_P.")
+        self.assertTrue(created)
+        hits = self.brain.recall("which quantization does the model use")
+        self.assertTrue(hits)
+        self.assertEqual(hits[0].id, row_id)
+
+    def test_context_block_formats_memories(self) -> None:
+        self.brain.remember("preference", "The user wants answers shorter than three sentences.")
+        block = self.brain.context_block("how should I answer")
+        self.assertIn("[preference]", block)
+        self.assertIn("three sentences", block)
+        self.assertTrue(block.startswith("What you remember"))
+
+    def test_context_block_empty_when_nothing_matches(self) -> None:
+        self.assertEqual(self.brain.context_block("zzzznothing"), "")
+
+    def test_context_block_respects_char_budget(self) -> None:
+        self.cfg.brain.inject_max_chars = 120
+        for i in range(10):
+            self.brain.remember("semantic", f"Durable fact number {i} about the local machine setup here.")
+        block = self.brain.context_block("durable fact machine setup")
+        self.assertLessEqual(len(block), 200)
+
+    def test_disabled_brain_injects_nothing(self) -> None:
+        self.cfg.brain.enabled = False
+        self.assertEqual(self.brain.context_block("anything"), "")
+
+    def test_stats_reports_keyword_mode(self) -> None:
+        stats = self.brain.stats()
+        self.assertFalse(stats["embeddings_enabled"])
+        self.assertEqual(stats["with_embeddings"], 0)
+
+
+class TestEmbedderDisabled(TestBrain):
+    def test_no_url_means_no_vectors(self) -> None:
+        self.assertFalse(self.brain.embedder.enabled)
+        self.assertIsNone(self.brain.embedder.embed("text"))
+
+    def test_unreachable_endpoint_disables_after_first_error(self) -> None:
+        self.cfg.brain.embeddings_url = "http://127.0.0.1:9/v1/embeddings"
+        brain = Brain(self.cfg)
+        try:
+            self.assertIsNone(brain.embedder.embed("text"))
+            self.assertFalse(brain.embedder.enabled, "one failure disables vectors for the session")
+            self.assertTrue(brain.embedder.last_error)
+        finally:
+            brain.close()
+
+    def test_keyword_recall_still_works_without_vectors(self) -> None:
+        self.brain.remember("procedural", "Start llama-server with -ngl 99 for full Metal offload.")
+        self.assertTrue(self.brain.recall("metal offload"))
+
+
+if __name__ == "__main__":
+    unittest.main()

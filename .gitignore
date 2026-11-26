@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+logs/
+sessions/
+*.db
+*.db-wal
+*.db-shm
+.snapshots/
+config.local.toml
