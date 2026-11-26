@@ -88,14 +88,15 @@ Runtime state — memory, audit log, sessions, snapshots, server log — lives i
 ## The interface
 
 ```
-╭─ Hauhau ──────────────────────────────────────╮
-│ Gemma-4-E2B…Q4_K_P.gguf                       │
-│ 8192 ctx · 4 threads · 8 GB RAM · 11 memories │
-│ http://127.0.0.1:8080 · /help for commands    │
-╰───────────────────────────────────────────────╯
+╭─ Hauhau ──────────────────────────────────────────────────╮
+│ Gemma-4-E2B…Q4_K_P.gguf                                   │
+│ 8192 ctx · 4 threads · 8 GB RAM · 11 memories · prompt v2 │
+│ /Users/johan/Documents/HauHau-CLI                         │
+│ http://127.0.0.1:8080 · /help for commands                │
+╰───────────────────────────────────────────────────────────╯
 ❯ how much disk is left?
   ⚙ shell  df -h /
-    ✓ /dev/disk3s3s1  228Gi  13Gi  109Gi  11%  /  +1 lines
+    ✓ /dev/disk3s3s1  228Gi  13Gi  109Gi  11%  /  +1 lines · /show
 
 The volume is 11% full (109 GB free).
   11.0s · 53 tok · 27 tok/s
@@ -105,12 +106,24 @@ The volume is 11% full (109 GB free).
   bullets and fences constantly, so tokens accumulate into a Live region that
   re-renders the block (throttled to 8 fps — a re-parse per token is wasted work).
 - **Tool calls show the interesting argument**, not raw JSON: `⚙ shell  df -h /`
-  rather than `{"cmd":"df -h /"}`. Results are one line with `✓`/`✗`, a count of
-  hidden lines, and the full text in `~/.hauhau/logs/audit.jsonl`.
-- **The meta line** after each turn reports wall time, completion tokens and
-  measured tok/s, so you can see what a slow answer cost.
-- **Prompt:** `Tab` completes `/commands` with descriptions, `Esc`+`Enter` adds a
-  newline, `Ctrl-C` cancels generation without leaving, `Ctrl-D` exits.
+  rather than `{"cmd":"df -h /"}`. Results are one line with `✓`/`✗`; a failed
+  result wraps instead of ellipsizing, because the reason is the one line you
+  must not lose.
+- **`/show` replays the full output** of the last five tool calls. The one-line
+  preview is a summary, not the evidence: `/show` (latest), `/show 2` (one back).
+- **`/status` is one screen**: model, backend, context, memory, which prompt
+  version is live, the workspace, the session file and where the config came from.
+- **Slow commands show progress.** `/eval`, `/tune`, `/evolve`, `/learn` and a
+  large `/compact` run under a spinner that names the task (`task 7/14:
+  disk-space`), print each finished step (`n_threads=7 → 29.5 tok/s`), and fall
+  back to plain one-line steps when output is piped.
+- **`/help` is grouped** (this session, working, memory, model, self-tuning) and
+  `/help tune` prints usage for one command. A mistyped command gets a
+  suggestion: `/modle → did you mean /model?`.
+- **Prompt:** `Tab` completes `/commands` *and* their arguments (`/prompt v` →
+  `v1 v2`, `/help ev` → `eval evolve`), `Esc`+`Enter` adds a newline, `Ctrl-C`
+  cancels generation without leaving, `Ctrl-D` exits. The bottom bar carries the
+  context size, memory count, prompt version and whether shell commands ask first.
 - **Piped output stays clean**: `hauhau "what is in /tmp" | jq` gets only the
   answer on stdout — no banner, no colour, no session chatter. Markdown is left
   raw so it stays greppable.
@@ -123,7 +136,7 @@ plain text.
 
 ```bash
 .venv/bin/ruff check hauhau tests                      # clean
-.venv/bin/python -m unittest discover -s tests -t .    # 333 tests
+.venv/bin/python -m unittest discover -s tests -t .    # 352 tests
 ```
 
 ## Assumptions this build corrects
@@ -248,9 +261,9 @@ into `~/.hauhau/.snapshots`. The denylist is checked *before* execution.
 
 ## Slash commands
 
-`/help` `/tools` `/mem [query]` `/compact` `/prune` `/remember` `/forget`
-`/learn` `/eval` `/tune` `/evolve` `/prompt` `/model` `/perf` `/config` `/audit`
-`/context` `/clear` `/save` `/quit`
+`/help [command]` `/status` `/show [n]` `/tools` `/mem [query]` `/compact`
+`/prune` `/remember` `/forget` `/learn` `/eval` `/tune` `/evolve` `/prompt`
+`/model` `/perf` `/config` `/audit` `/context` `/clear` `/save` `/quit`
 
 `/compact` merges memories that say the same thing. `/prune` is the forgetting
 half of the decay model: it drops memories that are stale *and* were never

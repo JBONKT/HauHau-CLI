@@ -12,6 +12,7 @@ from hauhau.tools.base import ToolResult, ok
 from hauhau.ui import (
     COMMANDS,
     PROMPT_GLYPH,
+    Progress,
     RichUI,
     SlashCompleter,
     StreamRenderer,
@@ -20,6 +21,7 @@ from hauhau.ui import (
     error_panel,
     help_panel,
     kv_table,
+    nearest_command,
     note,
     result_preview,
     short_name,
@@ -275,6 +277,60 @@ class TestStaticPieces(unittest.TestCase):
         self.assertIn("[b]not markup[/b]", text)
 
 
+class TestHelpAndSuggestions(unittest.TestCase):
+    def test_help_is_grouped(self) -> None:
+        text = render(help_panel)
+        for group in ("this session", "working", "memory", "model", "self-tuning"):
+            self.assertIn(group, text)
+        self.assertIn("/show", text)
+        self.assertIn("/status", text)
+
+    def test_help_for_one_command_shows_usage(self) -> None:
+        text = render(help_panel, "tune")
+        self.assertIn("/tune", text)
+        self.assertIn("/tune 6", text)
+        self.assertNotIn("/mem", text)
+
+    def test_help_for_an_unknown_command_suggests(self) -> None:
+        text = render(help_panel, "propmt")
+        self.assertIn("no such command", text)
+        self.assertIn("/prompt", text)
+
+    def test_nearest_command(self) -> None:
+        self.assertEqual(nearest_command("/modle"), "/model")
+        self.assertEqual(nearest_command("savee"), "/save")
+        self.assertEqual(nearest_command("/zzzzzz"), "")
+
+
+class TestProgress(unittest.TestCase):
+    def test_piped_output_prints_plain_steps(self) -> None:
+        out = StringIO()
+        console = Console(file=out, width=100, force_terminal=False)
+        with Progress(console, "working…") as progress:
+            progress.update("halfway…")
+            progress.step("done: 3 of 3")
+        text = out.getvalue()
+        self.assertIn("working…", text)
+        self.assertIn("done: 3 of 3", text)
+
+
+class TestShowBuffer(unittest.TestCase):
+    def test_recent_results_are_newest_first_and_capped(self) -> None:
+        ui = RichUI(Console(file=StringIO()))
+        for index in range(7):
+            ui.tool_result("shell", ToolResult(True, f"line {index}"))
+        recent = ui.recent_results()
+        self.assertEqual(len(recent), 5, "kept to five results")
+        self.assertEqual(recent[0][1].content, "line 6")
+        self.assertEqual(recent[-1][1].content, "line 2")
+
+    def test_failures_wrap_instead_of_ellipsizing(self) -> None:
+        out = StringIO()
+        ui = RichUI(Console(file=out, width=40, force_terminal=False))
+        ui.tool_result("shell", ToolResult(False, "long explanation " * 10))
+        self.assertIn("long explanation", out.getvalue())
+
+
 class TestPromptChrome(unittest.TestCase):
     def test_toolbar_summarises_state(self) -> None:
         text = toolbar_text(ctx=8192, memories=3, ram=8.0, shell_mode="auto")
@@ -296,6 +352,20 @@ class TestPromptChrome(unittest.TestCase):
 
     def test_completer_is_silent_after_arguments(self) -> None:
         self.assertEqual(list(SlashCompleter().get_completions(Document("/mem query"), None)), [])
+
+    def test_argument_completion_uses_the_provider(self) -> None:
+        completer = SlashCompleter(lambda text: [("v1", "baseline"), ("v2", "100%")])
+        items = list(completer.get_completions(Document("/prompt v"), None))
+        self.assertEqual([item.text for item in items], ["v1", "v2"])
+        self.assertEqual(items[0].display_meta_text, "baseline")
+
+    def test_argument_completion_looks_only_at_the_last_word(self) -> None:
+        completer = SlashCompleter(lambda text: [("evolve", "rewrite the prompt")] if "help" in text else [])
+        self.assertEqual([i.text for i in completer.get_completions(Document("/help ev"), None)], ["evolve"])
+        self.assertEqual(list(completer.get_completions(Document("/help pr"), None)), [])
+
+    def test_argument_completion_needs_a_provider(self) -> None:
+        self.assertEqual(list(SlashCompleter().get_completions(Document("/prompt v"), None)), [])
 
     def test_completer_ignores_plain_text(self) -> None:
         self.assertEqual(list(SlashCompleter().get_completions(Document("hello"), None)), [])

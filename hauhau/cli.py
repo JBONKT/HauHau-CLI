@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 
 from prompt_toolkit import prompt as pt_prompt
+from rich.box import ROUNDED
+from rich.panel import Panel
 from rich.text import Text
 
 from . import config as config_mod
@@ -37,9 +39,15 @@ from .profiler import apply_recommendations, probe, recommend
 from .server import ServerManager
 from .tools import build_registry
 from .ui import (
+    ACCENT,
+    COMMANDS,
+    ERR,
+    MUTED,
     OK,
     WARN,
+    Progress,
     RichUI,
+    SlashCompleter,
     banner,
     data_table,
     error_panel,
@@ -47,11 +55,13 @@ from .ui import (
     kv_table,
     make_console,
     make_prompt_session,
+    nearest_command,
     note,
     prompt_glyph,
+    short_name,
     toolbar_text,
 )
-from .util import estimate_messages_tokens, human_bytes, snapshot_file
+from .util import clip_text, estimate_messages_tokens, human_bytes, snapshot_file
 
 
 def apply_active_prompt(cfg, prompts: PromptStore) -> int | None:
@@ -104,6 +114,8 @@ class Repl:
         arg = parts[1] if len(parts) > 1 else ""
         handler = {
             "/help": self.cmd_help,
+            "/status": self.cmd_status,
+            "/show": self.cmd_show,
             "/?": self.cmd_help,
             "/tools": self.cmd_tools,
             "/mem": self.cmd_mem,
@@ -127,12 +139,71 @@ class Repl:
             "/exit": self.cmd_quit,
         }.get(command)
         if handler is None:
-            error_panel(self.console, f"unknown command {command} — try /help")
+            hint = nearest_command(command)
+            tail = f" — did you mean {hint}?" if hint else " — /help lists them"
+            error_panel(self.console, f"unknown command {command}{tail}")
             return
         handler(arg)
 
-    def cmd_help(self, _arg: str) -> None:
-        help_panel(self.console)
+    def cmd_help(self, arg: str) -> None:
+        help_panel(self.console, arg)
+
+    def cmd_status(self, _arg: str) -> None:
+        """One screen, so a user does not have to ask four questions."""
+        status = self.manager.status()
+        stats = self.brain.stats() if self.brain else None
+        active = self.prompts.active_number()
+        rows = [
+            ("model", short_name(os.path.basename(os.path.expanduser(status["gguf"]))) if status["gguf"] else "(none)"),
+            ("backend", f"{status['url']} · {'managed' if status['managed'] else 'external'}"),
+            ("context", f"{status['n_ctx']} tokens · {status['n_threads']} threads"),
+            (
+                "memory",
+                f"{stats['total']} memories · vectors {'on' if stats['embeddings_enabled'] else 'off'}"
+                if stats
+                else "off (--no-brain)",
+            ),
+            ("prompt", f"v{active} (evolved)" if active else "from config.toml"),
+            ("workspace", str(self.cfg.workspace)),
+            (
+                "session",
+                f"{self.session_path.name} · {self.agent.turn_count()} turns · "
+                f"{'saved' if self.session_path.is_file() else 'not saved yet'}",
+            ),
+            ("config", str(self.cfg.source) if self.cfg.source else "(built-in defaults)"),
+        ]
+        if self.agent.last_completion and self.agent.last_completion.usage.tok_per_second:
+            rows.append(("last speed", f"{self.agent.last_completion.usage.tok_per_second:.1f} tok/s"))
+        self._table("Status", rows)
+
+    def cmd_show(self, arg: str) -> None:
+        """Replay a tool result in full: the one-line preview loses error detail."""
+        collect = getattr(self.ui, "recent_results", None)
+        entries = collect() if callable(collect) else []
+        if not entries:
+            note(self.console, "no tool output in this session yet")
+            return
+        try:
+            index = int(arg) if arg.strip() else 1
+        except ValueError:
+            note(self.console, "usage: /show [n] — 1 is the most recent", WARN)
+            return
+        if not 1 <= index <= len(entries):
+            note(self.console, f"only {len(entries)} tool results are kept; /show 1 is the latest", WARN)
+            return
+        name, result = entries[index - 1]
+        body = clip_text(result.content or "(no output)", self.cfg.tools.max_output_chars)
+        heading = f"{name} {'✓' if result.ok else '✗'} · {index} of {len(entries)}"
+        self.console.print(
+            Panel(
+                Text(body, style="" if result.ok else ERR),
+                title=Text(heading, style=f"bold {ACCENT if result.ok else ERR}"),
+                title_align="left",
+                border_style=MUTED if result.ok else ERR,
+                box=ROUNDED,
+                expand=False,
+            )
+        )
 
     def cmd_tools(self, _arg: str) -> None:
         data_table(
@@ -176,8 +247,10 @@ class Repl:
             return
         before = self.brain.stats()["total"]
         if before > 300:
-            note(self.console, "compacting…")
-        absorbed = self.brain.store.compact()
+            with Progress(self.console, f"comparing {before} memories…"):
+                absorbed = self.brain.store.compact()
+        else:
+            absorbed = self.brain.store.compact()
         after = self.brain.stats()["total"]
         note(self.console, f"merged {absorbed} duplicate memories ({before} → {after})", OK)
 
@@ -229,12 +302,13 @@ class Repl:
         if not worth_distilling(self.agent.messages):
             note(self.console, "this session is too thin to learn from (one short turn, no tool use)", WARN)
             return
-        note(self.console, "distilling this session…")
-        try:
-            drafts, written = self.learner.distill(self.agent.messages)
-        except LLMError as exc:
-            error_panel(self.console, f"learn failed: {exc}")
-            return
+        with Progress(self.console, "distilling this session…") as progress:
+            try:
+                drafts, written = self.learner.distill(self.agent.messages)
+            except LLMError as exc:
+                error_panel(self.console, f"learn failed: {exc}")
+                return
+            progress.stop()
         if not drafts:
             note(self.console, "nothing durable found")
             return
@@ -263,17 +337,26 @@ class Repl:
         if not tasks:
             note(self.console, "no eval tasks apply to the current tool set", WARN)
             return
-        note(self.console, f"running {len(tasks)} eval tasks — one short completion each…")
-        try:
-            result = run_suite(
-                self.client,
-                tasks,
-                system_prompt=self._eval_prompt_text(self.cfg.agent.personality),
-                tools=self.agent.registry.schemas(),
-            )
-        except LLMError as exc:
-            error_panel(self.console, f"eval failed: {exc}")
-            return
+        seen = {"n": 0}
+
+        with Progress(self.console, f"playing {len(tasks)} eval tasks…") as progress:
+
+            def on_task(name: str) -> None:
+                seen["n"] += 1
+                progress.update(f"task {seen['n']}/{len(tasks)}: {name}")
+
+            try:
+                result = run_suite(
+                    self.client,
+                    tasks,
+                    system_prompt=self._eval_prompt_text(self.cfg.agent.personality),
+                    tools=self.agent.registry.schemas(),
+                    progress=on_task,
+                )
+            except LLMError as exc:
+                error_panel(self.console, f"eval failed: {exc}")
+                return
+            progress.step(f"scored {result.summary()} in {result.seconds:.1f}s")
         self.audit.log("eval", score=round(result.score, 3), passed=result.passed, total=result.total)
         self._table("Eval", [("score", result.summary()), ("seconds", f"{result.seconds:.1f}")])
         if result.failures:
@@ -303,51 +386,55 @@ class Repl:
         if not options:
             note(self.console, "nothing to try: the config already has the candidate values")
             return
-        note(self.console, "benchmarking the current config…")
-        try:
-            baseline = benchmark(self.client)
-        except LLMError as exc:
-            error_panel(self.console, f"benchmark failed: {exc}")
-            return
-        note(
-            self.console,
-            f"{baseline:.1f} tok/s now. Trying up to {budget} values; each restarts the backend (~25s).",
-        )
-        original = {key: getattr(self.cfg.model, key.split(".", 1)[1]) for key in ("model.n_threads", "model.n_ctx")}
-        self.audit.log("tune.start", baseline=round(baseline, 2), trials=budget)
-
-        def measure(option) -> float:
-            set_value(self.cfg, option.key, option.value)
-            self.audit.log("tune.trial", setting=option.key, value=option.value)
-            self.manager.restart()
-            return benchmark(self.client)
-
-        try:
-            result = hill_climb(baseline, options, measure, max_trials=budget)
-        except LLMError as exc:
-            error_panel(self.console, f"tuning aborted: {exc}")
-            result = None
-        finally:
-            # Whatever happened, the running server must match the chosen values.
-            for key, value in original.items():
-                set_value(self.cfg, key, value)
-            if result is not None:
-                for chosen in result.adopted:
-                    set_value(self.cfg, chosen.key, chosen.value)
+        with Progress(self.console, "benchmarking the current config…") as progress:
             try:
-                self.manager.restart()
+                baseline = benchmark(self.client)
             except LLMError as exc:
-                # Tuning must never take the session down with it.
-                note(self.console, f"backend restart failed: {exc} - run /model to check it", WARN)
+                error_panel(self.console, f"benchmark failed: {exc}")
+                return
+            progress.step(f"baseline {baseline:.1f} tok/s · trying up to {budget} values")
+            original = {
+                key: getattr(self.cfg.model, key.split(".", 1)[1]) for key in ("model.n_threads", "model.n_ctx")
+            }
+            self.audit.log("tune.start", baseline=round(baseline, 2), trials=budget)
+
+            def measure(option) -> float:
+                progress.update(f"restarting for {option}…")
+                set_value(self.cfg, option.key, option.value)
+                self.audit.log("tune.trial", setting=option.key, value=option.value)
+                self.manager.restart()
+                progress.update(f"benchmarking {option}…")
+                return benchmark(self.client)
+
+            def on_trial(trial) -> None:
+                progress.step(f"  {trial.candidate} → {trial.score:.1f} tok/s")
+
+            try:
+                result = hill_climb(baseline, options, measure, max_trials=budget, on_trial=on_trial)
+            except LLMError as exc:
+                error_panel(self.console, f"tuning aborted: {exc}")
+                result = None
+            finally:
+                # Whatever happened, the running server must match the chosen values.
+                for key, value in original.items():
+                    set_value(self.cfg, key, value)
+                if result is not None:
+                    for chosen in result.adopted:
+                        set_value(self.cfg, chosen.key, chosen.value)
+                try:
+                    self.manager.restart()
+                except LLMError as exc:
+                    # Tuning must never take the session down with it.
+                    note(self.console, f"backend restart failed: {exc} - run /model to check it", WARN)
 
         if result is None:
             return
         rows = [
-            (trial.candidate, f"{trial.score:.1f} tok/s", "adopted" if trial.adopted else "")
+            (trial.candidate, f"{trial.score:.1f} tok/s", "✓ adopted" if trial.adopted else "kept")
             for trial in result.trials
         ]
         if rows:
-            data_table(self.console, "Tuning trials", ["setting", "speed", ""], rows, no_wrap=1)
+            data_table(self.console, "Tuning trials", ["setting", "speed", "result"], rows, no_wrap=2)
         if result.adopted:
             target = self._save_config("tune")
             record_tuning(self.cfg.data_dir / "evolve" / "tuning.jsonl", result, adopted_config=str(target))
@@ -387,17 +474,19 @@ class Repl:
                 self.client, tasks, system_prompt=self._eval_prompt_text(text), tools=schemas
             )
 
-        try:
-            result = evolve_prompt(
-                self.client,
-                store,
-                run,
-                self.cfg.agent.personality,
-                progress=lambda message: note(self.console, message + "…"),
-            )
-        except LLMError as exc:
-            error_panel(self.console, f"evolution failed: {exc}")
-            return
+        with Progress(self.console, "scoring the current prompt…") as progress:
+            try:
+                result = evolve_prompt(
+                    self.client,
+                    store,
+                    run,
+                    self.cfg.agent.personality,
+                    progress=progress.update,
+                )
+            except LLMError as exc:
+                error_panel(self.console, f"evolution failed: {exc}")
+                return
+            progress.step(f"current {result.baseline:.0%} · candidate {result.candidate:.0%}")
         self.audit.log(
             "evolve.prompt",
             accepted=result.accepted,
@@ -424,8 +513,13 @@ class Repl:
                 "Prompt versions",
                 ["version", "score", "parent", "chars", "active"],
                 [
-                    [v.label, "-" if v.score is None else f"{v.score:.0%}", "-" if v.parent is None else f"v{v.parent}",
-                     str(len(store.text(v.number))), "yes" if v.number == active else ""]
+                    [
+                        v.label,
+                        "-" if v.score is None else f"{v.score:.0%}",
+                        "-" if v.parent is None else f"v{v.parent}",
+                        str(len(store.text(v.number))),
+                        "● active" if v.number == active else "",
+                    ]
                     for v in versions
                 ],
                 no_wrap=1,
@@ -707,6 +801,8 @@ def main(argv: list[str] | None = None) -> int:
             ram=profile.ram_gb,
             memories=stats["total"],
             url=cfg.model.server_url,
+            workspace=str(cfg.workspace),
+            prompt=f"v{adopted}" if adopted else "",
         )
 
     repl = Repl(
@@ -775,7 +871,25 @@ def main(argv: list[str] | None = None) -> int:
             prompt=f"v{active_version}" if active_version else "",
         )
 
-    session = make_prompt_session(history_file, toolbar)
+    def completions(text: str) -> list[tuple[str, str]]:
+        """Argument completion for the commands whose arguments the CLI knows."""
+        command, _, argument = text.partition(" ")
+        argument = argument.strip()
+        if command == "/help":
+            # No leading slash: completing "ev" must yield "/help evolve", not
+            # "/help /evolve". cmd_help normalises either form.
+            return [(name.lstrip("/"), description) for name, description in COMMANDS]
+        if command == "/prompt":
+            rows = []
+            for version in prompts.versions():
+                score = f"{version.score:.0%}" if version.score is not None else "baseline"
+                rows.append((f"v{version.number}", score))
+            return rows
+        if command in ("/show", "/audit") and not argument:
+            return [("1", "most recent"), ("2", "one back"), ("3", "two back")]
+        return []
+
+    session = make_prompt_session(history_file, toolbar, SlashCompleter(completions))
     try:
         while repl.running:
             try:

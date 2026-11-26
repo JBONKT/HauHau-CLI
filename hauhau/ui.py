@@ -15,9 +15,11 @@ Design notes:
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 import time
+from collections import deque
 from typing import Any
 
 from prompt_toolkit import HTML, PromptSession
@@ -51,28 +53,89 @@ TOOLBAR_BG = "#26263a"
 PROMPT_GLYPH = "❯"  # noqa: RUF001 - the prompt glyph is deliberate
 STREAM_MIN_INTERVAL = 1 / 8  # seconds between markdown re-renders
 
-COMMANDS: list[tuple[str, str]] = [
-    ("/help", "list commands"),
-    ("/tools", "tools the model can call"),
-    ("/mem", "memory stats, or search memories"),
-    ("/compact", "merge near-duplicate memories"),
-    ("/prune", "forget stale memories that were never reused"),
-    ("/remember", "store a fact yourself"),
-    ("/forget", "delete a memory by id"),
-    ("/learn", "distil this session into long-term memory"),
-    ("/eval", "run the behavioural eval suite"),
-    ("/tune", "hill-climb threads/context for speed"),
-    ("/evolve", "rewrite the system prompt, gated by /eval"),
-    ("/prompt", "list prompt versions, or activate one"),
-    ("/model", "backend and model status"),
-    ("/perf", "measure real tokens/second"),
-    ("/config", "effective configuration"),
-    ("/audit", "tail the audit log"),
-    ("/context", "token usage of this conversation"),
-    ("/clear", "forget the conversation, keep memory"),
-    ("/save", "persist the session now"),
-    ("/quit", "leave (runs a /learn pass first)"),
+# Grouped so that /help answers "what can I do here", not "here are 21 strings".
+COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
+    (
+        "this session",
+        [
+            ("/help", "commands, or details for one: /help tune"),
+            ("/status", "one screen: model, memory, prompt, session"),
+            ("/config", "effective configuration and where it came from"),
+            ("/context", "token usage of this conversation"),
+            ("/clear", "forget the conversation, keep memory"),
+            ("/save", "persist the session now"),
+            ("/audit", "tail the audit log"),
+            ("/quit", "leave (runs a /learn pass first)"),
+        ],
+    ),
+    (
+        "working",
+        [
+            ("/tools", "tools the model can call"),
+            ("/show", "the last tool output in full: /show, /show 2"),
+        ],
+    ),
+    (
+        "memory",
+        [
+            ("/mem", "memory stats, or search memories"),
+            ("/compact", "merge near-duplicate memories"),
+            ("/prune", "forget stale memories that were never reused"),
+            ("/remember", "store a fact yourself"),
+            ("/forget", "delete a memory by id"),
+            ("/learn", "distil this session into long-term memory"),
+        ],
+    ),
+    (
+        "model",
+        [
+            ("/model", "backend and model status"),
+            ("/perf", "measure real tokens/second"),
+        ],
+    ),
+    (
+        "self-tuning",
+        [
+            ("/eval", "play 14 behavioural tasks and score them"),
+            ("/tune", "hill-climb threads/context for speed"),
+            ("/evolve", "rewrite the system prompt, gated by /eval"),
+            ("/prompt", "list prompt versions, or activate one"),
+        ],
+    ),
 ]
+
+COMMANDS: list[tuple[str, str]] = [
+    (command, description) for _group, items in COMMAND_GROUPS for command, description in items
+]
+
+# The commands that take an argument get a usage line, shown by /help <command>.
+COMMAND_USAGE: dict[str, str] = {
+    "/help": "/help            list everything\n/help tune       detail for one command",
+    "/show": (
+        "/show            the most recent tool output, unabridged\n"
+        "/show 2          the one before it (up to 5 back)"
+    ),
+    "/mem": "/mem             totals, kinds, database size\n/mem postgres    search memories",
+    "/compact": "/compact         merge near-duplicate memories",
+    "/prune": (
+        "/prune           drop memories that are stale and were never recalled\n"
+        "/prune 0.1       stricter: drop anything below 0.1 weight"
+    ),
+    "/remember": "/remember <text> store a fact by hand, deduplicated like any other",
+    "/forget": "/forget <id>     delete one memory by id (see /mem for ids)",
+    "/learn": "/learn           distil this session into memory now (also runs on exit)",
+    "/eval": "/eval            run the behavioural suite; about a second per task",
+    "/tune": (
+        "/tune            try a few values, keep only a faster one\n"
+        "/tune 6           allow up to 6 trials (each restarts the backend)"
+    ),
+    "/evolve": "/evolve          ask the model for a better prompt, keep it only if /eval improves",
+    "/prompt": (
+        "/prompt          list versions with their scores\n"
+        "/prompt v2       activate a version (that is the rollback)"
+    ),
+    "/audit": "/audit           tail the last 10 audit entries\n/audit 40        the last 40",
+}
 
 # Tools whose arguments have one obviously interesting field. Showing
 # {"cmd":"ls -la"} verbatim wasted the whole line on syntax.
@@ -198,6 +261,57 @@ class StreamRenderer:
             self._live = None
 
 
+class Progress:
+    """Live feedback for a command that takes longer than a moment.
+
+    Rich suppresses its spinner when output is piped, so this prints plain
+    one-line steps instead - a piped run should still read like a transcript
+    rather than silence followed by a table.
+    """
+
+    def __init__(self, console: Console, label: str) -> None:
+        self.console = console
+        self.label = label
+        self._status: Any = None
+
+    def __enter__(self) -> Progress:
+        self.start()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.stop()
+
+    def _spin(self) -> None:
+        self._status = self.console.status(Text("  " + self.label, style=MUTED), spinner="dots")
+        self._status.start()
+
+    def start(self) -> None:
+        if self.console.is_terminal:
+            self._spin()
+        else:
+            self.console.print(Text(self.label, style=MUTED))
+
+    def update(self, label: str) -> None:
+        """Change the spinner text without printing a line."""
+        self.label = label
+        if self._status is not None:
+            self._status.update(Text("  " + label, style=MUTED))
+
+    def step(self, line: str, style: str = MUTED) -> None:
+        """Print a finished step, keeping the spinner running underneath."""
+        if self._status is not None:
+            self._status.stop()
+            self._status = None
+        self.console.print(Text(line, style=style))
+        if self.console.is_terminal:
+            self._spin()
+
+    def stop(self) -> None:
+        if self._status is not None:
+            self._status.stop()
+            self._status = None
+
+
 class RichUI(UI):
     """Streams a turn to the terminal: spinner, markdown answer, tool lines."""
 
@@ -208,6 +322,9 @@ class RichUI(UI):
         self._thinking = False
         self._reasoning_header = False
         self._needs_gap = False
+        # The one-line preview is not enough when a command fails inside a long
+        # output: /show replays the last few results in full.
+        self.recent: deque[tuple[str, ToolResult]] = deque(maxlen=5)
 
     # --- lifecycle -----------------------------------------------------
     def turn_start(self, label: str = "thinking…") -> None:
@@ -291,14 +408,23 @@ class RichUI(UI):
         self.console.print(line, overflow="ellipsis", no_wrap=True)
 
     def tool_result(self, name: str, result: ToolResult) -> None:
+        self.recent.append((name, result))
         preview, more = result_preview(result)
         line = Text("    ")
         line.append("✓ " if result.ok else "✗ ", style=OK if result.ok else ERR)
         line.append(preview, style="" if result.ok else ERR)
         if more:
             line.append(f"  +{more} lines", style=MUTED)
-        self.console.print(line, overflow="ellipsis", no_wrap=True)
+            line.append(" · /show", style=MUTED)
+        # A failure is the one line the user must not lose to an ellipsis, so it
+        # wraps instead of being cut off.
+        self.console.print(line, overflow="fold" if not result.ok else "ellipsis",
+                           no_wrap=result.ok)
         self._needs_gap = True
+
+    def recent_results(self) -> list[tuple[str, ToolResult]]:
+        """Most recent tool result first."""
+        return list(reversed(self.recent))
 
 
 # --- static pieces -----------------------------------------------------
@@ -314,17 +440,21 @@ def banner(
     ram: float,
     memories: int,
     url: str,
+    workspace: str = "",
+    prompt: str = "",
 ) -> None:
     title = Text(name, style=f"bold {ACCENT}")
-    body = Group(
-        Text(short_name(model) if model else "no model", style="bold"),
-        Text(
-            f"{ctx} ctx · {threads} threads · {ram:g} GB RAM · "
-            f"{memories} {'memory' if memories == 1 else 'memories'}",
-            style=MUTED,
-        ),
-        Text(f"{url} · /help for commands", style=MUTED),
+    facts = (
+        f"{ctx} ctx · {threads} threads · {ram:g} GB RAM · "
+        f"{memories} {'memory' if memories == 1 else 'memories'}"
     )
+    if prompt:
+        facts += f" · prompt {prompt}"
+    lines = [Text(short_name(model) if model else "no model", style="bold"), Text(facts, style=MUTED)]
+    if workspace:
+        lines.append(Text(workspace, style=MUTED))
+    lines.append(Text(f"{url} · /help for commands", style=MUTED))
+    body = Group(*lines)
     console.print(
         Panel(body, title=title, title_align="left", border_style=ACCENT, box=ROUNDED, expand=False)
     )
@@ -366,12 +496,50 @@ def data_table(
     console.print(table)
 
 
-def help_panel(console: Console) -> None:
+def nearest_command(name: str) -> str:
+    """Best guess for a mistyped command, or '' when nothing is close."""
+    known = [command for command, _description in COMMANDS]
+    if not name.startswith("/"):
+        name = "/" + name
+    matches = difflib.get_close_matches(name, known, n=1, cutoff=0.6)
+    return matches[0] if matches else ""
+
+
+def help_panel(console: Console, command: str = "") -> None:
+    """All commands by group, or the detail for one."""
+    wanted = command.strip()
+    if wanted:
+        name = wanted if wanted.startswith("/") else "/" + wanted
+        known = dict(COMMANDS)
+        if name not in known:
+            hint = nearest_command(name)
+            tail = f" - did you mean {hint}?" if hint else ""
+            note(console, f"no such command {name}{tail}", WARN)
+            return
+        body = Text()
+        body.append(known[name] + "\n", style="default")
+        usage = COMMAND_USAGE.get(name)
+        if usage:
+            body.append("\n" + usage, style=MUTED)
+        console.print(
+            Panel(
+                body,
+                title=Text(name, style=f"bold {ACCENT}"),
+                title_align="left",
+                border_style=MUTED,
+                box=ROUNDED,
+                expand=False,
+            )
+        )
+        return
+
     table = Table(box=None, show_header=False, padding=(0, 2), expand=False)
     table.add_column(style=f"bold {ACCENT}", no_wrap=True)
     table.add_column(style="default", overflow="fold")
-    for command, description in COMMANDS:
-        table.add_row(command, description)
+    for group, items in COMMAND_GROUPS:
+        table.add_row(Text(group, style=f"italic {MUTED}"), "")
+        for item_command, description in items:
+            table.add_row("  " + item_command, description)
     console.print(
         Panel(
             table,
@@ -380,7 +548,7 @@ def help_panel(console: Console) -> None:
             border_style=MUTED,
             box=ROUNDED,
             expand=False,
-            subtitle=Text(" esc+enter for a new line ", style=MUTED),
+            subtitle=Text(" /help <command> for usage · esc+enter for a new line ", style=MUTED),
             subtitle_align="right",
         )
     )
@@ -407,17 +575,33 @@ def note(console: Console, text: str, style: str = MUTED) -> None:
 
 
 class SlashCompleter(Completer):
-    """Complete /commands with their one-line description."""
+    """Complete /commands, and their arguments where the CLI can offer some.
+
+    ``extra`` returns (fragment, note) pairs for the command being typed - the
+    prompt versions for ``/prompt``, the command names for ``/help`` - so the
+    user does not have to remember which v-numbers exist.
+    """
+
+    def __init__(self, extra: Any = None) -> None:
+        self.extra = extra
 
     def get_completions(self, document: Any, complete_event: Any) -> Any:
         text = document.text_before_cursor
-        if not text.startswith("/") or " " in text:
+        if not text.startswith("/"):
             return
-        for command, description in COMMANDS:
-            if command.startswith(text):
-                yield Completion(
-                    command, start_position=-len(text), display=command, display_meta=description
-                )
+        if " " not in text:
+            for command, description in COMMANDS:
+                if command.startswith(text):
+                    yield Completion(
+                        command, start_position=-len(text), display=command, display_meta=description
+                    )
+            return
+        if self.extra is None:
+            return
+        word = text.split(" ")[-1]
+        for fragment, meta in self.extra(text):
+            if fragment.startswith(word):
+                yield Completion(fragment, start_position=-len(word), display=fragment, display_meta=meta)
 
 
 PROMPT_STYLE = Style.from_dict(
@@ -429,7 +613,7 @@ PROMPT_STYLE = Style.from_dict(
 )
 
 
-def make_prompt_session(history_path, toolbar) -> PromptSession:
+def make_prompt_session(history_path, toolbar, completer: SlashCompleter | None = None) -> PromptSession:
     bindings = KeyBindings()
 
     @bindings.add("escape", "enter")
@@ -439,7 +623,7 @@ def make_prompt_session(history_path, toolbar) -> PromptSession:
     return PromptSession(
         history=FileHistory(str(history_path)),
         auto_suggest=AutoSuggestFromHistory(),
-        completer=SlashCompleter(),
+        completer=completer or SlashCompleter(),
         complete_while_typing=True,
         style=PROMPT_STYLE,
         key_bindings=bindings,

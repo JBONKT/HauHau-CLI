@@ -17,6 +17,7 @@ from hauhau.config import Config
 from hauhau.evolve import PromptStore, SuiteResult
 from hauhau.llm import Completion, LLMError
 from hauhau.tools import build_registry
+from hauhau.tools.base import ToolResult
 
 
 class FakeClient:
@@ -300,6 +301,57 @@ class TestEvolveCommands(ReplTestCase):
         # FakeClient returns no usage, so the benchmark cannot compare anything.
         self.repl.handle("/tune 2")
         self.assertIn("benchmark failed", self.text())
+
+
+class TestInterfaceCommands(ReplTestCase):
+    def test_status_shows_the_essentials_on_one_screen(self) -> None:
+        self.repl.handle("/status")
+        output = self.text()
+        for label in ("model", "backend", "memory", "prompt", "workspace", "session"):
+            self.assertIn(label, output)
+
+    def test_status_reports_a_missing_brain(self) -> None:
+        self.repl.brain = None
+        self.repl.handle("/status")
+        self.assertIn("--no-brain", self.text())
+
+    def test_show_without_tool_output_explains_itself(self) -> None:
+        self.repl.handle("/show")
+        self.assertIn("no tool output", self.text())
+
+    def test_show_replays_the_last_result(self) -> None:
+        self.repl.ui.tool_result("shell", ToolResult(True, "first line\nsecond line\nthird line"))
+        self.repl.handle("/show")
+        output = self.text()
+        self.assertIn("first line", output)
+        self.assertIn("third line", output, "the whole output, not a preview")
+        self.assertIn("shell", output)
+
+    def test_show_indexes_backwards(self) -> None:
+        self.repl.ui.tool_result("shell", ToolResult(True, "older result"))
+        self.repl.ui.tool_result("grep", ToolResult(True, "newer result"))
+        self.repl.handle("/show 2")
+        self.assertIn("older result", self.text())
+
+    def test_show_rejects_an_index_that_does_not_exist(self) -> None:
+        self.repl.ui.tool_result("shell", ToolResult(True, "only one"))
+        self.repl.handle("/show 4")
+        self.assertIn("only 1 tool results", self.text())
+
+    def test_show_rejects_a_non_number(self) -> None:
+        self.repl.ui.tool_result("shell", ToolResult(True, "x"))
+        self.repl.handle("/show last")
+        self.assertIn("usage: /show", self.text())
+
+    def test_help_for_one_command(self) -> None:
+        self.repl.handle("/help show")
+        output = self.text()
+        self.assertIn("/show 2", output)
+        self.assertNotIn("/prune", output)
+
+    def test_unknown_command_suggests_the_closest(self) -> None:
+        self.repl.handle("/modle")
+        self.assertIn("did you mean /model?", self.text())
 
 
 class TestApplyActivePrompt(unittest.TestCase):
