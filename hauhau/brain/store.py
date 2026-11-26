@@ -70,12 +70,24 @@ class Hit:
 
 
 def _match_expr(query: str) -> str | None:
-    """Build a safe FTS5 OR-expression from free text."""
-    terms = [t for t in normalize(query).split() if len(t) > 1]
-    terms = [t for t in ("".join(c for c in term if c.isalnum() or c == "_") for term in terms) if t]
-    if not terms:
+    """Build a safe FTS5 OR-expression from free text.
+
+    Punctuation is *split*, not deleted: FTS5 tokenises ``line-length`` as
+    ``line`` + ``length``, so the old ``"linelength"`` pseudo-token could never
+    match the row that mentions it. A phrase of the parts matches the real
+    tokens, and the parts alone are added for looser recall.
+    """
+    phrases: list[str] = []
+    for raw in normalize(query).split():
+        parts = [p for p in re.split(r"[^0-9a-z_]+", raw) if p]
+        if not parts:
+            continue
+        if len(parts) > 1:
+            phrases.append(" ".join(parts))
+        phrases.extend(part for part in parts if len(part) > 1)
+    if not phrases:
         return None
-    return " OR ".join(f'"{t}"' for t in dict.fromkeys(terms))
+    return " OR ".join(f'"{p}"' for p in dict.fromkeys(phrases))
 
 
 # Tokens too common to be worth indexing: every row shares them, so bucketing by
@@ -95,11 +107,6 @@ _COMMON_TOKENS = frozenset({
 # ruff…" as one row and "The project utilizes a release checklist located in
 # docs/release.md" as another, scoring 0.75 containment against a 0.80 threshold.
 SHARED_ARTIFACT_CONTAINMENT = 0.6
-
-
-def _index_keys(tokens: set[str]) -> set[str]:
-    """Distinctive tokens only: enough to find candidate duplicates."""
-    return {tok for tok in tokens if len(tok) >= 4 and tok not in _COMMON_TOKENS}
 
 
 def _numbers(text: str) -> frozenset[str]:
@@ -128,6 +135,71 @@ def _numbers_agree(left: frozenset[str], right: frozenset[str]) -> bool:
     compact() of 2000 rows.
     """
     return not left or not right or left == right
+
+
+# A negated and a non-negated sentence are two facts, not one: the old dedupe
+# merged "always runs the tests with -x" into "never runs the tests with -x" and
+# kept the longer text, so the store asserted the opposite of what was said.
+_NEGATIONS = frozenset({
+    "not", "no", "never", "none", "nothing", "without", "avoid", "instead", "cannot",
+    "cant", "dont", "doesnt", "isnt", "arent", "wont", "shouldnt", "mustnt", "disable",
+    "disabled", "off",
+})
+
+
+def _mergeable(
+    new_text: str,
+    new_tokens: set[str],
+    old_text: str,
+    old_tokens: set[str],
+    *,
+    shared_artifact: bool,
+    jaccard_min: float,
+    containment_min: float,
+) -> bool:
+    """Should the incoming memory be merged into an existing one?
+
+    Similarity alone is not enough. Two guards keep the store honest:
+
+    * a negation on one side only means the texts disagree, whatever their
+      word overlap;
+    * containment is measured against the *shorter* text, so a one-word memory
+      ("Ruff") scores 1.0 against any sentence that uses the word. Merging
+      those deleted the incoming fact, so a large length mismatch is kept apart.
+    """
+    if not new_tokens or not old_tokens:
+        return False
+    if bool(new_tokens & _NEGATIONS) != bool(old_tokens & _NEGATIONS):
+        return False
+    if jaccard(new_tokens, old_tokens) >= jaccard_min:
+        return True
+    overlap = len(new_tokens & old_tokens)
+    containment = overlap / min(len(new_tokens), len(old_tokens))
+    if shared_artifact and containment >= SHARED_ARTIFACT_CONTAINMENT:
+        return True
+    if containment < containment_min:
+        return False
+    if len(new_text) <= len(old_text):
+        short_text, short_tokens, long_text, long_tokens = new_text, new_tokens, old_text, old_tokens
+    else:
+        short_text, short_tokens, long_text, long_tokens = old_text, old_tokens, new_text, new_tokens
+    if not long_text or len(short_text) >= 0.5 * len(long_text):
+        return True
+    # A short memory whose words are all present in the longer one adds nothing:
+    # "Uses uv for python." is subsumed by "...for all python projects here".
+    # One- or two-word notes are the exception - "Ruff" is the *subject* there,
+    # not a repetition, and merging it silently deleted the fact.
+    return len(short_tokens) >= 3 and short_tokens <= long_tokens
+
+
+def _merge_tags(old: str, new: str) -> str:
+    """Union of two tag lists - a merge used to drop the incoming tags."""
+    parts = [p.strip() for p in (old or "").split(",") if p.strip()]
+    for part in (new or "").split(","):
+        part = part.strip()
+        if part and part not in parts:
+            parts.append(part)
+    return ",".join(parts)[:400]
 
 
 def _pack(vec: list[float]) -> bytes:
@@ -164,34 +236,76 @@ class MemoryStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(path))
         self.db.row_factory = sqlite3.Row
-        self.db.executescript(SCHEMA)
-        self.db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        try:
+            self.db.executescript(SCHEMA)
+            self._migrate()
+            self.db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+            self.db.commit()
+        except sqlite3.OperationalError:
+            # A restored backup on a read-only mount can still be searched; the
+            # old unconditional rebuild made memory impossible there.
+            pass
+
+    def _migrate(self) -> None:
+        """Bring an older ``brain.db`` up to the current schema.
+
+        ``CREATE TABLE IF NOT EXISTS`` is a no-op on a mismatch, so an existing
+        file kept its old columns and the first query failed - outside the
+        "memory must never block startup" guard in the CLI, i.e. a traceback.
+        """
+        cols = {row["name"] for row in self.db.execute("PRAGMA table_info(memories)")}
+        if not cols:
+            return
+        wanted = {
+            "tags": "TEXT NOT NULL DEFAULT ''",
+            "norm_hash": "TEXT NOT NULL DEFAULT ''",
+            "importance": "REAL NOT NULL DEFAULT 0.5",
+            "uses": "INTEGER NOT NULL DEFAULT 0",
+            "created_at": "REAL NOT NULL DEFAULT 0",
+            "last_used_at": "REAL NOT NULL DEFAULT 0",
+            "embedding": "BLOB",
+        }
+        for name, decl in wanted.items():
+            if name not in cols:
+                self.db.execute(f"ALTER TABLE memories ADD COLUMN {name} {decl}")
+        now = time.time()
+        self.db.execute("UPDATE memories SET norm_hash = '' WHERE norm_hash IS NULL")
+        self.db.execute("UPDATE memories SET importance = 0.5 WHERE importance IS NULL")
+        self.db.execute("UPDATE memories SET uses = 0 WHERE uses IS NULL")
+        self.db.execute("UPDATE memories SET created_at = ? WHERE created_at > ?", (now, now))
+        self.db.execute(
+            "UPDATE memories SET last_used_at = created_at WHERE last_used_at IS NULL OR last_used_at = 0"
+        )
+        # A timestamp from the future (clock skew, a database copied from another
+        # machine) pinned decay at 1.0 forever, so the row could never be pruned.
+        self.db.execute("UPDATE memories SET last_used_at = ? WHERE last_used_at > ?", (now, now))
         self.db.commit()
 
     def close(self) -> None:
         self.db.close()
 
     # --- writes --------------------------------------------------------
-    def _bump(self, row_id: int, now: float, new_text: str | None = None) -> None:
+    def _bump(self, row_id: int, now: float, new_text: str | None = None, new_tags: str = "") -> None:
         """Record a reuse. When ``new_text`` is a richer phrasing, adopt it."""
-        current = self.db.execute("SELECT text FROM memories WHERE id = ?", (row_id,)).fetchone()
+        current = self.db.execute("SELECT text, tags FROM memories WHERE id = ?", (row_id,)).fetchone()
         adopt = (
             new_text
             and current
             and len(new_text) > len(current["text"])
             and new_text.strip() != current["text"].strip()
         )
+        tags = _merge_tags(current["tags"] if current else "", new_tags)
         if adopt:
             self.db.execute(
                 "UPDATE memories SET uses = uses + 1, last_used_at = ?, text = ?, norm_hash = ?, "
-                "importance = MIN(1.0, importance + 0.03) WHERE id = ?",
-                (now, new_text, norm_hash(new_text), row_id),
+                "tags = ?, importance = MIN(1.0, importance + 0.03) WHERE id = ?",
+                (now, new_text, norm_hash(new_text), tags, row_id),
             )
         else:
             self.db.execute(
-                "UPDATE memories SET uses = uses + 1, last_used_at = ?, "
+                "UPDATE memories SET uses = uses + 1, last_used_at = ?, tags = ?, "
                 "importance = MIN(1.0, importance + 0.03) WHERE id = ?",
-                (now, row_id),
+                (now, tags, row_id),
             )
         self.db.commit()
 
@@ -216,34 +330,34 @@ class MemoryStore:
         # same thing crowd each other out of a top-k prompt.
         row = self.db.execute("SELECT id FROM memories WHERE norm_hash = ?", (digest,)).fetchone()
         if row:
-            self._bump(row["id"], now, new_text=text)
+            self._bump(row["id"], now, new_text=text, new_tags=tags)
             return int(row["id"]), False
 
         candidates = tokens_of(text)
         new_numbers = _numbers(text)
         new_artifacts = _artifacts(text)
-        for cand in self.db.execute(
-            "SELECT id, text FROM memories ORDER BY last_used_at DESC LIMIT 400"
-        ):
-            other = tokens_of(cand["text"])
-            if not other:
-                continue
-            overlap = len(candidates & other)
-            # Jaccard catches rewordings of the same length; containment catches
-            # the same fact stated with an extra clause ("X is at P" vs
-            # "X files are located at P"), which Jaccard scores too low. Both are
-            # overridden by the numbers: "port 5432" and "port 5433" are
-            # different facts, however similar the wording.
-            shortest = min(len(candidates), len(other))
-            containment = overlap / shortest
-            similar = (
-                jaccard(candidates, other) >= self.dedupe_jaccard
-                or containment >= self.dedupe_containment
-                or (containment >= SHARED_ARTIFACT_CONTAINMENT and bool(new_artifacts & _artifacts(cand["text"])))
-            )
-            if similar and _numbers_agree(new_numbers, _numbers(cand["text"])):
-                self._bump(int(cand["id"]), now, new_text=text)
-                return int(cand["id"]), False
+        # Non-Latin text has no [a-z0-9_] token: dividing by zero here crashed
+        # every write after the first for a user writing in Russian or Chinese.
+        if candidates:
+            for cand in self.db.execute(
+                "SELECT id, text FROM memories ORDER BY last_used_at DESC LIMIT 400"
+            ):
+                other = tokens_of(cand["text"])
+                if not other:
+                    continue
+                # Jaccard catches rewordings of the same length; containment
+                # catches the same fact with an extra clause. Both are overridden
+                # by the numbers: "port 5432" and "port 5433" differ.
+                if not _numbers_agree(new_numbers, _numbers(cand["text"])):
+                    continue
+                if _mergeable(
+                    text, candidates, cand["text"], other,
+                    shared_artifact=bool(new_artifacts & _artifacts(cand["text"])),
+                    jaccard_min=self.dedupe_jaccard,
+                    containment_min=self.dedupe_containment,
+                ):
+                    self._bump(int(cand["id"]), now, new_text=text, new_tags=tags)
+                    return int(cand["id"]), False
 
         cur = self.db.execute(
             "INSERT INTO memories (kind, text, tags, norm_hash, importance, uses, created_at, last_used_at, embedding)"
@@ -268,7 +382,7 @@ class MemoryStore:
         opposite of what a decay model is for. ``last_used_at`` is the newer
         of the two whenever the memory was merged or deliberately recalled.
         """
-        reference = max(created_at, last_used_at or 0.0)
+        reference = min(max(created_at or 0.0, last_used_at or 0.0), now)
         age_days = max(0.0, (now - reference) / 86400.0)
         return math.pow(0.5, age_days / self.half_life_days)
 
@@ -287,6 +401,8 @@ class MemoryStore:
         immunised every memory against ``prune`` after a single session. Only
         deliberate recalls (``/mem``, ``rag_query``) and write-merges count.
         """
+        if k <= 0:
+            return []
         now = time.time()
         base: dict[int, float] = {}
 
@@ -311,7 +427,13 @@ class MemoryStore:
 
         if query_embedding:
             for r in self.db.execute("SELECT id, embedding FROM memories WHERE embedding IS NOT NULL"):
-                sim = _cosine(query_embedding, _unpack(r["embedding"]))
+                try:
+                    vector = _unpack(r["embedding"])
+                except (ValueError, TypeError):
+                    # A truncated or non-float32 blob (older writer, interrupted
+                    # write) crashed every search once embeddings were enabled.
+                    continue
+                sim = _cosine(query_embedding, vector)
                 if sim <= 0:
                     continue
                 base[int(r["id"])] = base.get(int(r["id"]), 0.0) * 0.6 + sim * 0.4
@@ -331,8 +453,11 @@ class MemoryStore:
             decay = self._decay(r["created_at"], r["last_used_at"], now)
             # Both factors are <= 1.0, so the score stays within 0..1 and /mem
             # never shows a "perfect" match as 1.23. Importance nudges the rank
-            # by at most 20%.
-            score = base[int(r["id"])] * (0.35 + 0.65 * decay) * (0.8 + 0.2 * r["importance"])
+            # by at most 20% - clamped here too, because rows written before the
+            # clamp existed (or by hand) are not.
+            importance = r["importance"] if isinstance(r["importance"], (int, float)) else 0.5
+            importance = max(0.0, min(1.0, float(importance)))
+            score = base[int(r["id"])] * (0.35 + 0.65 * decay) * (0.8 + 0.2 * importance)
             hits.append(Hit(int(r["id"]), r["kind"], r["text"], r["tags"], score, r["created_at"], r["uses"]))
 
         hits.sort(key=lambda h: h.score, reverse=True)
@@ -377,11 +502,16 @@ class MemoryStore:
         index: dict[str, list[dict]] = {}
         for row in rows:
             tokens = tokens_of(row["text"])
-            keys = _index_keys(tokens)
+            # Bucket on every distinctive token, not just the >=4-character ones:
+            # "Use uv for the build" / "Use uv for the tests" share "uv" but no
+            # long token, so compact() missed a pair that write() merges.
+            keys = {tok for tok in tokens if tok not in _COMMON_TOKENS}
             seen: set[int] = set()
             candidates: list[dict] = []
             for token in keys:
-                for survivor in index.get(token, ()):
+                # Cap the bucket: a very common word would otherwise compare
+                # this row against thousands of survivors.
+                for survivor in index.get(token, ())[-64:]:
                     if id(survivor) not in seen:
                         seen.add(id(survivor))
                         candidates.append(survivor)
@@ -392,15 +522,14 @@ class MemoryStore:
             nums = _numbers(row["text"])
             arts = _artifacts(row["text"])
             for survivor in candidates:
-                other = survivor["tokens"]
-                overlap = len(tokens & other)
-                containment = overlap / min(len(tokens), len(other))
-                similar = (
-                    jaccard(tokens, other) >= self.dedupe_jaccard
-                    or containment >= self.dedupe_containment
-                    or (containment >= SHARED_ARTIFACT_CONTAINMENT and bool(arts & survivor["arts"]))
-                )
-                if similar and _numbers_agree(nums, survivor["nums"]):
+                if not _numbers_agree(nums, survivor["nums"]):
+                    continue
+                if _mergeable(
+                    row["text"], tokens, survivor["text"], survivor["tokens"],
+                    shared_artifact=bool(arts & survivor["arts"]),
+                    jaccard_min=self.dedupe_jaccard,
+                    containment_min=self.dedupe_containment,
+                ):
                     match = survivor
                     break
             if match is None:
@@ -422,7 +551,7 @@ class MemoryStore:
                 match["tokens"] = tokens_of(richest)
                 match["nums"] = _numbers(richest)
                 match["arts"] = _artifacts(richest)
-                for token in _index_keys(match["tokens"]):
+                for token in (tok for tok in match["tokens"] if tok not in _COMMON_TOKENS):
                     bucket = index.setdefault(token, [])
                     if match not in bucket:
                         bucket.append(match)

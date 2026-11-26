@@ -50,23 +50,26 @@ class Brain:
         hits = self.recall(query, record=False)
         if not hits:
             return ""
-        budget = self.cfg.brain.inject_max_chars
+        budget = max(0, int(self.cfg.brain.inject_max_chars))
         lines = ["What you remember from earlier sessions (may be incomplete or stale):"]
         used = len(lines[0]) + 1
+        if budget <= used + 40:
+            # A header with no room for a single memory is prompt noise.
+            return ""
         withheld = 0
         for hit in hits:
             when = time.strftime("%Y-%m-%d", time.localtime(hit.created_at))
             suffix = f" ({when}{f', used {hit.uses}x' if hit.uses else ''})"
             line = f"- [{hit.kind}] {hit.text}{suffix}"
-            room = budget - used - 1
-            if len(line) > room:
-                if len(lines) > 1:
-                    withheld += 1
-                    continue
-                # Never drop the best match: show as much of it as fits.
-                line = line[: max(0, room - 1)].rstrip() + "…"
+            # A memory is a whole fact: skip the ones that do not fit and say how
+            # many were withheld. Clipping shipped half a sentence as a fact.
+            if used + len(line) + 1 > budget:
+                withheld += 1
+                continue
             lines.append(line)
             used += len(line) + 1
+        if len(lines) == 1:
+            return ""
         if withheld:
             note_line = f"- ({withheld} more memories withheld: prompt budget spent)"
             if used + len(note_line) <= budget:

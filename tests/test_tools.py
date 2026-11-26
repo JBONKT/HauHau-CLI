@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -85,6 +86,34 @@ class TestMemoryTools(unittest.TestCase):
         self.assertTrue(any(e.get("event") == "rag_query" for e in self.audit.tail(5)))
 
 
+    def test_rag_write_rejects_an_unknown_kind(self) -> None:
+        # The store silently relabelled a bogus kind "semantic", so the reply and
+        # the audit log claimed a label that was never stored.
+        result = self.run_tool("rag_write", text="Something to keep.", kind="bogus")
+        self.assertFalse(result.ok)
+        self.assertIn("semantic", result.content)
+        self.assertEqual(self.brain.stats()["total"], 0)
+
+    def test_rag_write_keeps_explicit_zero_importance(self) -> None:
+        # `importance or 0.5` turned an explicit 0 into the default weight.
+        result = self.run_tool("rag_write", text="A throwaway note about nothing.", importance=0)
+        self.assertTrue(result.ok, result.content)
+        row = self.brain.store.db.execute("SELECT importance FROM memories").fetchone()
+        self.assertEqual(row["importance"], 0.0)
+
+    def test_rag_write_rejects_out_of_range_importance(self) -> None:
+        result = self.run_tool("rag_write", text="x", importance=9)
+        self.assertFalse(result.ok)
+        self.assertIn("importance", result.content)
+
+    def test_rag_query_rejects_a_negative_k(self) -> None:
+        # SQLite reads LIMIT -1 as "no limit": a negative k dumped the whole brain.
+        self.run_tool("rag_write", text="The build uses make.")
+        result = self.run_tool("rag_query", query="build", k=-1)
+        self.assertFalse(result.ok)
+        self.assertIn("'k'", result.content)
+
+
 class TestShell(ToolTestCase):
     def test_echo_captures_output_and_exit(self) -> None:
         result = self.run_tool("shell", cmd="echo hello")
@@ -157,6 +186,17 @@ class TestShell(ToolTestCase):
         self.assertFalse(result.ok)
         self.assertIn("declined", result.content)
 
+    def test_a_background_child_holding_stdout_does_not_block(self) -> None:
+        # communicate() waits for every holder of the pipe: a daemon started by
+        # the command (or a shell profile) kept the REPL stuck for the whole
+        # timeout on its very first `shell` call.
+        started = time.monotonic()
+        result = self.run_tool("shell", cmd="sleep 5 > /dev/null 2>&1 & echo done", timeout=10)
+        elapsed = time.monotonic() - started
+        self.assertTrue(result.ok, result.content)
+        self.assertIn("done", result.content)
+        self.assertLess(elapsed, 3.0, "the tool waited for an unrelated pipe holder")
+
     def test_empty_command_rejected(self) -> None:
         self.assertFalse(self.run_tool("shell", cmd="   ").ok)
 
@@ -223,7 +263,7 @@ class TestFiles(ToolTestCase):
         self.run_tool("write_file", path=str(path), content="a\nb")
         result = self.run_tool("read_file", path=str(path), offset="five")
         self.assertFalse(result.ok)
-        self.assertIn("must be integers", result.content)
+        self.assertIn("must be an integer", result.content)
 
     def test_edit_refuses_a_file_too_large_to_rewrite(self) -> None:
         from hauhau.tools.files import EDIT_MAX_BYTES
@@ -302,6 +342,101 @@ class TestSearch(ToolTestCase):
         (self.root / "target.toml").write_text("x")
         result = self.run_tool("find", pattern="*.toml", path=str(self.root))
         self.assertIn("target.toml", result.content)
+
+class TestToolHardening(ToolTestCase):
+    """Reproducers for the tool-layer bugs the audit found.
+
+    Each case either crashed the whole turn, ran a command in the wrong place,
+    or silently changed data - so each asserts on *both* the reply and the
+    side effect on disk.
+    """
+
+    def test_non_utf8_output_is_kept_not_raised(self) -> None:
+        # subprocess(...) with text=True raised UnicodeDecodeError after the
+        # command had already run, so the work happened with no audit entry.
+        result = self.run_tool("shell", cmd="printf \'ok\\xff\\xfe done\\n\'")
+        self.assertTrue(result.ok, result.content)
+        self.assertIn("ok", result.content)
+        self.assertTrue(any(e.get("event") == "shell" for e in self.audit.tail(5)))
+
+    def test_invalid_cwd_fails_instead_of_running_elsewhere(self) -> None:
+        marker = self.root / "ran-here"
+        result = self.run_tool("shell", cmd=f"touch {marker}", cwd=str(self.root / "missing"))
+        self.assertFalse(result.ok)
+        self.assertIn("cwd", result.content)
+        self.assertFalse(marker.exists())
+
+    def test_infinite_timeout_is_a_clean_failure(self) -> None:
+        # float("inf") reached Popen and raised OverflowError, orphaning a child.
+        result = self.run_tool("shell", cmd="sleep 30", timeout=float("inf"))
+        self.assertFalse(result.ok)
+        self.assertIn("timeout", result.content)
+
+    def test_confirmation_without_a_prompt_fails_closed(self) -> None:
+        self.cfg.tools.shell_confirm = True
+        marker = self.root / "unasked"
+        result = self.run_tool("shell", cmd=f"touch {marker}")
+        self.assertFalse(result.ok)
+        self.assertIn("no prompt", result.content)
+        self.assertFalse(marker.exists())
+
+    def test_string_false_does_not_authorise_replace_all(self) -> None:
+        path = self.root / "twice.txt"
+        self.run_tool("write_file", path=str(path), content="dup dup")
+        result = self.run_tool("edit_file", path=str(path), old="dup", new="x", replace_all="false")
+        self.assertFalse(result.ok)
+        self.assertEqual(path.read_text(), "dup dup")
+
+    def test_non_string_content_is_rejected(self) -> None:
+        path = self.root / "n.txt"
+        result = self.run_tool("write_file", path=str(path), content={"a": 1})
+        self.assertFalse(result.ok)
+        self.assertIn("must be a string", result.content)
+        self.assertFalse(path.exists())
+
+    def test_edit_preserves_crlf_line_endings(self) -> None:
+        # Rewriting with newline translation turned every CRLF file into LF.
+        path = self.root / "win.txt"
+        path.write_bytes(b"one\r\ntwo\r\nthree\r\n")
+        result = self.run_tool("edit_file", path=str(path), old="two", new="TWO")
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(path.read_bytes(), b"one\r\nTWO\r\nthree\r\n")
+
+    def test_negative_read_limit_does_not_dump_the_file(self) -> None:
+        path = self.root / "big.txt"
+        self.run_tool("write_file", path=str(path), content="\n".join(f"l{i}" for i in range(50)))
+        result = self.run_tool("read_file", path=str(path), limit=-1)
+        self.assertFalse(result.ok)
+        self.assertIn("limit", result.content)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores directory modes")
+    def test_unreadable_directory_is_a_clean_failure(self) -> None:
+        locked = self.root / "locked"
+        locked.mkdir()
+        os.chmod(locked, 0o000)
+        try:
+            result = self.run_tool("list_dir", path=str(locked))
+        finally:
+            # addCleanup would run after tearDown has deleted the tree.
+            os.chmod(locked, 0o700)
+        self.assertFalse(result.ok)
+        self.assertIn("permission", result.content.lower())
+
+    def test_grep_rejects_a_non_numeric_max_results(self) -> None:
+        result = self.run_tool("grep", pattern="x", path=str(self.root), max_results="lots")
+        self.assertFalse(result.ok)
+        self.assertIn("max_results", result.content)
+
+    def test_grep_does_not_treat_the_string_false_as_ignore_case(self) -> None:
+        (self.root / "c.py").write_text("NEEDLE\n")
+        result = self.run_tool("grep", pattern="needle", path=str(self.root), ignore_case="false")
+        self.assertIn("no matches", result.content)
+
+    def test_find_caps_max_results(self) -> None:
+        for i in range(5):
+            (self.root / f"f{i}.txt").write_text("x")
+        result = self.run_tool("find", pattern="*.txt", path=str(self.root), max_results=2)
+        self.assertLessEqual(len(result.content.splitlines()), 2)
 
 
 class TestRegistryShape(ToolTestCase):

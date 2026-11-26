@@ -6,6 +6,7 @@ deliberately separate from the repo so it is git-ignored and survives upgrades.
 
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
@@ -147,6 +148,10 @@ def _describe(default: Any) -> str:
 def _type_ok(default: Any, value: Any) -> bool:
     if isinstance(default, bool):
         return isinstance(value, bool)
+    if isinstance(default, float) and isinstance(value, (int, float)) and not isinstance(value, bool):
+        # nan < 0.1 is False, so a NaN half-life sailed past every range check
+        # and turned decay, scores and sorting into NaN.
+        return math.isfinite(float(value))
     if isinstance(default, int):
         # bool is a subclass of int, but `max_steps = true` is always a mistake.
         return isinstance(value, int) and not isinstance(value, bool)
@@ -157,6 +162,10 @@ def _type_ok(default: Any, value: Any) -> bool:
     if isinstance(default, list):
         return isinstance(value, list) and all(isinstance(item, str) for item in value)
     return True
+
+
+class ConfigError(Exception):
+    """A config file that exists but cannot be understood."""
 
 
 def _apply(obj: Any, table: dict[str, Any], origin: str) -> list[str]:
@@ -204,6 +213,16 @@ def _sanity(cfg: Config) -> list[str]:
         ("brain.half_life_days", 0.1),
         ("brain.inject_max_chars", 100),
     ]
+    ceilings = [
+        ("brain.top_k", 50, "retrieval beyond 50 rows costs more prompt than it returns"),
+        ("agent.max_steps", 50, "a turn that needs 50 tool calls is a bug, not a plan"),
+    ]
+    for dotted, maximum, why in ceilings:
+        section, name = dotted.split(".")
+        current = getattr(getattr(cfg, section), name)
+        if current > maximum:
+            warnings.append(f"{dotted} must be <= {maximum}; using {maximum} ({why})")
+            setattr(getattr(cfg, section), name, maximum)
     for dotted, minimum in checks:
         section, name = dotted.split(".")
         current = getattr(getattr(cfg, section), name)
@@ -236,8 +255,15 @@ def load(path: str | os.PathLike[str] | None = None) -> tuple[Config, list[str]]
                 break
 
     if target is not None:
-        with target.open("rb") as fh:
-            data = tomllib.load(fh)
+        try:
+            with target.open("rb") as fh:
+                data = tomllib.load(fh)
+        except tomllib.TOMLDecodeError as exc:
+            # A typo in config.toml used to escape as a raw TOMLDecodeError and
+            # print a stack trace instead of saying which line is wrong.
+            raise ConfigError(f"{target} is not valid TOML: {exc}") from exc
+        except OSError as exc:
+            raise ConfigError(f"cannot read {target}: {exc}") from exc
         for section, value in data.items():
             if not hasattr(cfg, section) or not is_dataclass(getattr(cfg, section)):
                 warnings.append(f"unknown config section [{section}]")

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from hauhau.brain import Brain
-from hauhau.brain.learn import Learner, build_transcript, parse_drafts, worth_distilling
+from hauhau.brain.learn import Draft, Learner, build_transcript, durable, parse_drafts, worth_distilling
 from hauhau.config import Config
 from hauhau.llm import Completion, LLMError
 
@@ -204,6 +204,30 @@ class TestLearner(unittest.TestCase):
         learner = Learner(self.cfg, FakeClient(), None)
         self.assertEqual(learner.distill(self.messages), ([], []))
 
+
+class TestDurableKindValidation(unittest.TestCase):
+    """The specificity guard must not be bypassable by a kind label."""
+
+    def test_unknown_kind_fails_closed(self) -> None:
+        noise = "The user executes echo MEM_OK to confirm success."
+        for kind in ("procedural", "procedure", "Semantic", "SEMANTIC"):
+            self.assertFalse(durable(Draft(kind, noise), ("hauhau", "johan")), kind)
+
+    def test_real_machine_facts_are_kept(self) -> None:
+        for text in (
+            "The CI provider for this repository is GitHub Actions.",
+            "The user's machine is an M1 MacBook Air with eight gigabytes of memory.",
+            "The user's editor of choice is Emacs with the evil keybindings.",
+            "The staging deploy is triggered by the release branch.",
+        ):
+            self.assertTrue(durable(Draft("semantic", text), ("hauhau", "johan")), text)
+
+    def test_a_plain_preference_is_still_kept(self) -> None:
+        self.assertTrue(durable(Draft("preference", "The user wants answers in Swedish.")))
+
+    def test_parse_drafts_normalises_the_kind(self) -> None:
+        drafts = parse_drafts('[{"kind": "Procedure", "text": "Run make test before committing."}]')
+        self.assertEqual(drafts[0].kind, "semantic")
 
 if __name__ == "__main__":
     unittest.main()

@@ -680,8 +680,8 @@ def _apply_args(cfg, args) -> None:
         cfg.generation.think = True
     if args.data_dir:
         cfg.logging.data_dir = args.data_dir
-    if args.max_steps:
-        cfg.agent.max_steps = args.max_steps
+    if args.max_steps is not None:
+        cfg.agent.max_steps = max(1, args.max_steps)
 
 
 def _session_path(cfg, resume: str | None) -> tuple[Path, str | None]:
@@ -697,7 +697,20 @@ def _session_path(cfg, resume: str | None) -> tuple[Path, str | None]:
     if resume == "last":
         existing = sorted(cfg.sessions_dir.glob("*.json"))
         return (existing[-1], None) if existing else (fresh, None)
-    candidate = cfg.sessions_dir / (resume if resume.endswith(".json") else f"{resume}.json")
+    name = resume if resume.endswith(".json") else f"{resume}.json"
+    candidate = cfg.sessions_dir / name
+    # Check containment on the resolved path (symlinks included) but keep the
+    # unresolved one: /var is a symlink to /private/var on macOS, and a session
+    # path that suddenly reads "/private/var/..." is a surprise in the logs.
+    root = cfg.sessions_dir.resolve()
+    try:
+        inside = root in candidate.resolve().parents
+    except OSError:
+        inside = False
+    if not inside:
+        # --resume ../../notes would otherwise load, and later overwrite, any
+        # .json file the user can reach from the data directory.
+        return fresh, f"refusing --resume {resume!r}: it points outside {root}"
     if candidate.is_file():
         return candidate, None
     return fresh, f"no session named {resume!r} - starting a new one"
@@ -710,7 +723,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         cfg, warnings = config_mod.load(args.config)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, config_mod.ConfigError) as exc:
         error_panel(console, str(exc))
         return 2
     for warning in warnings:
@@ -790,7 +803,10 @@ def main(argv: list[str] | None = None) -> int:
         note(console, f"resumed {agent.turn_count()} turns from {session_path.name}")
 
     # --- banner --------------------------------------------------------
-    stats = brain.stats() if brain else {"total": 0}
+    try:
+        stats = brain.stats() if brain else {"total": 0}
+    except Exception:  # a broken brain.db must not block the CLI
+        stats = {"total": 0}
     if console.is_terminal:  # a boxed banner is noise when piped
         banner(
             console,
@@ -844,19 +860,34 @@ def main(argv: list[str] | None = None) -> int:
                     if console.is_terminal:
                         note(console, f"could not save the session: {exc}", WARN)
         finally:
+            # sqlite kept its handle (and its WAL) open until the interpreter
+            # exited; close it with everything else.
+            if brain is not None:
+                try:
+                    brain.close()
+                except Exception as exc:  # pragma: no cover - best effort
+                    audit.log("brain.close_error", error=str(exc))
             audit.close()
             manager.stop()
 
     # --- one-shot ------------------------------------------------------
     if args.prompt:
+        text = " ".join(args.prompt).strip()
+        if not text:
+            error_panel(console, "the prompt is empty")
+            finish()
+            return 2
+        failed = False
         try:
-            agent.run_turn(" ".join(args.prompt))
+            agent.run_turn(text)
             ui.newline()
         except LLMError as exc:
             error_panel(console, str(exc))
+            # A scripted run must be able to tell that nothing was answered.
+            failed = True
         finally:
             finish()
-        return 0
+        return 1 if failed else 0
 
     # --- interactive ---------------------------------------------------
     history_file = cfg.data_dir / "history"
@@ -902,7 +933,12 @@ def main(argv: list[str] | None = None) -> int:
             if not text:
                 continue
             if text.startswith("/"):
-                repl.handle(text)
+                try:
+                    repl.handle(text)
+                except Exception as exc:  # a command bug must not end the session
+                    audit.log("command.error", command=text.split(maxsplit=1)[0],
+                              error=f"{exc.__class__.__name__}: {exc}")
+                    error_panel(console, f"{text.split(maxsplit=1)[0]} failed: {exc}")
                 continue
             try:
                 agent.run_turn(text)

@@ -15,6 +15,7 @@ unnecessary. Two model-specific quirks are handled here:
 from __future__ import annotations
 
 import json
+import math
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable
@@ -37,6 +38,8 @@ class ToolCall:
             value = json.loads(self.arguments or "{}")
         except json.JSONDecodeError as exc:
             raise LLMError(f"tool {self.name!r} got malformed JSON arguments: {self.arguments!r}") from exc
+        except TypeError as exc:  # arguments arrived as an object, not a string
+            raise LLMError(f"tool {self.name!r} got non-string arguments: {self.arguments!r}") from exc
         if not isinstance(value, dict):
             raise LLMError(f"tool {self.name!r} arguments must be an object, got {type(value).__name__}")
         return value
@@ -150,19 +153,74 @@ class LlamaClient:
         with self._open(req) as resp:
             return self._parse_stream(resp, on_token, on_reasoning)
 
-    def _parse_full(self, data: dict) -> Completion:
-        choice = (data.get("choices") or [{}])[0]
-        msg = choice.get("message") or {}
-        calls = [
+    @staticmethod
+    def _shape(data: Any) -> tuple[dict, dict]:
+        """First choice and its message/delta, validated.
+
+        A proxy error page or a different server version can answer with JSON
+        of another shape; indexing it blindly raised KeyError/AttributeError out
+        of chat() and killed the turn with a traceback instead of an LLMError
+        the CLI can show.
+        """
+        if not isinstance(data, dict):
+            raise LLMError(f"unexpected response from llama-server: {type(data).__name__}, not an object")
+        choices = data.get("choices") or []
+        if not isinstance(choices, list):
+            raise LLMError("unexpected response from llama-server: 'choices' is not a list")
+        choice = choices[0] if choices else {}
+        if not isinstance(choice, dict):
+            raise LLMError("unexpected response from llama-server: choices[0] is not an object")
+        body = choice.get("message") or choice.get("delta") or {}
+        if not isinstance(body, dict):
+            raise LLMError("unexpected response from llama-server: message is not an object")
+        return choice, body
+
+    @staticmethod
+    def _rate(source: Any, key: str) -> float:
+        """A finite float, or 0.0. Timings arrive as None when a server omits them."""
+        if not isinstance(source, dict):
+            return 0.0
+        value = source.get(key, 0.0)
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return rate if math.isfinite(rate) else 0.0
+
+    @staticmethod
+    def _args(function: Any) -> str:
+        """Tool arguments as JSON text, as the API promises but does not always send."""
+        if not isinstance(function, dict):
+            return "{}"
+        value = function.get("arguments")
+        if isinstance(value, str):
+            return value or "{}"
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+        return "{}"
+
+    @staticmethod
+    def _calls(raw: Any) -> list[ToolCall]:
+        if not isinstance(raw, list):
+            return []
+        return [
             ToolCall(
-                id=tc.get("id") or f"call_{i}",
-                name=(tc.get("function") or {}).get("name", ""),
-                arguments=(tc.get("function") or {}).get("arguments") or "{}",
+                id=(tc.get("id") or f"call_{i}") if isinstance(tc, dict) else f"call_{i}",
+                name=((tc.get("function") or {}).get("name") or "") if isinstance(tc, dict) else "",
+                arguments=LlamaClient._args((tc.get("function") or {}) if isinstance(tc, dict) else {}),
             )
-            for i, tc in enumerate(msg.get("tool_calls") or [])
+            for i, tc in enumerate(raw)
         ]
+
+    def _parse_full(self, data: dict) -> Completion:
+        choice, msg = self._shape(data)
+        calls = self._calls(msg.get("tool_calls"))
         usage = data.get("usage") or {}
         timings = data.get("timings") or {}
+        if not isinstance(usage, dict):
+            usage = {}
+        if not isinstance(timings, dict):
+            timings = {}
         return Completion(
             content=msg.get("content") or "",
             reasoning=msg.get("reasoning_content") or "",
@@ -171,8 +229,8 @@ class LlamaClient:
             usage=Usage(
                 prompt_tokens=usage.get("prompt_tokens", 0),
                 completion_tokens=usage.get("completion_tokens", 0),
-                tok_per_second=timings.get("predicted_per_second", 0.0),
-                prompt_per_second=timings.get("prompt_per_second", 0.0),
+                tok_per_second=self._rate(timings, "predicted_per_second"),
+                prompt_per_second=self._rate(timings, "prompt_per_second"),
             ),
             model=data.get("model", ""),
         )
@@ -196,18 +254,28 @@ class LlamaClient:
                 event = json.loads(chunk)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(event, dict):
+                continue
             if "timings" in event:
-                out.usage.tok_per_second = (event["timings"] or {}).get("predicted_per_second", 0.0)
-                out.usage.prompt_per_second = (event["timings"] or {}).get("prompt_per_second", 0.0)
-            if event.get("usage"):
-                out.usage.prompt_tokens = event["usage"].get("prompt_tokens", out.usage.prompt_tokens)
-                out.usage.completion_tokens = event["usage"].get(
+                out.usage.tok_per_second = self._rate(event["timings"], "predicted_per_second")
+                out.usage.prompt_per_second = self._rate(event["timings"], "prompt_per_second")
+            usage = event.get("usage")
+            if isinstance(usage, dict) and usage:
+                out.usage.prompt_tokens = usage.get("prompt_tokens", out.usage.prompt_tokens)
+                out.usage.completion_tokens = usage.get(
                     "completion_tokens", out.usage.completion_tokens
                 )
-            choice = (event.get("choices") or [{}])[0]
+            choices = event.get("choices") or []
+            if not isinstance(choices, list):
+                continue
+            choice = choices[0] if choices else {}
+            if not isinstance(choice, dict):
+                continue
             if choice.get("finish_reason"):
                 out.finish_reason = choice["finish_reason"]
             delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
             if delta.get("content"):
                 out.content += delta["content"]
                 if on_token:
@@ -217,6 +285,8 @@ class LlamaClient:
                 if on_reasoning:
                     on_reasoning(delta["reasoning_content"])
             for tc in delta.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
                 slot = pending.setdefault(tc.get("index", len(pending)), {"id": "", "name": "", "args": ""})
                 if tc.get("id"):
                     slot["id"] = tc["id"]

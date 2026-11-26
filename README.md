@@ -136,7 +136,7 @@ plain text.
 
 ```bash
 .venv/bin/ruff check hauhau tests                      # clean
-.venv/bin/python -m unittest discover -s tests -t .    # 352 tests
+.venv/bin/python -m unittest discover -s tests -t .    # 440 tests
 ```
 
 ## Assumptions this build corrects
@@ -258,6 +258,12 @@ authoritative — the command never executed.
 Every shell command, tool call, file write, snapshot and config change is
 appended to `~/.hauhau/logs/audit.jsonl`. Overwrites snapshot the previous file
 into `~/.hauhau/.snapshots`. The denylist is checked *before* execution.
+
+Treat the denylist as a speed bump, not a boundary. Quoting, case and line
+continuations are normalised before matching, but shell indirection
+(`X=rm; $X -rf /`) still gets through — only `shell_confirm` (the prompt) is a
+real gate. `read_file` pages at 2000 lines by default; ask for more with
+`limit`/`offset` instead of pulling a whole file into the prompt.
 
 ## Slash commands
 

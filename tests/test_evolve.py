@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 
 from hauhau.evolve.prompts import PromptStore, evolve_prompt, validate
-from hauhau.evolve.suite import DEFAULT_TASKS, SuiteResult, Task, available, run_suite
+from hauhau.evolve.suite import DEFAULT_TASKS, SuiteResult, Task, _judge, available, run_suite
+from hauhau.evolve.tune import Candidate, hill_climb
 from hauhau.llm import Completion, LLMError, ToolCall
 
 
@@ -232,6 +233,79 @@ class TestEvolvePrompt(unittest.TestCase):
         result = evolve_prompt(FakeClient(error=LLMError("down")), self.store, run, self.current)
         self.assertFalse(result.accepted)
         self.assertIn("rewrite failed", result.reason)
+
+
+class TestVersionNumbers(unittest.TestCase):
+    """A rollback point must never be overwritten."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = PromptStore(Path(self._tmp.name))
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_lost_index_entry_does_not_reissue_a_live_number(self) -> None:
+        self.store.add("prompt one " * 25)
+        self.store.add("prompt two " * 25)
+        self.store.add("PRECIOUS v3 prompt " * 20)
+        lines = self.store.index_path.read_text().splitlines()
+        # Simulate a truncated/edited index: the v3 line is gone but v3.md is not.
+        self.store.index_path.write_text(lines[0] + "\n" + lines[1] + "\n{oops}\n")
+        version = self.store.add("brand new rewrite " * 20)
+        self.assertEqual(version.number, 4)
+        self.assertIn("PRECIOUS", (self.store.versions_dir / "v3.md").read_text())
+
+    def test_orphan_version_file_is_not_clobbered(self) -> None:
+        self.store.versions_dir.mkdir(parents=True, exist_ok=True)
+        (self.store.versions_dir / "v7.md").write_text("orphan\n")
+        version = self.store.add("fresh prompt " * 25)
+        self.assertEqual(version.number, 8)
+        self.assertEqual((self.store.versions_dir / "v7.md").read_text(), "orphan\n")
+
+    def test_a_hand_edited_score_does_not_crash_the_listing(self) -> None:
+        self.store.add("prompt one " * 25)
+        lines = self.store.index_path.read_text().splitlines()
+        self.store.index_path.write_text(lines[0].replace('"score": null', '"score": "0.9"') + "\n")
+        versions = self.store.versions()
+        self.assertEqual(len(versions), 1)
+        # A string score used to reach "/prompt" and raise on f"{score:.0%}".
+        self.assertEqual(versions[0].score, 0.9)
+        self.assertEqual(f"{versions[0].score:.0%}", "90%")
+
+
+class TestJudgeIsNotSubstring(unittest.TestCase):
+    def test_a_longer_number_does_not_pass(self) -> None:
+        task = Task("arithmetic", "What is 1+1? Answer with the number only.", contains=("2",))
+        self.assertFalse(_judge(task, Completion(content="12"))[0])
+        self.assertTrue(_judge(task, Completion(content="2"))[0])
+
+    def test_negated_answer_does_not_pass(self) -> None:
+        task = Task("arithmetic", "What is 1+1? Answer with the number only.", contains=("2",))
+        self.assertFalse(_judge(task, Completion(content="It is not 2."))[0])
+
+    def test_prose_still_passes_a_word_task(self) -> None:
+        task = Task("exact-reply", "Reply with exactly: pong", contains=("pong",), exact=True)
+        self.assertTrue(_judge(task, Completion(content="pong"))[0])
+        self.assertTrue(_judge(task, Completion(content="PONG!"))[0])
+        self.assertFalse(_judge(task, Completion(content="I will not reply pong."))[0])
+
+    def test_a_tool_argument_is_matched_as_a_word(self) -> None:
+        task = Task("list-files", "list files", tools_any=("shell",), args_contains=("ls", "."))
+        wrong = Completion(content="", tool_calls=[ToolCall(id="c", name="shell", arguments='{"cmd": "false"}')])
+        right = Completion(content="", tool_calls=[ToolCall(id="c", name="shell", arguments='{"cmd": "ls ."}')])
+        self.assertFalse(_judge(task, wrong)[0])
+        self.assertTrue(_judge(task, right)[0])
+
+
+class TestHillClimbAdoption(unittest.TestCase):
+    def test_the_winning_trial_is_the_one_marked_adopted(self) -> None:
+        options = [Candidate("model.n_threads", 2, "a"), Candidate("model.n_threads", 2, "b")]
+        scores = iter([10.0, 20.0])
+        result = hill_climb(10.0, options, lambda candidate: next(scores), max_trials=2)
+        adopted = [trial for trial in result.trials if trial.adopted]
+        self.assertEqual(len(adopted), 1)
+        self.assertEqual(adopted[0].score, 20.0)
 
 
 if __name__ == "__main__":

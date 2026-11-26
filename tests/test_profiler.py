@@ -52,6 +52,15 @@ class TestRecommend(unittest.TestCase):
 
 
 class TestApply(unittest.TestCase):
+    def test_unknown_ram_gets_the_conservative_context(self) -> None:
+        # A machine whose RAM cannot be read is not a licence to assume 32k.
+        unknown = HardwareProfile(
+            os_name="Linux", arch="x86_64", cpu="?", cores=4, ram_gb=0.0, gpu="none",
+            metal=False, disk_free_gb=0.0, llama_server="", llama_version="",
+        )
+        self.assertEqual(recommend(unknown)["n_ctx"][0], 8192)
+        self.assertIn("could not be detected", recommend(unknown)["n_ctx"][1])
+
     def test_values_are_written_and_changes_described(self) -> None:
         cfg = Config()
         cfg.model.n_ctx = 2048

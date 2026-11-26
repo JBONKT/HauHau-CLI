@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from hauhau import config as config_mod
-from hauhau.config import Config
+from hauhau.config import Config, ConfigError, _sanity, _type_ok, load
 
 
 class ConfigTestCase(unittest.TestCase):
@@ -71,7 +71,46 @@ class TestRoundTrip(ConfigTestCase):
             config_mod.load(self.tmp / "nope.toml")
 
 
+class TestMalformedFile(unittest.TestCase):
+    def test_broken_toml_raises_a_config_error(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "config.toml"
+        path.write_text("[model\nn_ctx = 8192\n")
+        with self.assertRaises(ConfigError) as ctx:
+            load(path)
+        self.assertIn("not valid TOML", str(ctx.exception))
+        self.assertIn("line 1", str(ctx.exception))
+
+    def test_unreadable_file_raises_a_config_error(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "config.toml"
+        path.write_text("[model]\nn_ctx = 8192\n")
+        path.chmod(0o000)
+        self.addCleanup(path.chmod, 0o600)
+        with self.assertRaises(ConfigError):
+            load(path)
+
+
 class TestValidation(ConfigTestCase):
+    def test_nan_is_not_a_number(self) -> None:
+        # nan < 0.1 is False, so a NaN half-life used to pass every range check
+        # and turn decay scores into NaN.
+        self.assertFalse(_type_ok(0.5, float("nan")))
+        self.assertFalse(_type_ok(0.5, float("inf")))
+        self.assertTrue(_type_ok(0.5, 30.0))
+
+    def test_upper_bounds_on_top_k_and_max_steps(self) -> None:
+        cfg = Config()
+        cfg.brain.top_k = 10_000
+        cfg.agent.max_steps = 5_000
+        warnings = _sanity(cfg)
+        self.assertEqual(cfg.brain.top_k, 50)
+        self.assertEqual(cfg.agent.max_steps, 50)
+        self.assertTrue(any("top_k" in w for w in warnings))
+        self.assertTrue(any("max_steps" in w for w in warnings))
+
     def write(self, body: str) -> Path:
         path = self.tmp / "config.toml"
         path.write_text(body, encoding="utf-8")

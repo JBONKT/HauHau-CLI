@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..llm import LLMError
+from .store import KINDS
 
 # Below this, a session is too thin to be worth a model pass.
 MIN_TRANSCRIPT_CHARS = 40
@@ -80,6 +81,18 @@ _SPECIFIC = re.compile(
 # ("the user wants answers in Swedish").
 _NEEDS_SPECIFICS = {"semantic", "procedural"}
 
+# Naming a real tool, service or platform is as specific as naming a path: the
+# old rule rejected "the CI provider is GitHub Actions" while accepting
+# "remember to be brief at 10:30".
+_TOOLING = re.compile(
+    r"\b(?:github|gitlab|bitbucket|actions|jenkins|circleci|homebrew|brew|docker|podman"
+    r"|kubernetes|postgres(?:ql)?|mysql|sqlite|redis|nginx|apache|macos|osx|linux|ubuntu"
+    r"|debian|windows|wsl|macbook|imac|emacs|vim|neovim|vscode|pycharm|zsh|bash|fish"
+    r"|python|node|rust|cargo|uv|poetry|pipx|ruff|pytest|mypy|llama\.cpp|ollama"
+    r"|staging|production|release branch|ci\b|gpu|cuda|metal|rocm)\b",
+    re.IGNORECASE,
+)
+
 
 def _anchors(cfg) -> tuple[str, ...]:
     """Words that tie a memory to this machine, project or user."""
@@ -93,11 +106,23 @@ def _anchors(cfg) -> tuple[str, ...]:
     return tuple(w.lower() for w in words if w and len(w) > 2)
 
 
+def _kind(value: object) -> str:
+    """Only the four stored kinds survive; anything else is a plain fact."""
+    kind = str(value or "semantic").strip().lower()
+    return kind if kind in KINDS else "semantic"
+
+
 def durable(draft: Draft, anchors: tuple[str, ...] = ()) -> bool:
-    """Reject generic advice the agent should not need a memory for."""
-    if draft.kind not in _NEEDS_SPECIFICS:
+    """Reject generic advice the agent should not need a memory for.
+
+    An unrecognised kind fails *closed*: ``parse_drafts`` accepts whatever string
+    the model sends, so "procedure" (or "Semantic") used to bypass the guard and
+    store exactly the noise it exists to drop.
+    """
+    kind = (draft.kind or "").strip().lower()
+    if kind in KINDS and kind not in _NEEDS_SPECIFICS:
         return True
-    if _SPECIFIC.search(draft.text):
+    if _SPECIFIC.search(draft.text) or _TOOLING.search(draft.text):
         return True
     low = draft.text.lower()
     return any(anchor in low for anchor in anchors)
@@ -168,7 +193,7 @@ def parse_drafts(raw: str) -> list[Draft]:
             importance = 0.5
         drafts.append(
             Draft(
-                kind=str(item.get("kind") or "semantic"),
+                kind=_kind(item.get("kind")),
                 text=text,
                 tags=str(tags),
                 importance=max(0.0, min(1.0, importance)),
@@ -208,7 +233,9 @@ class Learner:
         transcript = build_transcript(messages)
         if len(transcript) < MIN_TRANSCRIPT_CHARS or not worth_distilling(messages):
             return [], []
-        prompt = PROMPT.replace("{known}", self._known_block()).replace("{transcript}", transcript)
+        # Transcript first: memory text is model-written and may itself contain
+        # "{known}" or "{transcript}", which the old order spliced in.
+        prompt = PROMPT.replace("{transcript}", transcript).replace("{known}", self._known_block())
         try:
             completion = self.client.chat(
                 [{"role": "user", "content": prompt}],

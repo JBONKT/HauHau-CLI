@@ -73,6 +73,25 @@ class TestRememberRecall(TestBrain):
             self.assertTrue(line.endswith(")"), f"truncated memory: {line!r}")
             self.assertIn("/srv/cache/", line)
 
+    def test_context_block_does_not_exceed_a_tiny_budget(self) -> None:
+        # A header plus one clipped memory was over budget *and* shipped half a
+        # sentence; with no room for a whole memory the block must be empty.
+        self.cfg.brain.inject_max_chars = 100
+        self.brain.remember(
+            "procedural",
+            "The release checklist lives in docs/release.md and starts with a branch freeze.",
+            importance=0.9,
+        )
+        block = self.brain.context_block("release checklist")
+        self.assertLessEqual(len(block), 100)
+        self.assertNotIn("…", block)
+        self.assertNotIn("The release c", block)
+
+    def test_context_block_holds_its_budget_at_the_configured_minimum(self) -> None:
+        self.cfg.brain.inject_max_chars = 71  # header length: nothing can fit
+        self.brain.remember("semantic", "A durable fact about this machine.")
+        self.assertEqual(self.brain.context_block("durable fact"), "")
+
     def test_disabled_brain_injects_nothing(self) -> None:
         self.cfg.brain.enabled = False
         self.assertEqual(self.brain.context_block("anything"), "")

@@ -144,9 +144,12 @@ def recommend(profile: HardwareProfile, model_bytes: int = 0) -> dict:
 
     rec["n_threads"] = (threads, f"{profile.cores} logical cores, leaving headroom for the client")
 
-    if profile.ram_gb and profile.ram_gb < 10:
+    if not profile.ram_gb:
+        # An unreadable total is not a licence to assume a big machine.
+        rec["n_ctx"] = (8192, "RAM could not be detected: the conservative 8k context")
+    elif profile.ram_gb < 10:
         rec["n_ctx"] = (8192, "8 GB class RAM: 8k context keeps KV cache small")
-    elif profile.ram_gb and profile.ram_gb < 18:
+    elif profile.ram_gb < 18:
         rec["n_ctx"] = (16384, f"{profile.ram_gb:g} GB RAM fits a 16k KV cache")
     else:
         rec["n_ctx"] = (32768, f"{profile.ram_gb:g} GB RAM fits a 32k KV cache")

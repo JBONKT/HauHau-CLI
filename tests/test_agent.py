@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -341,3 +342,55 @@ class TestPersistence(AgentTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSessionShape(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        cfg = Config()
+        cfg.brain.enabled = False
+        self.agent = Agent(cfg, FakeClient([]), Registry([]), brain=None)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write(self, payload) -> Path:
+        path = self.root / "s.json"
+        path.write_text(payload if isinstance(payload, str) else json.dumps(payload))
+        return path
+
+    def test_a_good_session_round_trips(self) -> None:
+        path = self.root / "good.json"
+        self.agent.messages = [{"role": "user", "content": "hi"}]
+        self.agent.summary = "some summary"
+        self.agent.persist(path)
+        other = Agent(Config(), FakeClient([]), Registry([]), brain=None)
+        self.assertTrue(other.load(path))
+        self.assertEqual(other.messages, self.agent.messages)
+        self.assertEqual(other.summary, "some summary")
+
+    def test_rejects_messages_that_are_not_a_list(self) -> None:
+        for payload in ({"messages": {"a": 1}}, {"messages": "hello"}, {"messages": [], "summary": 5}):
+            self.assertFalse(self.agent.load(self._write(payload)), payload)
+        self.assertEqual(self.agent.messages, [])
+
+    def test_rejects_a_top_level_list(self) -> None:
+        self.assertFalse(self.agent.load(self._write([1, 2, 3])))
+
+    def test_rejects_a_message_without_a_role(self) -> None:
+        self.assertFalse(self.agent.load(self._write({"messages": [{"content": "x"}]})))
+
+    def test_rejects_broken_json(self) -> None:
+        self.assertFalse(self.agent.load(self._write("{not json")))
+
+
+class TestPersonalityBraces(unittest.TestCase):
+    def test_an_unknown_placeholder_does_not_crash_every_turn(self) -> None:
+        cfg = Config()
+        cfg.brain.enabled = False
+        cfg.agent.personality = "You are {name}. Reply about {topic}."
+        agent = Agent(cfg, FakeClient([]), Registry([]), brain=None)
+        prompt = agent.system_prompt("hi")
+        self.assertIn("You are Hauhau", prompt)
+        self.assertIn("{topic}", prompt, "the text is kept, braces and all")

@@ -50,6 +50,9 @@ class Audit:
     def tail(self, n: int = 10) -> list[dict]:
         if not self.path.exists():
             return []
+        # lines[-0:] is the whole file and a negative n slices from the front,
+        # so /audit 0 printed the entire log.
+        n = max(1, int(n))
         lines = self.path.read_text(encoding="utf-8").splitlines()[-n:]
         out = []
         for line in lines:

@@ -161,6 +161,7 @@ def hill_climb(
 
     for group in by_key.values():
         best: Candidate | None = None
+        best_index: int | None = None
         for option in group:
             if len(result.trials) >= max_trials:
                 result.stopped = f"trial budget ({max_trials}) reached"
@@ -179,9 +180,11 @@ def hill_climb(
             if score > result.best + margin * max(1.0, abs(result.best)):
                 result.best = score
                 best = option
-        if best is not None:
-            best_trial = next(t for t in result.trials if t.candidate == str(best))
-            best_trial.adopted = True
+                # Remember *which* trial won: two candidates can print the same
+                # label, and the old lookup marked the first match as adopted.
+                best_index = len(result.trials) - 1
+        if best is not None and best_index is not None:
+            result.trials[best_index].adopted = True
             result.adopted.append(best)
     return result
 

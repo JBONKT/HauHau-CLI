@@ -61,7 +61,7 @@ class Agent:
     # --- prompt --------------------------------------------------------
     def system_prompt(self, query: str = "") -> str:
         a = self.cfg.agent
-        parts = [a.personality.format(name=a.name)]
+        parts = [self._personality(a.personality, a.name)]
         parts.append(f"Working directory: {self.cfg.workspace}")
         parts.append(f"Today: {time.strftime('%Y-%m-%d %H:%M %Z')}")
         parts.append(
@@ -77,6 +77,18 @@ class Agent:
         if self.summary:
             parts.append(f"Summary of the earlier conversation in this session:\n{self.summary}")
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _personality(template: str, name: str) -> str:
+        """Fill ``{name}`` without dying on any other brace.
+
+        A hand-edited personality containing "{topic}" raised KeyError out of
+        every single turn; the text is still usable, so keep it.
+        """
+        try:
+            return template.format(name=name)
+        except (KeyError, IndexError, ValueError):
+            return template.replace("{name}", name)
 
     def _last_user_text(self) -> str:
         for msg in reversed(self.messages):
@@ -329,10 +341,22 @@ class Agent:
             return False
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return False
-        self.messages = payload.get("messages") or []
-        self.summary = payload.get("summary") or ""
+        if not isinstance(payload, dict):
+            return False
+        messages = payload.get("messages") or []
+        summary = payload.get("summary") or ""
+        # A hand-edited or half-written session used to load as a dict or a list
+        # of strings and crash the first turn with AttributeError.
+        if not isinstance(messages, list) or not all(
+            isinstance(message, dict) and isinstance(message.get("role"), str) for message in messages
+        ):
+            return False
+        if not isinstance(summary, str):
+            return False
+        self.messages = messages
+        self.summary = summary
         return True
 
     def turn_count(self) -> int:

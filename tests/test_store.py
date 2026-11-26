@@ -335,5 +335,125 @@ class TestMaintenance(StoreTestCase):
         self.store = MemoryStore(self.db)  # for tearDown
 
 
+class TestStoreHardening(StoreTestCase):
+    """Reproducers for the memory defects found by the adversarial review."""
+
+    def test_non_latin_memory_is_stored(self) -> None:
+        # tokens_of() only matches [a-z0-9_]+, so a Cyrillic or CJK memory had no
+        # tokens at all and the containment divide-by-zero killed the write.
+        self.store.write("semantic", "The deploy script is bin/deploy.sh")
+        for text in (
+            "Пользователь предпочитает краткие ответы",
+            "用户偏好简短回答",
+            "!!!",
+            "→ ←",
+        ):
+            row_id, created = self.store.write("preference", text)
+            self.assertTrue(created, text)
+            self.assertGreater(row_id, 0)
+
+    def test_negated_fact_is_not_merged_into_its_opposite(self) -> None:
+        self.store.write("preference", "The user always runs the tests with the -x flag.")
+        self.store.write("preference", "The user never runs the tests with the -x flag on this machine.")
+        self.assertEqual(self.store.stats()["total"], 2)
+        texts = [row["text"] for row in self.store.db.execute("SELECT text FROM memories")]
+        self.assertTrue(any("always" in text for text in texts))
+        self.assertTrue(any("never" in text for text in texts))
+
+    def test_a_one_word_fact_is_not_swallowed(self) -> None:
+        # Containment is measured against the shorter text, so "Ruff" scored 1.0
+        # against a whole sentence that mentioned ruff and was silently dropped.
+        self.store.write("procedural", "Run ruff check . before every commit.")
+        _, created = self.store.write("semantic", "Ruff")
+        self.assertTrue(created)
+        self.assertEqual(self.store.stats()["total"], 2)
+
+    def test_merge_keeps_the_incoming_tags(self) -> None:
+        self.store.write("semantic", "Uses uv for every python project here.", tags="python,packaging")
+        self.store.write("semantic", "Uses uv for every python project on this machine.", tags="tooling,venv")
+        tags = self.store.db.execute("SELECT tags FROM memories").fetchone()["tags"]
+        for expected in ("python", "packaging", "tooling", "venv"):
+            self.assertIn(expected, tags)
+
+    def test_identifier_punctuation_is_searchable(self) -> None:
+        # FTS5 splits "line-length" into two tokens; the old query stripped the
+        # dash and searched for "linelength", which can never match.
+        self.store.write("semantic", "Ruff is configured with line-length 120 in pyproject.toml.")
+        for query in ("line-length", "pyproject.toml", "line length"):
+            self.assertTrue(self.store.search(query), query)
+
+    def test_corrupt_embedding_blob_does_not_break_search(self) -> None:
+        self.store.write("semantic", "Quarterly revenue grew.", embedding=[1.0, 0.0, 0.0])
+        self.store.db.execute("UPDATE memories SET embedding = ?", (b"\x00\x00\x80\x3f\x01",))
+        self.store.db.commit()
+        hits = self.store.search("revenue", k=2, query_embedding=[1.0, 0.0, 0.0])
+        self.assertTrue(hits)
+
+    def test_search_with_non_positive_k_returns_nothing(self) -> None:
+        self.store.write("semantic", "Uses uv for python.")
+        for k in (0, -1):
+            self.assertEqual(self.store.search("uv", k=k), [])
+
+    def test_out_of_range_importance_cannot_exceed_a_score_of_one(self) -> None:
+        row_id, _ = self.store.write("semantic", "Everything about the deploy pipeline.", importance=1.0)
+        self.store.db.execute("UPDATE memories SET importance = 2.5 WHERE id = ?", (row_id,))
+        self.store.db.commit()
+        self.assertLessEqual(self.store.search("deploy pipeline", k=1, record_use=False)[0].score, 1.0)
+
+    def test_compact_finds_a_pair_that_write_would_merge(self) -> None:
+        # "Use uv for the build" / "Use uv for the tests" share no long token, so
+        # the old >=4-character bucketing never compared them.
+        now = time.time()
+        for digest, text in (("a", "Use uv for the build"), ("b", "Use uv for the tests")):
+            self.store.db.execute(
+                "INSERT INTO memories (kind, text, tags, norm_hash, importance, uses, created_at, last_used_at)"
+                " VALUES ('semantic', ?, '', ?, 0.5, 0, ?, ?)",
+                (text, digest, now, now),
+            )
+        self.store.db.commit()
+        self.assertEqual(self.store.compact(), 1)
+        self.assertEqual(self.store.stats()["total"], 1)
+
+    def test_legacy_database_is_migrated_on_open(self) -> None:
+        import sqlite3
+
+        legacy = Path(self._tmp.name) / "legacy.db"
+        db = sqlite3.connect(legacy)
+        db.executescript(
+            "CREATE TABLE memories (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,"
+            " text TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '', norm_hash TEXT NOT NULL,"
+            " importance REAL NOT NULL DEFAULT 0.5, uses INTEGER NOT NULL DEFAULT 0,"
+            " created_at REAL NOT NULL, last_used_at REAL NOT NULL);"
+        )
+        db.execute(
+            "INSERT INTO memories (kind, text, norm_hash, created_at, last_used_at)"
+            " VALUES ('semantic', 'old fact', 'h', ?, ?)",
+            (time.time(), time.time()),
+        )
+        db.commit()
+        db.close()
+        store = MemoryStore(legacy)
+        try:
+            self.assertEqual(store.stats()["total"], 1)
+            self.assertEqual([hit.text for hit in store.search("old fact")], ["old fact"])
+        finally:
+            store.close()
+
+    def test_future_timestamp_is_clamped_on_open(self) -> None:
+        row_id, _ = self.store.write("episodic", "Throwaway note about a temp file.", importance=0.05)
+        future = time.time() + 86400 * 3650
+        self.store.db.execute(
+            "UPDATE memories SET created_at = ?, last_used_at = ? WHERE id = ?", (future, future, row_id)
+        )
+        self.store.db.commit()
+        self.store.close()
+        store = MemoryStore(self.db)
+        try:
+            created = store.db.execute("SELECT created_at FROM memories WHERE id = ?", (row_id,)).fetchone()[0]
+            self.assertLessEqual(created, time.time())
+        finally:
+            store.close()
+        self.store = MemoryStore(self.db)
+
 if __name__ == "__main__":
     unittest.main()

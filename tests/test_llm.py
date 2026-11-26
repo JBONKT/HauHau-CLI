@@ -192,3 +192,62 @@ class ToolCallArguments(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHostilePayloads(unittest.TestCase):
+    """A proxy error page or another server version must not crash a turn."""
+
+    def setUp(self) -> None:
+        self.client = LlamaClient("http://127.0.0.1:9")
+
+    def test_choices_that_are_not_a_list_raise_llm_error(self) -> None:
+        with self.assertRaises(LLMError) as ctx:
+            self.client._parse_full({"choices": {"message": {"content": "x"}}})
+        self.assertIn("choices", str(ctx.exception).lower())
+
+    def test_choice_that_is_not_an_object_raises_llm_error(self) -> None:
+        with self.assertRaises(LLMError):
+            self.client._parse_full({"choices": ["nope"]})
+
+    def test_message_that_is_not_an_object_raises_llm_error(self) -> None:
+        with self.assertRaises(LLMError):
+            self.client._parse_full({"choices": [{"message": "nope"}]})
+
+    def test_missing_pieces_are_simply_empty(self) -> None:
+        self.assertEqual(self.client._parse_full({}).content, "")
+        self.assertEqual(self.client._parse_full({"choices": []}).tool_calls, [])
+
+    def test_none_and_nan_timings_become_zero(self) -> None:
+        for value in (None, float("nan"), "fast", float("inf")):
+            completion = self.client._parse_full(
+                {"choices": [{"message": {"content": "x"}}], "timings": {"predicted_per_second": value}}
+            )
+            self.assertEqual(completion.usage.tok_per_second, 0.0)
+
+    def test_usage_that_is_not_an_object_is_ignored(self) -> None:
+        completion = self.client._parse_full({"choices": [{"message": {"content": "x"}}], "usage": []})
+        self.assertEqual(completion.usage.completion_tokens, 0)
+
+    def test_object_arguments_become_json_text(self) -> None:
+        payload = {
+            "choices": [
+                {"message": {"tool_calls": [{"function": {"name": "shell", "arguments": {"cmd": "ls"}}}]}}
+            ]
+        }
+        call = self.client._parse_full(payload).tool_calls[0]
+        self.assertEqual(call.arguments, '{"cmd": "ls"}')
+        self.assertEqual(call.parsed(), {"cmd": "ls"})
+
+    def test_non_string_arguments_raise_llm_error_from_parsed(self) -> None:
+        with self.assertRaises(LLMError):
+            ToolCall(id="1", name="shell", arguments={"cmd": "ls"}).parsed()
+
+    def test_stream_ignores_junk_events_but_keeps_the_text(self) -> None:
+        chunks = [
+            b'data: {"choices": {"not": "a list"}}\n',
+            b"data: not json\n",
+            b'data: {"choices": ["nope"]}\n',
+            b'data: {"choices": [{"delta": {"content": "hi"}}]}\n',
+            b"data: [DONE]\n",
+        ]
+        self.assertEqual(self.client._parse_stream(chunks, None, None).content, "hi")

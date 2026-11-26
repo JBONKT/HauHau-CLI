@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 from ..util import clip_text
+from .args import flag, integer, text
 from .base import Tool, ToolResult, fail, ok
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache", "dist", "build", ".tox"}
@@ -18,19 +19,19 @@ def build(cfg, audit) -> list[Tool]:
     max_chars = cfg.tools.max_output_chars
 
     def grep(args: dict) -> ToolResult:
-        pattern = args.get("pattern")
+        pattern = text(args, "pattern", required=True)
         if not pattern:
-            return fail("grep: 'pattern' is required")
-        root = Path(os.path.expanduser(str(args.get("path") or cfg.workspace)))
+            return fail("grep: 'pattern' must not be empty")
+        root = Path(os.path.expanduser(text(args, "path", str(cfg.workspace))))
         if not root.is_dir():
             return fail(f"grep: not a directory: {root}")
-        flags = re.IGNORECASE if args.get("ignore_case") else 0
+        flags = re.IGNORECASE if flag(args, "ignore_case") else 0
         try:
-            regex = re.compile(str(pattern), flags)
+            regex = re.compile(pattern, flags)
         except re.error as exc:
             return fail(f"grep: bad regex: {exc}")
-        glob = str(args.get("glob") or "*")
-        max_results = int(args.get("max_results") or 60)
+        glob = text(args, "glob", "*")
+        max_results = integer(args, "max_results", 60, minimum=1, maximum=500)
         hits: list[str] = []
         scanned = 0
         for dirpath, dirnames, filenames in os.walk(root):
@@ -62,11 +63,11 @@ def build(cfg, audit) -> list[Tool]:
         return ok(clip_text("\n".join(hits), max_chars), hits=len(hits))
 
     def find(args: dict) -> ToolResult:
-        pattern = str(args.get("pattern") or "*")
-        root = Path(os.path.expanduser(str(args.get("path") or cfg.workspace)))
+        pattern = text(args, "pattern", "*") or "*"
+        root = Path(os.path.expanduser(text(args, "path", str(cfg.workspace))))
         if not root.is_dir():
             return fail(f"find: not a directory: {root}")
-        max_results = int(args.get("max_results") or 200)
+        max_results = integer(args, "max_results", 200, minimum=1, maximum=2000)
         found: list[str] = []
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]

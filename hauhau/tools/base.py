@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..util import clip_text
+from .args import BadArgument
 
 
 @dataclass
@@ -49,7 +50,12 @@ class Tool:
         }
 
     def run(self, args: dict[str, Any]) -> ToolResult:
-        return self.fn(args)
+        try:
+            return self.fn(args)
+        except BadArgument as exc:
+            # An unusable argument is a normal failure with a fixable message,
+            # not a crash: one place for every tool.
+            return fail(f"{self.name}: {exc}")
 
 
 class Registry:

@@ -12,6 +12,7 @@ instructions will happily produce something that sounds wiser and acts worse.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import time
@@ -21,6 +22,21 @@ from pathlib import Path
 
 from ..llm import LLMError
 from .suite import SuiteResult
+
+
+def _number_of(path: Path) -> int | None:
+    """Version number encoded in a ``v<N>.md`` filename."""
+    match = re.fullmatch(r"v(\d+)\.md", path.name)
+    return int(match.group(1)) if match else None
+
+
+def _score(value: object) -> float | None:
+    """A score read back from JSONL, which may have been hand-edited."""
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
 
 # A floor and a ceiling, but the floor is relative: a rewrite that keeps the same
 # instructions in fewer words is a legitimate improvement, and rejecting it for
@@ -110,7 +126,7 @@ class PromptStore:
                 Version(
                     number=number,
                     path=path,
-                    score=entry.get("score"),
+                    score=_score(entry.get("score")),
                     parent=entry.get("parent"),
                     created=str(entry.get("created", "")),
                 )
@@ -147,10 +163,24 @@ class PromptStore:
         if not text:
             raise ValueError("refusing to store an empty prompt")
         self.versions_dir.mkdir(parents=True, exist_ok=True)
-        existing = [v.number for v in self.versions()]
-        number = (max(existing) + 1) if existing else 1
+        # `versions()` is the *intersection* of index.jsonl and the files on
+        # disk, so deriving the next number from it re-issued a live number
+        # whenever either side was lost - and overwrote a rollback point.
+        numbers = [v.number for v in self.versions()]
+        numbers += [_number_of(path) for path in self.versions_dir.glob("v*.md")]
+        for entry in self._index():
+            with contextlib.suppress(KeyError, TypeError, ValueError):
+                numbers.append(int(entry["number"]))
+        number = max([n for n in numbers if n is not None] or [0]) + 1
         path = self.versions_dir / f"v{number}.md"
-        path.write_text(text + "\n", encoding="utf-8")
+        while True:
+            try:
+                with path.open("x", encoding="utf-8") as fh:
+                    fh.write(text + "\n")
+                break
+            except FileExistsError:
+                number += 1
+                path = self.versions_dir / f"v{number}.md"
         entry = {
             "number": number,
             "score": score,

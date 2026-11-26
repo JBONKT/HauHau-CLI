@@ -13,6 +13,7 @@ stable enough to compare two prompts.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -29,8 +30,10 @@ class Task:
     arguments - a model that picks ``shell`` but runs the wrong command has not
     understood the request, and that is the difference a clearer prompt makes.
     ``contains``: pass if the final answer contains one of these strings
-    (case-insensitive) and no tool was called - answering with a tool call is
-    exactly the failure a chatty prompt causes.
+    (whole words, case-insensitive) and no tool was called - answering with a
+    tool call is exactly the failure a chatty prompt causes.
+    ``exact``: the answer must *be* one of ``contains``, not merely mention it -
+    "Reply with exactly: pong" was passed by "I will not reply pong."
     """
 
     name: str
@@ -38,6 +41,7 @@ class Task:
     tools_any: tuple[str, ...] = ()
     args_contains: tuple[str, ...] = ()
     contains: tuple[str, ...] = ()
+    exact: bool = False
 
     @property
     def kind(self) -> str:
@@ -82,7 +86,7 @@ DEFAULT_TASKS: tuple[Task, ...] = (
     ),
     Task("recall", "What do you remember about my release checklist?", ("rag_query",)),
     Task("store-fact", "Remember that deploys go through the staging pipeline.", ("rag_write",)),
-    Task("exact-reply", "Reply with exactly: pong", contains=("pong",)),
+    Task("exact-reply", "Reply with exactly: pong", contains=("pong",), exact=True),
     Task("no-tool-answer", "In one short sentence: what does the ls command do?", contains=("list",)),
     Task("arithmetic", "What is 1+1? Answer with the number only.", contains=("2",)),
 )
@@ -108,6 +112,11 @@ def available(tasks: tuple[Task, ...], tool_names: list[str]) -> tuple[Task, ...
     return tuple(t for t in tasks if not t.tools_any or any(n in tool_names for n in t.tools_any))
 
 
+def _mentions(want: str, haystack: str) -> bool:
+    """Whole-word match: "12" must not pass for "2", "false" is not "ls"."""
+    return re.search(rf"(?<!\w){re.escape(want.lower())}(?!\w)", haystack.lower()) is not None
+
+
 def _judge(task: Task, completion: Any) -> tuple[bool, str]:
     raw = list(getattr(completion, "tool_calls", None) or [])
     calls = [c.name for c in raw]
@@ -119,13 +128,24 @@ def _judge(task: Task, completion: Any) -> tuple[bool, str]:
             return False, f"called {calls[0]} (wanted {'/'.join(task.tools_any)})"
         if task.args_contains:
             arguments = " ".join(str(c.arguments) for c in raw).lower()
-            if not any(want.lower() in arguments for want in task.args_contains):
+            if not any(_mentions(want, arguments) for want in task.args_contains):
                 return False, f"{calls[0]} ran the wrong command: {arguments[:80]}"
         return True, calls[0]
     if calls:
         return False, f"called {calls[0]} instead of answering"
-    low = text.lower()
-    if any(want.lower() in low for want in task.contains):
+    if task.exact:
+        folded = re.sub(r"[^\w]+", "", text.lower())
+        if any(folded == re.sub(r"[^\w]+", "", want.lower()) for want in task.contains):
+            return True, "answered"
+        return False, f"answer was not exactly {task.contains!r}"
+    if all(want.strip().isdigit() for want in task.contains if want.strip()):
+        # "Answer with the number only" means exactly that; "It is not 2." and
+        # "12" both contained the expected digit and passed the old substring test.
+        allowed = "|".join(re.escape(want.strip()) for want in task.contains if want.strip())
+        if re.fullmatch(rf"[\s\W]*(?:{allowed})[\s\W]*", text):
+            return True, "answered"
+        return False, f"answer was not the number {task.contains!r}"
+    if any(_mentions(want, text) for want in task.contains):
         return True, "answered"
     return False, f"answer did not contain {task.contains!r}"
 
