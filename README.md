@@ -158,8 +158,26 @@ plain text.
 
 ```bash
 .venv/bin/ruff check hauhau tests                      # clean
-.venv/bin/python -m unittest discover -s tests -t .    # 496 tests
+.venv/bin/python -m unittest discover -s tests -t .    # 507 tests
 ```
+
+### Keeping a session going
+
+Hauhau answers, then waits. `scripts/nudge.py` types one line into the terminal
+tab the app owns when the session has produced nothing for a while, so a
+run left alone keeps working instead of sitting at the prompt:
+
+```bash
+.venv/bin/python scripts/nudge.py --dry-run            # what it would do
+.venv/bin/python scripts/nudge.py --idle-seconds 300   # push when quiet 5 min
+```
+
+Idleness is the newest mtime of `logs/server.log` and `logs/audit.jsonl`, so a
+turn in progress is never interrupted. Each push is logged to
+`~/.hauhau/logs/nudge.jsonl` and rate-limited: `--min-gap` between pushes and
+`--max-per-hour` overall, because a stuck model that is fed lines forever burns
+the context window without making progress. Delivery uses Terminal's
+`do script … in tab`, which asks for Automation permission once.
 
 ## Assumptions this build corrects
 

@@ -522,6 +522,7 @@ class Repl:
             baseline=round(result.baseline, 3),
             candidate=round(result.candidate, 3),
             version=result.version,
+            reason=result.reason,
         )
         if result.accepted:
             self._apply_prompt(result.text, "evolve")
