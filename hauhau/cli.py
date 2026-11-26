@@ -16,6 +16,22 @@ from .agent import Agent
 from .audit import Audit
 from .brain import Brain
 from .brain.learn import Learner, worth_distilling
+from .evolve import (
+    DEFAULT_TASKS,
+    PromptStore,
+    available,
+    benchmark,
+    evolve_prompt,
+    hill_climb,
+    run_suite,
+)
+from .evolve import (
+    candidates as tune_candidates,
+)
+from .evolve import (
+    record as record_tuning,
+)
+from .evolve.tune import set_value
 from .llm import LLMError
 from .profiler import apply_recommendations, probe, recommend
 from .server import ServerManager
@@ -35,12 +51,37 @@ from .ui import (
     prompt_glyph,
     toolbar_text,
 )
-from .util import estimate_messages_tokens, human_bytes
+from .util import estimate_messages_tokens, human_bytes, snapshot_file
+
+
+def apply_active_prompt(cfg, prompts: PromptStore) -> int | None:
+    """Adopt the stored prompt version, if there is one. Returns its number.
+
+    The version store wins over ``config.toml``: the config keeps the text that
+    was last applied for transparency, but only the store has the history and
+    the rollback.
+    """
+    active = prompts.active()
+    if active is None:
+        return None
+    try:
+        stored = prompts.text(active.number)
+    except FileNotFoundError:
+        return None
+    if not stored:
+        return None
+    cfg.agent.personality = stored
+    return active.number
 
 
 class Repl:
-    def __init__(self, cfg, client, manager, brain, learner, agent, audit, ui, session_path) -> None:
+    def __init__(
+        self, cfg, client, manager, brain, learner, agent, audit, ui, session_path,
+        prompts: PromptStore | None = None, profile=None,
+    ) -> None:
         self.cfg = cfg
+        self.prompts = prompts or PromptStore(cfg.data_dir / "evolve" / "prompts")
+        self.profile = profile
         self.client = client
         self.manager = manager
         self.brain = brain
@@ -71,6 +112,10 @@ class Repl:
             "/remember": self.cmd_remember,
             "/forget": self.cmd_forget,
             "/learn": self.cmd_learn,
+            "/eval": self.cmd_eval,
+            "/tune": self.cmd_tune,
+            "/evolve": self.cmd_evolve,
+            "/prompt": self.cmd_prompt,
             "/model": self.cmd_model,
             "/perf": self.cmd_perf,
             "/config": self.cmd_config,
@@ -196,6 +241,209 @@ class Repl:
         for draft, (row_id, created) in zip(drafts, written, strict=False):
             mark = "new" if created else "merged"
             self.console.print(Text(f"  [{draft.kind}/{mark} #{row_id}] {draft.text}", style="green"), markup=False)
+
+    # --- auto-tuning and prompt evolution -------------------------------
+    def _eval_tasks(self):
+        return available(DEFAULT_TASKS, self.agent.registry.names())
+
+    def _eval_prompt_text(self, text: str) -> str:
+        """The personality is the part under test, not the per-session context."""
+        return text.format(name=self.cfg.agent.name)
+
+    def _save_config(self, what: str) -> Path:
+        """Snapshot the config, then write it. Never edit it behind the user's back."""
+        target = self.cfg.source or (self.cfg.data_dir / "config.toml")
+        copy = snapshot_file(target, self.cfg.snapshots_dir)
+        if copy:
+            self.audit.log("snapshot", path=str(target), copy=str(copy), why=what)
+        return config_mod.save(self.cfg, target)
+
+    def cmd_eval(self, _arg: str) -> None:
+        tasks = self._eval_tasks()
+        if not tasks:
+            note(self.console, "no eval tasks apply to the current tool set", WARN)
+            return
+        note(self.console, f"running {len(tasks)} eval tasks — one short completion each…")
+        try:
+            result = run_suite(
+                self.client,
+                tasks,
+                system_prompt=self._eval_prompt_text(self.cfg.agent.personality),
+                tools=self.agent.registry.schemas(),
+            )
+        except LLMError as exc:
+            error_panel(self.console, f"eval failed: {exc}")
+            return
+        self.audit.log("eval", score=round(result.score, 3), passed=result.passed, total=result.total)
+        self._table("Eval", [("score", result.summary()), ("seconds", f"{result.seconds:.1f}")])
+        if result.failures:
+            data_table(
+                self.console,
+                "Failed tasks",
+                ["task", "why"],
+                [[name, detail] for name, detail in result.failures],
+                no_wrap=1,
+            )
+
+    def cmd_tune(self, arg: str) -> None:
+        if not self.cfg.model.manage_server:
+            note(
+                self.console,
+                "the backend is external (manage_server = false); the tuner cannot restart it",
+                WARN,
+            )
+            return
+        try:
+            budget = int(arg) if arg.strip() else 4
+        except ValueError:
+            note(self.console, "usage: /tune [max_trials]", WARN)
+            return
+        cores = (self.profile.cores if self.profile else 0) or os.cpu_count() or 4
+        options = tune_candidates(self.cfg, cores)
+        if not options:
+            note(self.console, "nothing to try: the config already has the candidate values")
+            return
+        note(self.console, "benchmarking the current config…")
+        try:
+            baseline = benchmark(self.client)
+        except LLMError as exc:
+            error_panel(self.console, f"benchmark failed: {exc}")
+            return
+        note(
+            self.console,
+            f"{baseline:.1f} tok/s now. Trying up to {budget} values; each restarts the backend (~25s).",
+        )
+        original = {key: getattr(self.cfg.model, key.split(".", 1)[1]) for key in ("model.n_threads", "model.n_ctx")}
+        self.audit.log("tune.start", baseline=round(baseline, 2), trials=budget)
+
+        def measure(option) -> float:
+            set_value(self.cfg, option.key, option.value)
+            self.audit.log("tune.trial", setting=option.key, value=option.value)
+            self.manager.restart()
+            return benchmark(self.client)
+
+        try:
+            result = hill_climb(baseline, options, measure, max_trials=budget)
+        except LLMError as exc:
+            error_panel(self.console, f"tuning aborted: {exc}")
+            result = None
+        finally:
+            # Whatever happened, the running server must match the chosen values.
+            for key, value in original.items():
+                set_value(self.cfg, key, value)
+            if result is not None:
+                for chosen in result.adopted:
+                    set_value(self.cfg, chosen.key, chosen.value)
+            try:
+                self.manager.restart()
+            except LLMError as exc:
+                # Tuning must never take the session down with it.
+                note(self.console, f"backend restart failed: {exc} - run /model to check it", WARN)
+
+        if result is None:
+            return
+        rows = [
+            (trial.candidate, f"{trial.score:.1f} tok/s", "adopted" if trial.adopted else "")
+            for trial in result.trials
+        ]
+        if rows:
+            data_table(self.console, "Tuning trials", ["setting", "speed", ""], rows, no_wrap=1)
+        if result.adopted:
+            target = self._save_config("tune")
+            record_tuning(self.cfg.data_dir / "evolve" / "tuning.jsonl", result, adopted_config=str(target))
+            self.audit.log("tune.adopt", best=round(result.best, 2), settings=[str(c) for c in result.adopted])
+            note(
+                self.console,
+                f"adopted {', '.join(str(c) for c in result.adopted)}: "
+                f"{baseline:.1f} → {result.best:.1f} tok/s, saved to {target}",
+                OK,
+            )
+        else:
+            note(
+                self.console,
+                f"kept the current settings ({baseline:.1f} tok/s). {result.stopped or 'no candidate was faster'}",
+                WARN,
+            )
+
+    def _apply_prompt(self, text: str, why: str) -> None:
+        self.cfg.agent.personality = text
+        target = self._save_config(why)
+        self.audit.log("prompt.apply", why=why, config=str(target), chars=len(text))
+
+    def cmd_evolve(self, _arg: str) -> None:
+        tasks = self._eval_tasks()
+        if not tasks:
+            note(self.console, "no eval tasks apply to the current tool set", WARN)
+            return
+        store = self.prompts
+        if not store.versions():
+            seed = store.add(self.cfg.agent.personality, score=None)
+            store.activate(seed.number)
+            note(self.console, f"stored the current prompt as v{seed.number} (rollback point)")
+        schemas = self.agent.registry.schemas()
+
+        def run(text: str):
+            return run_suite(
+                self.client, tasks, system_prompt=self._eval_prompt_text(text), tools=schemas
+            )
+
+        try:
+            result = evolve_prompt(
+                self.client,
+                store,
+                run,
+                self.cfg.agent.personality,
+                progress=lambda message: note(self.console, message + "…"),
+            )
+        except LLMError as exc:
+            error_panel(self.console, f"evolution failed: {exc}")
+            return
+        self.audit.log(
+            "evolve.prompt",
+            accepted=result.accepted,
+            baseline=round(result.baseline, 3),
+            candidate=round(result.candidate, 3),
+            version=result.version,
+        )
+        if result.accepted:
+            self._apply_prompt(result.text, "evolve")
+            note(self.console, f"{result.reason}; the new prompt is active", OK)
+        else:
+            note(self.console, f"kept the current prompt: {result.reason}", WARN)
+
+    def cmd_prompt(self, arg: str) -> None:
+        store = self.prompts
+        versions = store.versions()
+        if not versions:
+            note(self.console, "no prompt versions yet — run /evolve to store v1", WARN)
+            return
+        active = store.active_number()
+        if not arg.strip():
+            data_table(
+                self.console,
+                "Prompt versions",
+                ["version", "score", "parent", "chars", "active"],
+                [
+                    [v.label, "-" if v.score is None else f"{v.score:.0%}", "-" if v.parent is None else f"v{v.parent}",
+                     str(len(store.text(v.number))), "yes" if v.number == active else ""]
+                    for v in versions
+                ],
+                no_wrap=1,
+            )
+            return
+        try:
+            number = int(arg.strip().lstrip("vV"))
+        except ValueError:
+            note(self.console, "usage: /prompt [vN]", WARN)
+            return
+        try:
+            version = store.activate(number)
+            text = store.text(number)
+        except FileNotFoundError as exc:
+            note(self.console, str(exc), WARN)
+            return
+        self._apply_prompt(text, f"prompt v{version.number}")
+        note(self.console, f"activated prompt v{version.number} ({len(text)} chars)", OK)
 
     def cmd_model(self, _arg: str) -> None:
         status = self.manager.status()
@@ -434,6 +682,11 @@ def main(argv: list[str] | None = None) -> int:
         except LLMError:
             return False
 
+    prompts = PromptStore(cfg.data_dir / "evolve" / "prompts")
+    adopted = apply_active_prompt(cfg, prompts)
+    if adopted is not None and console.is_terminal:
+        note(console, f"system prompt v{adopted} active")
+
     registry = build_registry(cfg, audit, brain, confirm if cfg.tools.shell_confirm else None)
     agent = Agent(cfg, client, registry, brain, audit, ui)
     learner = Learner(cfg, client, brain, audit)
@@ -456,7 +709,10 @@ def main(argv: list[str] | None = None) -> int:
             url=cfg.model.server_url,
         )
 
-    repl = Repl(cfg, client, manager, brain, learner, agent, audit, ui, session_path)
+    repl = Repl(
+        cfg, client, manager, brain, learner, agent, audit, ui, session_path,
+        prompts=prompts, profile=profile,
+    )
 
     def finish() -> None:
         """Learn from the session, then shut down - in that order, always.
@@ -510,11 +766,13 @@ def main(argv: list[str] | None = None) -> int:
     history_file = cfg.data_dir / "history"
     history_file.parent.mkdir(parents=True, exist_ok=True)
     def toolbar() -> str:
+        active_version = prompts.active_number()
         return toolbar_text(
             ctx=cfg.model.n_ctx,
             memories=brain.stats()["total"] if brain else 0,
             ram=profile.ram_gb,
             shell_mode="confirm" if cfg.tools.shell_confirm else "auto",
+            prompt=f"v{active_version}" if active_version else "",
         )
 
     session = make_prompt_session(history_file, toolbar)

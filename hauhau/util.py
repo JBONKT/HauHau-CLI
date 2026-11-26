@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shutil
+import time
 from collections.abc import Iterable
+from pathlib import Path
 
 _WS = re.compile(r"\s+")
 _WORD = re.compile(r"[a-z0-9_]+")
@@ -33,6 +36,25 @@ def clip_text(text: str, limit: int) -> str:
     tail = limit - head
     removed = len(text) - head - tail
     return f"{text[:head]}\n...[{removed} chars truncated]...\n{text[-tail:]}"
+
+
+def snapshot_file(path: Path, dest_dir: Path) -> Path | None:
+    """Copy ``path`` into ``dest_dir`` with a timestamp; return the copy.
+
+    Used before the agent rewrites its own config or prompt: a version file is
+    the rollback, but the config needs a plain copy because it is a single file.
+    """
+    if not path.is_file():
+        return None
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    dest = dest_dir / f"{stamp}_{path.name}"
+    counter = 1
+    while dest.exists():
+        dest = dest_dir / f"{stamp}-{counter}_{path.name}"
+        counter += 1
+    shutil.copy2(path, dest)
+    return dest
 
 
 def normalize(text: str) -> str:

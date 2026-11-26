@@ -18,8 +18,9 @@ directory is `modeller` at 3.4 GB, almost entirely the model file.
 
 Phases 0–3 of the plan are implemented and tested: scaffold, conversation loop,
 native tool use with full terminal access, and the persistent brain with
-post-session self-learning. Phases 4–6 (auto-tuning hill-climb, prompt
-self-evolution, soak testing) are **not** built — see [Not built yet](#not-built-yet).
+post-session self-learning, a behavioural eval suite, a bounded parameter
+hill-climb and gated prompt self-evolution. Soak testing is not built — see
+[Auto-tuning and self-evolution](#auto-tuning-and-self-evolution).
 
 ### Verified end to end
 
@@ -122,7 +123,7 @@ plain text.
 
 ```bash
 .venv/bin/ruff check hauhau tests                      # clean
-.venv/bin/python -m unittest discover -s tests -t .    # 278 tests
+.venv/bin/python -m unittest discover -s tests -t .    # 333 tests
 ```
 
 ## Assumptions this build corrects
@@ -248,7 +249,8 @@ into `~/.hauhau/.snapshots`. The denylist is checked *before* execution.
 ## Slash commands
 
 `/help` `/tools` `/mem [query]` `/compact` `/prune` `/remember` `/forget`
-`/learn` `/model` `/perf` `/config` `/audit` `/context` `/clear` `/save` `/quit`
+`/learn` `/eval` `/tune` `/evolve` `/prompt` `/model` `/perf` `/config` `/audit`
+`/context` `/clear` `/save` `/quit`
 
 `/compact` merges memories that say the same thing. `/prune` is the forgetting
 half of the decay model: it drops memories that are stale *and* were never
@@ -259,21 +261,49 @@ spent, then says how many were withheld. Clipping the joined string instead cut
 sentences mid-word — `/srv/… che lives at` — and presented the fragments as
 facts.
 
-## Not built yet
+## Auto-tuning and self-evolution
 
-Left for Phases 4–6, deliberately, because the plan's version of each would not
-survive this hardware:
+The agent can now measure itself and change two things: `n_threads`/`n_ctx`, and
+its own system prompt. Nothing is changed without a measurement that beats the
+current state.
 
-- **Auto-tuning hill-climb.** On Apple Silicon, quantization and GPU-offload
-  choices require re-downloading multi-gigabyte weights, so they are one-shot
-  profiler output, not session knobs. The honest tunables are `n_ctx`,
-  `n_threads`, think on/off, retrieval `k`, `temperature` and the prompt text.
-  `profiler.recommend()` already derives the first three; a hill-climb would
-  need an eval set first.
-- **Prompt self-evolution.** Needs a ~20-task pass/fail suite before it can mean
-  anything, otherwise the "evolutionary log" just records regressions. Build the
-  eval harness first.
+**`/eval` — the yardstick.** 14 tasks, one short completion each (~12 s here).
+A task passes if the model's *first action* is the right tool **and** the
+arguments name the right thing (`df` for free space, `context_budget_tokens` for
+a code search); text tasks pass only if the answer contains the required content
+and no tool was called. It measures behaviour — "does it inspect the file or
+invent a number" — not facts, because a 2B model's facts are not a stable
+signal. Tasks whose tools are missing (brain off → `rag_*`) are dropped.
+
+**`/tune [trials]` — the hill-climb.** Benchmarks the current config with a
+fixed prompt, then tries `n_threads` (half the cores, all-but-one, capped at 8)
+and `n_ctx` (4k/8k/16k), restarting the backend for each trial (~25 s each).
+A value is adopted only if it beats the best by 2 %. On this machine the honest
+answer was *nothing*: 29.5 and 29.9 tok/s against a 29.7 baseline is noise, so
+the config was left alone. Adopted values are snapshotted and written to
+`config.toml`, and every trial is appended to `evolve/tuning.jsonl`.
+
+**`/evolve` — the prompt rewrite, gated.** Seeds `v1` with the current prompt,
+scores it, asks the model for an improved version using the failing tasks as
+feedback, scores that, and **adopts only on a strictly higher score**. Measured
+here: a deliberately weak poetic prompt scored 10/14 (71 %), the rewrite reached
+14/14 and was adopted as `v2`; a rewrite of the already-good prompt also scored
+13/14 and was *rejected*, so the agent did not churn.
+
+**`/prompt [vN]` — history and rollback.** Versions live in
+`<data_dir>/evolve/prompts/versions/v<N>.md` with a JSONL index and an `active`
+pointer; the store wins over `config.toml` at startup. `/prompt v1` is the undo.
+Every adoption snapshots `config.toml` first and is logged as `evolve.prompt` /
+`prompt.apply` in the audit trail.
+
+What stays deliberately unbuilt, because the plan's version would not survive
+this hardware:
+
+- **Quantization and GPU-offload hill-climbing.** Both need multi-gigabyte
+  re-downloads, so they remain one-shot profiler output.
 - **Soak testing** for memory growth and config thrash.
 
-A tuner must also not be able to edit its own safety policy or the audit log;
-`audit.jsonl` is append-only and outside every write tool's path for that reason.
+Safety rails for the tuner itself: `TUNABLE` is an allowlist of two keys, and
+`set_value()` refuses anything else, so the tuner cannot edit `shell_confirm`,
+the denylist, the workspace or the audit switch. `audit.jsonl` stays
+append-only and outside every write tool's path.

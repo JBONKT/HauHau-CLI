@@ -60,6 +60,10 @@ COMMANDS: list[tuple[str, str]] = [
     ("/remember", "store a fact yourself"),
     ("/forget", "delete a memory by id"),
     ("/learn", "distil this session into long-term memory"),
+    ("/eval", "run the behavioural eval suite"),
+    ("/tune", "hill-climb threads/context for speed"),
+    ("/evolve", "rewrite the system prompt, gated by /eval"),
+    ("/prompt", "list prompt versions, or activate one"),
     ("/model", "backend and model status"),
     ("/perf", "measure real tokens/second"),
     ("/config", "effective configuration"),
@@ -448,6 +452,7 @@ def prompt_glyph(width: int = 0) -> HTML:
     return HTML(f"<prompt>{PROMPT_GLYPH}</prompt> ")
 
 
-def toolbar_text(*, ctx: int, memories: int, ram: float, shell_mode: str) -> str:
+def toolbar_text(*, ctx: int, memories: int, ram: float, shell_mode: str, prompt: str = "") -> str:
     mem = f"{memories} mem" if memories else "no memory"
-    return f" {ram:g}GB · {ctx} ctx · {mem} · shell {shell_mode} · ctrl-c cancels · /help "
+    version = f" · prompt {prompt}" if prompt else ""
+    return f" {ram:g}GB · {ctx} ctx · {mem}{version} · shell {shell_mode} · ctrl-c cancels · /help "

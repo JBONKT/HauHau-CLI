@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 from rich.console import Console
 
@@ -11,9 +12,10 @@ from hauhau.agent import Agent
 from hauhau.audit import Audit
 from hauhau.brain import Brain
 from hauhau.brain.learn import Learner
-from hauhau.cli import Repl, RichUI
+from hauhau.cli import Repl, RichUI, apply_active_prompt
 from hauhau.config import Config
-from hauhau.llm import Completion
+from hauhau.evolve import PromptStore, SuiteResult
+from hauhau.llm import Completion, LLMError
 from hauhau.tools import build_registry
 
 
@@ -218,6 +220,116 @@ class TestCommands(ReplTestCase):
         self.repl.handle("/learn")
         self.assertIn("helix", self.text())
         self.assertEqual(self.brain.stats()["total"], 1)
+
+
+class TestEvolveCommands(ReplTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.repl.prompts = PromptStore(self.cfg.data_dir / "evolve" / "prompts")
+
+    def test_prompt_without_versions_explains_itself(self) -> None:
+        self.repl.handle("/prompt")
+        self.assertIn("no prompt versions yet", self.text())
+
+    def test_prompt_lists_and_activates_a_version(self) -> None:
+        version = self.repl.prompts.add(self.cfg.agent.personality, score=0.5)
+        self.repl.handle("/prompt")
+        self.assertIn("v1", self.text())
+        self.repl.handle("/prompt v1")
+        output = self.text()
+        self.assertIn("activated prompt v1", output)
+        self.assertEqual(self.cfg.agent.personality, self.repl.prompts.text(1))
+        self.assertTrue((self.cfg.data_dir / "config.toml").is_file(), "activation persists the config")
+        self.assertTrue(version)
+
+    def test_prompt_rejects_a_missing_version(self) -> None:
+        self.repl.prompts.add(self.cfg.agent.personality)
+        self.repl.handle("/prompt v9")
+        self.assertIn("no prompt version v9", self.text())
+
+    def test_prompt_rejects_garbage_argument(self) -> None:
+        self.repl.prompts.add(self.cfg.agent.personality)
+        self.repl.handle("/prompt later")
+        self.assertIn("usage", self.text())
+
+    def test_eval_reports_score_and_failures(self) -> None:
+        self.repl.handle("/eval")
+        output = self.text()
+        self.assertIn("Eval", output)
+        self.assertIn("tasks", output)
+
+    def test_eval_reports_a_dead_backend(self) -> None:
+        class Dead:
+            def chat(self, *_args, **_kwargs):
+                raise LLMError("connection refused")
+
+        self.repl.client = Dead()
+        self.repl.handle("/eval")
+        self.assertIn("eval failed", self.text())
+
+    def test_evolve_adopts_a_better_prompt(self) -> None:
+        candidate = "You are {name}. Act first. " + "z" * 260
+        scores = [SuiteResult(passed=3, total=12), SuiteResult(passed=8, total=12)]
+        with mock.patch("hauhau.cli.run_suite", side_effect=scores), \
+                mock.patch.object(self.repl.client, "chat", return_value=Completion(content=candidate)):
+            self.repl.handle("/evolve")
+        output = self.text()
+        self.assertIn("adopted v2", output)
+        self.assertEqual(self.repl.prompts.active_number(), 2)
+        self.assertEqual(self.cfg.agent.personality.strip(), candidate.strip())
+        self.assertTrue((self.cfg.data_dir / "config.toml").is_file())
+
+    def test_evolve_keeps_the_prompt_on_a_regression(self) -> None:
+        scores = [SuiteResult(passed=8, total=12), SuiteResult(passed=5, total=12)]
+        with mock.patch("hauhau.cli.run_suite", side_effect=scores), \
+                mock.patch.object(self.repl.client, "chat", return_value=Completion(content="y" * 400)):
+            self.repl.handle("/evolve")
+        self.assertIn("kept the current prompt", self.text())
+        self.assertEqual(self.repl.prompts.active_number(), 1, "only the seeded baseline exists")
+
+    def test_tune_refuses_an_external_backend(self) -> None:
+        self.cfg.model.manage_server = False
+        self.repl.handle("/tune")
+        self.assertIn("cannot restart it", self.text())
+
+    def test_tune_rejects_a_bad_budget(self) -> None:
+        self.repl.handle("/tune many")
+        self.assertIn("usage: /tune", self.text())
+
+    def test_tune_reports_a_backend_without_timings(self) -> None:
+        # FakeClient returns no usage, so the benchmark cannot compare anything.
+        self.repl.handle("/tune 2")
+        self.assertIn("benchmark failed", self.text())
+
+
+class TestApplyActivePrompt(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config()
+        self.cfg.logging.data_dir = str(Path(self._tmp.name) / "data")
+        self.prompts = PromptStore(self.cfg.data_dir / "evolve" / "prompts")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_stored_version_wins_over_the_config(self) -> None:
+        evolved = "Evolved instructions. " + "e" * 250
+        version = self.prompts.add(evolved)
+        self.prompts.activate(version.number)
+        self.cfg.agent.personality = "the old config prompt"
+        self.assertEqual(apply_active_prompt(self.cfg, self.prompts), version.number)
+        self.assertEqual(self.cfg.agent.personality, evolved)
+
+    def test_no_versions_leaves_the_config_alone(self) -> None:
+        self.cfg.agent.personality = "config prompt"
+        self.assertIsNone(apply_active_prompt(self.cfg, self.prompts))
+        self.assertEqual(self.cfg.agent.personality, "config prompt")
+
+    def test_a_broken_store_is_not_fatal(self) -> None:
+        version = self.prompts.add("x" * 300)
+        self.prompts.activate(version.number)
+        version.path.unlink()
+        self.assertIsNone(apply_active_prompt(self.cfg, self.prompts))
 
 
 class TestSessionPath(unittest.TestCase):
