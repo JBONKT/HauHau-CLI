@@ -259,6 +259,11 @@ Every shell command, tool call, file write, snapshot and config change is
 appended to `~/.hauhau/logs/audit.jsonl`. Overwrites snapshot the previous file
 into `~/.hauhau/.snapshots`. The denylist is checked *before* execution.
 
+`/tune` rewrites `config.toml` from the in-memory values, so hand-written
+comments in that file do not survive an adoption (the previous file is
+snapshotted into `~/.hauhau/.snapshots` first, and every adopted setting is
+logged in `evolve/tuning.jsonl`).
+
 Treat the denylist as a speed bump, not a boundary. Quoting, case and line
 continuations are normalised before matching, but shell indirection
 (`X=rm; $X -rf /`) still gets through — only `shell_confirm` (the prompt) is a

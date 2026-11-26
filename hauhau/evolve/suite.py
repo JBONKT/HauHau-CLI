@@ -113,8 +113,17 @@ def available(tasks: tuple[Task, ...], tool_names: list[str]) -> tuple[Task, ...
 
 
 def _mentions(want: str, haystack: str) -> bool:
-    """Whole-word match: "12" must not pass for "2", "false" is not "ls"."""
-    return re.search(rf"(?<!\w){re.escape(want.lower())}(?!\w)", haystack.lower()) is not None
+    """Whole-token match: "12" must not pass for "2", "false" is not "ls".
+
+    The boundary is only required where the expected string has one: ".py" has
+    to keep matching "mod.py", where a leading word character precedes it.
+    """
+    want, haystack = want.lower(), haystack.lower()
+    if not want:
+        return False
+    left = r"(?<!\w)" if (want[0].isalnum() or want[0] == "_") else ""
+    right = r"(?!\w)" if (want[-1].isalnum() or want[-1] == "_") else ""
+    return re.search(f"{left}{re.escape(want)}{right}", haystack) is not None
 
 
 def _judge(task: Task, completion: Any) -> tuple[bool, str]:

@@ -84,11 +84,14 @@ _NEEDS_SPECIFICS = {"semantic", "procedural"}
 # Naming a real tool, service or platform is as specific as naming a path: the
 # old rule rejected "the CI provider is GitHub Actions" while accepting
 # "remember to be brief at 10:30".
+# Deliberately *not* language or linter names: "the user runs python to check"
+# is the generic noise this guard exists to drop, while naming the platform,
+# the CI service or the deployment stage is durable machine knowledge.
 _TOOLING = re.compile(
     r"\b(?:github|gitlab|bitbucket|actions|jenkins|circleci|homebrew|brew|docker|podman"
     r"|kubernetes|postgres(?:ql)?|mysql|sqlite|redis|nginx|apache|macos|osx|linux|ubuntu"
-    r"|debian|windows|wsl|macbook|imac|emacs|vim|neovim|vscode|pycharm|zsh|bash|fish"
-    r"|python|node|rust|cargo|uv|poetry|pipx|ruff|pytest|mypy|llama\.cpp|ollama"
+    r"|debian|windows|wsl|macbook|imac|emacs|neovim|vscode|pycharm|zsh\b|fish"
+    r"|llama\.cpp|ollama"
     r"|staging|production|release branch|ci\b|gpu|cuda|metal|rocm)\b",
     re.IGNORECASE,
 )

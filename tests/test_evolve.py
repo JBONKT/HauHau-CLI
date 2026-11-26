@@ -290,6 +290,12 @@ class TestJudgeIsNotSubstring(unittest.TestCase):
         self.assertTrue(_judge(task, Completion(content="PONG!"))[0])
         self.assertFalse(_judge(task, Completion(content="I will not reply pong."))[0])
 
+    def test_an_extension_still_matches_a_filename(self) -> None:
+        # Requiring a left word boundary made ".py" unmatchable in "mod.py".
+        task = Task("find-files", "list python files", contains=(".py",))
+        self.assertTrue(_judge(task, Completion(content="the file is mod.py"))[0])
+        self.assertFalse(_judge(task, Completion(content="there is no python here"))[0])
+
     def test_a_tool_argument_is_matched_as_a_word(self) -> None:
         task = Task("list-files", "list files", tools_any=("shell",), args_contains=("ls", "."))
         wrong = Completion(content="", tool_calls=[ToolCall(id="c", name="shell", arguments='{"cmd": "false"}')])

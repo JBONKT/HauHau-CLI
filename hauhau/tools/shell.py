@@ -148,15 +148,22 @@ def build(
                 break
         if timed_out:
             _kill_tree(proc)
-            with contextlib.suppress(OSError):
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 proc.wait(timeout=2)
             audit.log("shell.timeout", cmd=cmd, timeout=timeout)
             return fail(
                 f"shell: the command was killed after {timeout:g}s (timeout). Its partial output "
                 "was discarded, and any children it started were killed too."
             )
-        with contextlib.suppress(OSError):
-            proc.wait(timeout=2)
+        # The loop can stop before the process does (it closed stdout). Waiting on
+        # the process itself is not an OSError if it overruns: TimeoutExpired is a
+        # SubprocessError, and it used to escape the tool as a crash.
+        try:
+            proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                proc.wait(timeout=2)
 
         duration = time.monotonic() - started
         output = b"".join(chunks).decode("utf-8", "replace")

@@ -222,6 +222,16 @@ class TestDurableKindValidation(unittest.TestCase):
         ):
             self.assertTrue(durable(Draft("semantic", text), ("hauhau", "johan")), text)
 
+    def test_generic_developer_noise_is_still_rejected(self) -> None:
+        # A "names a tool" shortcut must not turn every mention of python or ruff
+        # into a durable memory; platform and CI names are the signal.
+        for text in (
+            "The user executes python code to verify the change.",
+            "The user runs ruff to check the code.",
+            "The user opens a terminal and types commands.",
+        ):
+            self.assertFalse(durable(Draft("procedural", text), ("hauhau", "johan")), text)
+
     def test_a_plain_preference_is_still_kept(self) -> None:
         self.assertTrue(durable(Draft("preference", "The user wants answers in Swedish.")))
 

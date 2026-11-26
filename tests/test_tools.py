@@ -190,12 +190,15 @@ class TestShell(ToolTestCase):
         # communicate() waits for every holder of the pipe: a daemon started by
         # the command (or a shell profile) kept the REPL stuck for the whole
         # timeout on its very first `shell` call.
+        # `sleep 3 &` inherits the stdout pipe; communicate() would block until it
+        # exited. (An earlier version of this test wrote "> /dev/null", which
+        # redirects the holder away and made the test unable to fail.)
         started = time.monotonic()
-        result = self.run_tool("shell", cmd="sleep 5 > /dev/null 2>&1 & echo done", timeout=10)
+        result = self.run_tool("shell", cmd="sleep 3 & echo done", timeout=10)
         elapsed = time.monotonic() - started
         self.assertTrue(result.ok, result.content)
         self.assertIn("done", result.content)
-        self.assertLess(elapsed, 3.0, "the tool waited for an unrelated pipe holder")
+        self.assertLess(elapsed, 1.5, "the tool waited for an unrelated pipe holder")
 
     def test_empty_command_rejected(self) -> None:
         self.assertFalse(self.run_tool("shell", cmd="   ").ok)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import time
 import unittest
@@ -401,10 +402,14 @@ class TestStoreHardening(StoreTestCase):
         self.assertLessEqual(self.store.search("deploy pipeline", k=1, record_use=False)[0].score, 1.0)
 
     def test_compact_finds_a_pair_that_write_would_merge(self) -> None:
-        # "Use uv for the build" / "Use uv for the tests" share no long token, so
-        # the old >=4-character bucketing never compared them.
+        # These two share "uv", "uses", "every", "python" and "project" but no
+        # >=4-character token distinct enough for the old bucketing, which is why
+        # /compact reported nothing while write() merged the pair on sight.
         now = time.time()
-        for digest, text in (("a", "Use uv for the build"), ("b", "Use uv for the tests")):
+        for digest, text in (
+            ("a", "Uses uv for every python project here."),
+            ("b", "Uses uv for every python project on this machine."),
+        ):
             self.store.db.execute(
                 "INSERT INTO memories (kind, text, tags, norm_hash, importance, uses, created_at, last_used_at)"
                 " VALUES ('semantic', ?, '', ?, 0.5, 0, ?, ?)",
@@ -413,6 +418,75 @@ class TestStoreHardening(StoreTestCase):
         self.store.db.commit()
         self.assertEqual(self.store.compact(), 1)
         self.assertEqual(self.store.stats()["total"], 1)
+
+    def test_a_legacy_schema_with_nulls_is_migrated(self) -> None:
+        # A pre-embedding table has nullable columns. The migration UPDATEs fired
+        # the FTS triggers *before* the index was rebuilt, and SQLite reported
+        # "database disk image is malformed" - a startup crash.
+        import sqlite3
+
+        legacy = Path(self._tmp.name) / "nullable.db"
+        db = sqlite3.connect(legacy)
+        db.executescript(
+            "CREATE TABLE memories (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT,"
+            " text TEXT, tags TEXT, norm_hash TEXT, importance REAL, uses INTEGER,"
+            " created_at REAL, last_used_at REAL);"
+        )
+        db.execute(
+            "INSERT INTO memories (kind, text, norm_hash, created_at) VALUES ('semantic', 'old null fact', 'h', ?)",
+            (time.time(),),
+        )
+        db.commit()
+        db.close()
+        store = MemoryStore(legacy)
+        try:
+            self.assertEqual(store.stats()["total"], 1)
+            self.assertEqual([hit.text for hit in store.search("null fact")], ["old null fact"])
+        finally:
+            store.close()
+
+    def test_a_read_only_database_can_still_be_searched(self) -> None:
+        # search(record_use=True) writes the usage counter; on a read-only mount
+        # that raised out of every recall and disabled memory entirely.
+        path = Path(self._tmp.name) / "readonly.db"
+        store = MemoryStore(path)
+        store.write("semantic", "A fact worth reading back.")
+        store.close()
+        os.chmod(path, 0o444)
+        try:
+            store = MemoryStore(path)
+            try:
+                self.assertEqual([hit.text for hit in store.search("fact")], ["A fact worth reading back."])
+                self.assertEqual(store.stats()["total"], 1)
+            finally:
+                store.close()
+        finally:
+            os.chmod(path, 0o644)
+
+    def test_one_word_substitution_is_a_different_fact(self) -> None:
+        # 0.83 containment and no negation either way: staging and production are
+        # two facts, and the old rule merged them and kept one value.
+        self.store.write("semantic", "Deploys go through the staging pipeline.")
+        self.store.write("semantic", "Deploys go through the production pipeline.")
+        self.assertEqual(self.store.stats()["total"], 2)
+
+    def test_a_reworded_copula_still_merges(self) -> None:
+        # "is in" vs "lives in" is the same fact; the substitution guard must not
+        # block it, or one learn pass stores the same sentence twice.
+        first, _ = self.store.write("semantic", "The release checklist is in docs/release.md.")
+        second, created = self.store.write("procedural", "The release checklist lives in docs/release.md.")
+        self.assertFalse(created)
+        self.assertEqual(first, second)
+
+    def test_an_absolute_path_counts_as_an_artifact(self) -> None:
+        # The pattern was anchored with \b before "/", which cannot match after a
+        # space, so artifact-aware merging had never worked for absolute paths.
+        from hauhau.brain.store import _artifacts
+
+        self.assertEqual(
+            _artifacts("The models are at /Users/johan/modeller/gguf."),
+            frozenset({"/users/johan/modeller/gguf."}),
+        )
 
     def test_legacy_database_is_migrated_on_open(self) -> None:
         import sqlite3

@@ -114,8 +114,11 @@ def _numbers(text: str) -> frozenset[str]:
     return frozenset(tok for tok in tokens_of(text) if tok.isdigit())
 
 
+# `\b/` was meant to anchor the path but a word boundary cannot sit between a
+# space and "/", so absolute paths never matched and every artifact-aware rule
+# below was dead. A negative lookbehind is the anchor that works.
 _ARTIFACT = re.compile(
-    r"(?:~|\b/(?:Users|opt|etc|usr|var|srv|home|private|Applications)\b)[\w./~-]*"
+    r"(?:~|(?<![\w])/(?:Users|opt|etc|usr|var|srv|home|private|Applications)\b)[\w./~-]*"
     r"|\b[\w-]+\.(?:py|toml|json|md|txt|gguf|sh|zsh|bash|db|ya?ml|cfg|ini|env)\b"
 )
 
@@ -147,6 +150,16 @@ _NEGATIONS = frozenset({
 })
 
 
+# Swapping one of these for another does not change the fact: the distiller
+# writes "the checklist is in docs/release.md" and "…lives in docs/release.md"
+# in the same pass, and those must still merge.
+_FUNCTION_WORDS = frozenset({
+    "is", "are", "was", "were", "be", "been", "being", "lives", "lived", "located",
+    "sits", "resides", "uses", "use", "runs", "run", "goes", "go", "has", "have",
+    "the", "a", "an", "in", "on", "at", "for", "to", "of", "with", "and", "that",
+})
+
+
 def _mergeable(
     new_text: str,
     new_tokens: set[str],
@@ -171,6 +184,13 @@ def _mergeable(
         return False
     if bool(new_tokens & _NEGATIONS) != bool(old_tokens & _NEGATIONS):
         return False
+    # One word swapped for another is a different fact, however similar the
+    # rest of the sentence: "deploys go through the staging pipeline" and
+    # "... the production pipeline" scored 0.83 containment, and merging them
+    # kept one value while reporting the other as stored.
+    swapped = (new_tokens ^ old_tokens)
+    if len(new_tokens - old_tokens) == 1 and len(old_tokens - new_tokens) == 1 and not swapped <= _FUNCTION_WORDS:
+        return False
     if jaccard(new_tokens, old_tokens) >= jaccard_min:
         return True
     overlap = len(new_tokens & old_tokens)
@@ -185,10 +205,8 @@ def _mergeable(
         short_text, short_tokens, long_text, long_tokens = old_text, old_tokens, new_text, new_tokens
     if not long_text or len(short_text) >= 0.5 * len(long_text):
         return True
-    # A short memory whose words are all present in the longer one adds nothing:
-    # "Uses uv for python." is subsumed by "...for all python projects here".
-    # One- or two-word notes are the exception - "Ruff" is the *subject* there,
-    # not a repetition, and merging it silently deleted the fact.
+    # A much shorter memory is only a repetition when the long one says
+    # everything it says; "Ruff" is the subject of a sentence, not a repeat of it.
     return len(short_tokens) >= 3 and short_tokens <= long_tokens
 
 
@@ -238,9 +256,12 @@ class MemoryStore:
         self.db.row_factory = sqlite3.Row
         try:
             self.db.executescript(SCHEMA)
-            self._migrate()
+            # Rebuild the index *before* migrating: the cleanup UPDATEs below fire
+            # the FTS triggers, and a delete against an index that was never built
+            # for these rows made SQLite report "database disk image is malformed".
             self.db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
             self.db.commit()
+            self._migrate()
         except sqlite3.OperationalError:
             # A restored backup on a read-only mount can still be searched; the
             # old unconditional rebuild made memory impossible there.
@@ -463,11 +484,17 @@ class MemoryStore:
         hits.sort(key=lambda h: h.score, reverse=True)
         top = hits[:k]
         if top and record_use:
-            self.db.executemany(
-                "UPDATE memories SET uses = uses + 1, last_used_at = ? WHERE id = ?",
-                [(now, h.id) for h in top],
-            )
-            self.db.commit()
+            try:
+                self.db.executemany(
+                    "UPDATE memories SET uses = uses + 1, last_used_at = ? WHERE id = ?",
+                    [(now, h.id) for h in top],
+                )
+                self.db.commit()
+            except sqlite3.OperationalError:
+                # A database on a read-only mount is still worth reading; the
+                # recall itself succeeded, only the usage counter could not be
+                # written. Losing the counter beats losing the memory.
+                self.db.rollback()
         return top
 
     def recent(self, kind: str | None = None, limit: int = 20) -> list[Hit]:
