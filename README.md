@@ -33,11 +33,13 @@ next turn works); `/perf`; `--resume last` and an explicit session id; `--think`
 traceback); piped output (answer only on stdout); and the agent starting and
 stopping its own server.
 
-The full-screen interface is verified in a terminal emulator, not by eye: a pty
-run is rendered through `pyte` and asserted on — 24×100 and 14×50, header on row
-0, chrome pinned to the bottom, a long transcript scrolled out of a fixed frame,
+The full-screen interface is verified in a terminal emulator, not by eye:
+`scripts/screen_ui_check.py` starts a stub llama-server, runs the CLI in a pty,
+renders the byte stream through `pyte` and asserts the layout — header on row 0,
+chrome pinned to the bottom, a long transcript scrolled inside a fixed frame,
 `PgUp` freezing the view, typing resuming the newest line, and a live
-`SIGWINCH` resize re-wrapping the text.
+`SIGWINCH` resize to 14×50 re-wrapping the text. It needs `pyte`
+(`.venv/bin/pip install pyte`) and exits non-zero on a failure.
 
 ## Setup (macOS)
 
