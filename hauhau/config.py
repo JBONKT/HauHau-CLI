@@ -76,6 +76,20 @@ class BrainConfig:
 
 
 @dataclass
+class JournalConfig:
+    """The second-brain journal: mails, messages, calls, events, reminders."""
+
+    enabled: bool = True
+    path: str = ""  # empty = <data_dir>/journal.db
+    mail_days: int = 7
+    calendar_days_back: int = 1
+    calendar_days_ahead: int = 14
+    messages_limit: int = 500
+    calls_limit: int = 300
+    brief_lookahead_days: int = 2
+
+
+@dataclass
 class LoggingConfig:
     data_dir: str = "~/.hauhau"
     audit: bool = True
@@ -88,6 +102,7 @@ class Config:
     agent: AgentConfig = field(default_factory=AgentConfig)
     tools: ToolConfig = field(default_factory=ToolConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
+    journal: JournalConfig = field(default_factory=JournalConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     source: Path | None = None
 
@@ -103,6 +118,12 @@ class Config:
     @property
     def db_path(self) -> Path:
         return self.data_dir / "brain" / "brain.db"
+
+    @property
+    def journal_path(self) -> Path:
+        if self.journal.path:
+            return Path(os.path.expanduser(self.journal.path))
+        return self.data_dir / "journal" / "journal.db"
 
     @property
     def sessions_dir(self) -> Path:

@@ -91,7 +91,7 @@ def apply_active_prompt(cfg, prompts: PromptStore) -> int | None:
 class Repl:
     def __init__(
         self, cfg, client, manager, brain, learner, agent, audit, ui, session_path,
-        prompts: PromptStore | None = None, profile=None,
+        prompts: PromptStore | None = None, profile=None, journal=None,
     ) -> None:
         self.cfg = cfg
         self.prompts = prompts or PromptStore(cfg.data_dir / "evolve" / "prompts")
@@ -99,6 +99,7 @@ class Repl:
         self.client = client
         self.manager = manager
         self.brain = brain
+        self.journal = journal
         self.learner = learner
         self.agent = agent
         self.audit = audit
@@ -128,6 +129,9 @@ class Repl:
             "/remember": self.cmd_remember,
             "/forget": self.cmd_forget,
             "/learn": self.cmd_learn,
+            "/sync": self.cmd_sync,
+            "/journal": self.cmd_journal,
+            "/brief": self.cmd_brief,
             "/eval": self.cmd_eval,
             "/tune": self.cmd_tune,
             "/evolve": self.cmd_evolve,
@@ -684,6 +688,89 @@ class Repl:
     def cmd_quit(self, _arg: str) -> None:
         self.running = False
 
+    # --- journal -------------------------------------------------------
+    def _require_journal(self):
+        if self.journal is None:
+            error_panel(
+                self.console,
+                "the journal is off. Set [journal] enabled = true in config.toml, then restart.",
+            )
+            return None
+        return self.journal
+
+    def cmd_sync(self, arg: str) -> None:
+        """Pull mails, messages, calls, events and reminders into the journal."""
+        journal = self._require_journal()
+        if journal is None:
+            return
+        from .ingest import FETCHERS, sync
+
+        wanted = [name.strip() for name in arg.replace(",", " ").split() if name.strip()]
+        unknown = [name for name in wanted if name not in FETCHERS]
+        if unknown:
+            error_panel(self.console, f"unknown source {unknown[0]!r} — pick from {', '.join(FETCHERS)}")
+            return
+        with Progress(self.console, "syncing…") as progress:
+            report = sync(journal, wanted or None, progress=progress.update)
+        rows: list[tuple[str, str]] = []
+        failed: list[str] = []
+        for name, result in report.items():
+            if "error" in result:
+                failed.append(f"{name}: {result['error']}")
+                rows.append((name, f"[red]failed[/red] {result['error'][:90]}"))
+            else:
+                rows.append((name, f"{result['added']} new of {result['fetched']} seen"))
+        self.audit.log("sync", report=report)
+        data_table(self.console, "journal sync", rows)
+        if failed:
+            error_panel(self.console, failed[0])
+
+    def cmd_journal(self, arg: str) -> None:
+        """Search the journal, or show what it holds."""
+        journal = self._require_journal()
+        if journal is None:
+            return
+        query = arg.strip()
+        if not query:
+            stats = journal.stats()
+            by_source = ", ".join(f"{k} {v}" for k, v in dict(stats["by_source"]).items()) or "empty"
+            newest = stats["newest"]
+            last = (
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(float(newest)))
+                if newest
+                else "never"
+            )
+            self._table(
+                "journal",
+                [
+                    ("events", str(stats["total"])),
+                    ("by source", by_source),
+                    ("newest", last),
+                    ("database", f"{journal.path} ({journal.path.stat().st_size // 1024} KB)"),
+                ],
+            )
+            return
+        rows = journal.search(query, k=20)
+        if not rows:
+            note(self.console, f"nothing in the journal matches {query!r}", WARN)
+            return
+        data_table(
+            self.console,
+            f"{len(rows)} match(es) for {query!r}",
+            [(row.when, f"{row.kind} {row.title or row.body}"[:100]) for row in rows],
+        )
+
+    def cmd_brief(self, _arg: str) -> None:
+        """Today's digest: what arrived, what is due, what is next."""
+        journal = self._require_journal()
+        if journal is None:
+            return
+        from .brief import compose
+
+        digest = compose(journal, self.cfg)
+        self.audit.log("brief", where="repl")
+        self.console.print(digest)
+
 
 def _flag_tokens(option) -> list[str]:
     """The server flags a trial candidate asks for: the part that can be refused."""
@@ -874,7 +961,18 @@ def main(argv: list[str] | None = None) -> int:
     if adopted is not None and console.is_terminal:
         note(console, f"system prompt v{adopted} active")
 
-    registry = build_registry(cfg, audit, brain, confirm if cfg.tools.shell_confirm else None)
+    journal = None
+    if cfg.journal.enabled:
+        try:
+            from .journal import Journal
+
+            journal = Journal(cfg.journal_path)
+        except Exception as exc:  # the journal must never block startup
+            note(console, f"journal disabled: {exc}", WARN)
+
+    registry = build_registry(
+        cfg, audit, brain, confirm if cfg.tools.shell_confirm else None, journal=journal
+    )
     agent = Agent(cfg, client, registry, brain, audit, ui)
     learner = Learner(cfg, client, brain, audit)
     if session_warning:
@@ -905,7 +1003,7 @@ def main(argv: list[str] | None = None) -> int:
 
     repl = Repl(
         cfg, client, manager, brain, learner, agent, audit, ui, session_path,
-        prompts=prompts, profile=profile,
+        prompts=prompts, profile=profile, journal=journal,
     )
 
     def finish() -> None:
@@ -944,6 +1042,11 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             # sqlite kept its handle (and its WAL) open until the interpreter
             # exited; close it with everything else.
+            if journal is not None:
+                try:
+                    journal.close()
+                except Exception as exc:  # pragma: no cover - best effort
+                    audit.log("journal.close_error", error=str(exc))
             if brain is not None:
                 try:
                     brain.close()

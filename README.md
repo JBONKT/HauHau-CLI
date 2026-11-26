@@ -93,6 +93,44 @@ descriptor.
 Runtime state — memory, audit log, sessions, snapshots, server log — lives in
 `~/.hauhau`, never in the repo.
 
+## The second-brain journal
+
+The memory brain holds lessons; the journal holds the record. Every mail,
+message, call, calendar event and reminder is stored once in
+`~/.hauhau/journal/journal.db`, keyed by `(source, external_id)` so a repeated
+sync costs nothing, with a cursor per source so a run only asks for the delta.
+
+```bash
+.venv/bin/python scripts/journal_sync.py --once      # pull everything now
+.venv/bin/python scripts/journal_sync.py --brief     # today's digest
+.venv/bin/python scripts/journal_sync.py --status    # what it holds, what it can read
+.venv/bin/python scripts/journal_sync.py --install   # 15-min sync + 07:30 brief
+```
+
+Inside the REPL that is `/sync`, `/brief` and `/journal [query]`, and the model
+gets four more tools: `journal_search`, `agenda`, `person` and `brief`.
+
+| source | mechanism | needs |
+|---|---|---|
+| mail | AppleScript, INBOX subjects from the last 7 days | Automation permission for Mail |
+| calendar | AppleScript, ±14 days across all calendars | Automation permission for Calendar |
+| reminders | AppleScript, open reminders with their list | Automation permission for Reminders |
+| messages | `chat.db`, read-only, iMessage and SMS | **Full Disk Access** |
+| calls | `CallHistoryDB`, read-only | **Full Disk Access** |
+
+macOS grants those to the *interpreter*, not to the terminal:
+`.venv/bin/python` must be added under System Settings → Privacy & Security →
+Full Disk Access, because the launchd agent has no terminal session. `--status`
+reports which sources actually work, so a silent "permission denied" every 15
+minutes does not go unnoticed.
+
+Two decisions worth recording. **The journal does not decay**: the brain ranks
+memories by use and lets stale ones fade, which is right for lessons and wrong
+for a record you may want to search in March. **Nothing leaves the machine**:
+there is no account, no API key and no network call in the sync path, which is
+also why Gmail/Google Calendar would need a different fetcher rather than a
+switch.
+
 ## The interface
 
 On a terminal on both ends this is a **fixed, full-screen layout**: nothing
@@ -161,9 +199,7 @@ plain text.
 .venv/bin/python -m unittest discover -s tests -t .    # 507 tests
 ```
 
-### Keeping a session going
-
-Hauhau answers, then waits. `scripts/nudge.py` types one line into the terminal
+### Keeping a session goingHauhau answers, then waits. `scripts/nudge.py` types one line into the terminal
 tab the app owns when the session has produced nothing for a while, so a
 run left alone keeps working instead of sitting at the prompt:
 
