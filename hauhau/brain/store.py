@@ -77,6 +77,37 @@ def _match_expr(query: str) -> str | None:
     return " OR ".join(f'"{t}"' for t in dict.fromkeys(terms))
 
 
+# Tokens too common to be worth indexing: every row shares them, so bucketing by
+# them degenerates to comparing every pair (which took ~18s on 2000 rows).
+_COMMON_TOKENS = frozenset({
+    "uses", "using", "with", "this", "that", "from", "into", "your", "have", "were",
+    "will", "must", "should", "does", "then", "than", "them", "they", "there", "here",
+    "when", "where", "which", "while", "what", "also", "only", "just", "some", "such",
+    "same", "very", "more", "most", "much", "many", "each", "every", "other", "about",
+    "after", "before", "during", "under", "over", "between", "through", "against",
+    "being", "been", "both", "onto", "upon", "located", "purposes",
+})
+
+
+def _index_keys(tokens: set[str]) -> set[str]:
+    """Distinctive tokens only: enough to find candidate duplicates."""
+    return {tok for tok in tokens if len(tok) >= 4 and tok not in _COMMON_TOKENS}
+
+
+def _numbers(text: str) -> frozenset[str]:
+    """Numeric tokens carry meaning: ports, versions, counts, step ids."""
+    return frozenset(tok for tok in tokens_of(text) if tok.isdigit())
+
+
+def _numbers_agree(left: frozenset[str], right: frozenset[str]) -> bool:
+    """Same test, on number sets that were computed once.
+
+    The string version re-tokenised both sides on every comparison, which showed
+    up as 1,000,000 regex calls and ~17s for a single compact() of 2000 rows.
+    """
+    return left == right
+
+
 def _pack(vec: list[float]) -> bytes:
     return array.array("f", vec).tobytes()
 
@@ -166,6 +197,7 @@ class MemoryStore:
             return int(row["id"]), False
 
         candidates = tokens_of(text)
+        new_numbers = _numbers(text)
         for cand in self.db.execute(
             "SELECT id, text FROM memories WHERE kind = ? ORDER BY last_used_at DESC LIMIT 400", (kind,)
         ):
@@ -175,11 +207,14 @@ class MemoryStore:
             overlap = len(candidates & other)
             # Jaccard catches rewordings of the same length; containment catches
             # the same fact stated with an extra clause ("X is at P" vs
-            # "X files are located at P"), which Jaccard scores too low.
-            if (
+            # "X files are located at P"), which Jaccard scores too low. Both are
+            # overridden by the numbers: "port 5432" and "port 5433" are
+            # different facts, however similar the wording.
+            similar = (
                 jaccard(candidates, other) >= self.dedupe_jaccard
                 or overlap / min(len(candidates), len(other)) >= self.dedupe_containment
-            ):
+            )
+            if similar and _numbers_agree(new_numbers, _numbers(cand["text"])):
                 self._bump(int(cand["id"]), now, new_text=text)
                 return int(cand["id"]), False
 
@@ -293,36 +328,64 @@ class MemoryStore:
                 )
             )
             kept: list[dict] = []
+            # Two texts that share no token can never pass either similarity test,
+            # so index the survivors by token instead of comparing every pair:
+            # the naive version took 16s on 2000 rows.
+            index: dict[str, list[dict]] = {}
             for row in rows:
                 tokens = tokens_of(row["text"])
+                keys = _index_keys(tokens)
+                seen: set[int] = set()
+                candidates: list[dict] = []
+                for token in keys:
+                    for survivor in index.get(token, ()):
+                        if id(survivor) not in seen:
+                            seen.add(id(survivor))
+                            candidates.append(survivor)
+                if not keys:
+                    # Nothing distinctive to look up; compare the long way.
+                    candidates = list(kept)
                 match = None
-                for survivor in kept:
+                nums = _numbers(row["text"])
+                for survivor in candidates:
                     other = survivor["tokens"]
-                    if not tokens or not other:
-                        continue
                     overlap = len(tokens & other)
-                    if (
+                    similar = (
                         jaccard(tokens, other) >= self.dedupe_jaccard
                         or overlap / min(len(tokens), len(other)) >= self.dedupe_containment
-                    ):
+                    )
+                    if similar and _numbers_agree(nums, survivor["nums"]):
                         match = survivor
                         break
                 if match is None:
-                    kept.append(
-                        {"id": row["id"], "text": row["text"], "tokens": tokens,
-                         "uses": row["uses"], "created_at": row["created_at"],
-                         "importance": row["importance"]}
-                    )
+                    entry = {
+                        "id": row["id"], "text": row["text"], "tokens": tokens, "nums": nums,
+                        "uses": row["uses"], "created_at": row["created_at"],
+                        "importance": row["importance"], "dirty": False,
+                    }
+                    kept.append(entry)
+                    for token in keys:
+                        index.setdefault(token, []).append(entry)
                     continue
                 richest = max(match["text"], row["text"], key=len)
                 match["uses"] += row["uses"] + 1
                 match["importance"] = max(match["importance"], row["importance"])
+                match["dirty"] = True
                 if richest != match["text"]:
                     match["text"] = richest
                     match["tokens"] = tokens_of(richest)
+                    match["nums"] = _numbers(richest)
+                    for token in _index_keys(match["tokens"]):
+                        bucket = index.setdefault(token, [])
+                        if match not in bucket:
+                            bucket.append(match)
                 self.db.execute("DELETE FROM memories WHERE id = ?", (row["id"],))
                 absorbed += 1
             for survivor in kept:
+                # Only touched rows are rewritten: every UPDATE fires the FTS
+                # trigger, and rewriting all 2000 unchanged rows took ~17s.
+                if not survivor["dirty"]:
+                    continue
                 self.db.execute(
                     "UPDATE memories SET text = ?, norm_hash = ?, uses = ?, importance = ? WHERE id = ?",
                     (survivor["text"], norm_hash(survivor["text"]), survivor["uses"],

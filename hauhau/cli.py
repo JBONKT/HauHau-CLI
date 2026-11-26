@@ -130,6 +130,8 @@ class Repl:
             note(self.console, "memory is disabled (--no-brain)", WARN)
             return
         before = self.brain.stats()["total"]
+        if before > 300:
+            note(self.console, "compacting…")
         absorbed = self.brain.store.compact()
         after = self.brain.stats()["total"]
         note(self.console, f"merged {absorbed} duplicate memories ({before} → {after})", OK)

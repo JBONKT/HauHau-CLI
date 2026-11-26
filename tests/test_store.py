@@ -58,6 +58,24 @@ class TestWrite(StoreTestCase):
         self.assertEqual(first, second)
         self.assertEqual(self.store.stats()["total"], 1)
 
+    def test_different_numbers_are_different_facts(self) -> None:
+        # "port 5432" and "port 5433" are 0.89 contained in each other, but a port
+        # number is not prose: merging them would lose a real distinction.
+        self.store.write("semantic", "The staging database listens on port 5432.")
+        _, created = self.store.write("semantic", "The staging database listens on port 5433.")
+        self.assertTrue(created, "different ports must not merge")
+        self.assertEqual(self.store.stats()["total"], 2)
+
+    def test_identical_numbers_still_merge(self) -> None:
+        # Same fact plus an extra clause: containment clears the threshold and the
+        # numbers agree, so this must merge.
+        self.store.write("semantic", "The deploy script is bin/deploy.sh on port 5432.")
+        _, created = self.store.write(
+            "semantic", "The deploy script is bin/deploy.sh on port 5432 with --force."
+        )
+        self.assertFalse(created)
+        self.assertEqual(self.store.stats()["total"], 1)
+
     def test_merge_adopts_the_richer_phrasing(self) -> None:
         self.store.write("preference", "Uses uv for python.")
         richer = "Uses uv for all python projects on this machine."
