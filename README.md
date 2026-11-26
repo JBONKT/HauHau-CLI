@@ -63,6 +63,11 @@ hauhau --profile                    # what hardware the tuner sees
 put it anywhere, update that line, or set `HAUHAU_GGUF`. Nothing is downloaded at
 runtime.
 
+Every value in `config.toml` is type-checked on load: a typo such as
+`extra_args = "not-a-list"` (which used to be spliced into the server command
+line one character at a time) or `max_steps = "many"` (which used to raise
+`TypeError` mid-turn) is reported at startup and the default is used.
+
 **What "it manages the server" means.** The first turn starts `llama-server` with
 the configured context, threads and Metal offload, and stops it on exit —
 verified: no process survives a normal quit. If a run is killed hard (`kill -9`,
@@ -112,7 +117,7 @@ plain text.
 
 ```bash
 .venv/bin/ruff check hauhau tests                      # clean
-.venv/bin/python -m unittest discover -s tests -t .    # 245 tests
+.venv/bin/python -m unittest discover -s tests -t .    # 259 tests
 ```
 
 ## Assumptions this build corrects
@@ -197,6 +202,16 @@ place and tested:
 shell_confirm = true          # or: hauhau --confirm
 denylist = ["rm\\s+-rf\\s+/", "mkfs"]
 ```
+
+A command that times out is killed **with its children**: the shell runs in its
+own session and the whole process group is signalled, because killing only
+`bash` left backgrounded work running. The tool then says the partial output was
+discarded, so the model does not present a partial run as a success.
+
+Known limitation: the model is 2B and can misdescribe a refusal in its own prose
+(it has claimed a declined command "ran successfully" while the tool result said
+NOT RUN). The tool result, the red `✗` line on screen and the audit log are
+authoritative — the command never executed.
 
 Every shell command, tool call, file write, snapshot and config change is
 appended to `~/.hauhau/logs/audit.jsonl`. Overwrites snapshot the previous file

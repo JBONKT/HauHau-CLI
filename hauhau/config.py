@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -130,16 +130,93 @@ def find_gguf() -> str:
     return str(max(candidates, key=lambda p: p.stat().st_size))
 
 
+def _describe(default: Any) -> str:
+    if isinstance(default, bool):
+        return "a boolean"
+    if isinstance(default, int):
+        return "an integer"
+    if isinstance(default, float):
+        return "a number"
+    if isinstance(default, str):
+        return "a string"
+    if isinstance(default, list):
+        return "a list of strings"
+    return type(default).__name__
+
+
+def _type_ok(default: Any, value: Any) -> bool:
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, int):
+        # bool is a subclass of int, but `max_steps = true` is always a mistake.
+        return isinstance(value, int) and not isinstance(value, bool)
+    if isinstance(default, float):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(default, str):
+        return isinstance(value, str)
+    if isinstance(default, list):
+        return isinstance(value, list) and all(isinstance(item, str) for item in value)
+    return True
+
+
 def _apply(obj: Any, table: dict[str, Any], origin: str) -> list[str]:
-    """Copy known keys from a parsed TOML table onto a dataclass instance."""
-    unknown: list[str] = []
+    """Copy known keys onto a dataclass instance, checking each value's type.
+
+    Without this, `extra_args = "not-a-list"` was accepted and then expanded
+    character by character into the llama-server command line, and
+    `max_steps = "many"` raised TypeError in the middle of a turn - a failure
+    far from the typo that caused it.
+    """
+    warnings: list[str] = []
     known = {f.name: f for f in fields(obj)}
     for key, value in table.items():
         if key not in known:
-            unknown.append(f"{origin}{key}")
+            warnings.append(f"unknown setting {origin}{key}")
             continue
+        spec = known[key]
+        default = spec.default if spec.default is not MISSING else (
+            spec.default_factory() if spec.default_factory is not MISSING else None
+        )
+        if not _type_ok(default, value):
+            warnings.append(
+                f"{origin}{key} must be {_describe(default)}; ignoring {value!r}"
+            )
+            continue
+        if isinstance(default, float) and isinstance(value, int):
+            value = float(value)
         setattr(obj, key, value)
-    return unknown
+    return warnings
+
+
+def _sanity(cfg: Config) -> list[str]:
+    """Clamp values whose bad range would only surface as a crash later."""
+    warnings: list[str] = []
+    checks = [
+        ("model.n_ctx", 256),
+        ("model.n_threads", 1),
+        ("model.startup_timeout", 1.0),
+        ("tools.shell_timeout", 0.1),
+        ("tools.max_output_chars", 200),
+        ("agent.max_steps", 1),
+        ("agent.context_budget_tokens", 200),
+        ("agent.keep_recent_turns", 1),
+        ("brain.top_k", 1),
+        ("brain.half_life_days", 0.1),
+        ("brain.inject_max_chars", 100),
+    ]
+    for dotted, minimum in checks:
+        section, name = dotted.split(".")
+        current = getattr(getattr(cfg, section), name)
+        if current < minimum:
+            warnings.append(f"{dotted} must be >= {minimum}; using {minimum}")
+            setattr(getattr(cfg, section), name, minimum)
+    if cfg.model.server_url and not cfg.model.server_url.startswith(("http://", "https://")):
+        warnings.append(
+            f"model.server_url should start with http:// (got {cfg.model.server_url!r}); "
+            "using http://127.0.0.1:8080"
+        )
+        cfg.model.server_url = "http://127.0.0.1:8080"
+    return warnings
 
 
 def load(path: str | os.PathLike[str] | None = None) -> tuple[Config, list[str]]:
@@ -173,6 +250,7 @@ def load(path: str | os.PathLike[str] | None = None) -> tuple[Config, list[str]]
 
     if not cfg.model.gguf:
         cfg.model.gguf = find_gguf()
+    warnings.extend(_sanity(cfg))
     return cfg, warnings
 
 
@@ -205,7 +283,8 @@ def dumps(cfg: Config) -> str:
 
 
 def save(cfg: Config, path: str | os.PathLike[str] | None = None) -> Path:
-    target = Path(os.path.expanduser(str(path))) if path else (cfg.source or Path("config.toml"))
+    default = cfg.source or (cfg.data_dir / "config.toml")
+    target = Path(os.path.expanduser(str(path))) if path else default
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(dumps(cfg), encoding="utf-8")
     return target

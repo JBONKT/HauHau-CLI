@@ -162,6 +162,7 @@ class Repl:
 
     def cmd_forget(self, arg: str) -> None:
         if self.brain is None:
+            note(self.console, "memory is disabled (--no-brain)", WARN)
             return
         try:
             row_id = int(arg.strip())

@@ -10,6 +10,11 @@ from pathlib import Path
 from ..util import clip_text
 from .base import Tool, ToolResult, fail, ok
 
+# A single very long line is truncated rather than loaded whole, and files too
+# big to rewrite in memory are refused by edit_file.
+MAX_LINE_CHARS = 4000
+EDIT_MAX_BYTES = 32 * 1024 * 1024
+
 
 def _resolve(path: str) -> Path:
     return Path(os.path.expanduser(path)).expanduser()
@@ -30,6 +35,39 @@ def _snapshot(cfg, audit, path: Path) -> None:
     audit.log("snapshot", path=str(path), copy=str(dest))
 
 
+def _read_window(path: Path, offset: int, limit: int) -> tuple[list[str], bool]:
+    """Read at most `limit` lines from `offset` without loading the file.
+
+    `read_text()` pulled the whole file into memory: asking for 3 lines of a
+    286 MB log cost 903 MB of resident memory. This walks the file with a bound
+    on both line length and line count.
+    """
+    window: list[str] = []
+    has_more = False
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        index = 0
+        while True:
+            line = fh.readline(MAX_LINE_CHARS + 1)
+            if not line:
+                break
+            if len(line) > MAX_LINE_CHARS and not line.endswith("\n"):
+                # Over-long line: keep the head and discard the remainder.
+                while True:
+                    chunk = fh.readline(65536)
+                    if not chunk or chunk.endswith("\n"):
+                        break
+                line = line[:MAX_LINE_CHARS] + " …[line truncated]\n"
+            if index < offset:
+                index += 1
+                continue
+            if limit and len(window) >= limit:
+                has_more = True
+                break
+            window.append(line.rstrip("\n"))
+            index += 1
+    return window, has_more
+
+
 def build(cfg, audit) -> list[Tool]:
     max_chars = cfg.tools.max_output_chars
 
@@ -37,26 +75,24 @@ def build(cfg, audit) -> list[Tool]:
         path = _resolve(str(args.get("path") or ""))
         if not path.is_file():
             return fail(f"read_file: not a file: {path}")
-        offset = max(0, int(args.get("offset") or 0))
-        limit = int(args.get("limit") or 0)
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            offset = max(0, int(args.get("offset") or 0))
+            limit = max(0, int(args.get("limit") or 0))
+        except (TypeError, ValueError):
+            return fail("read_file: offset and limit must be integers")
+        try:
+            window, has_more = _read_window(path, offset, limit)
         except OSError as exc:
             return fail(f"read_file: {exc}")
-        lines = text.splitlines()
-        if not lines:
+        if not window:
+            if offset:
+                return fail(f"read_file: offset {offset} is past the end of the file")
             return ok("(empty file)")
-        if offset >= len(lines):
-            return fail(
-                f"read_file: offset {offset} is past the end of the file ({len(lines)} lines)"
-            )
-        chunk = lines[offset : offset + limit] if limit else lines[offset:]
-        body = "\n".join(chunk)
-        suffix = ""
-        if len(chunk) < len(lines) - offset:
-            suffix = f"\n...[{len(lines) - offset - len(chunk)} more lines; use offset/limit]..."
-        audit.log("read_file", path=str(path), lines=len(chunk))
-        return ok(clip_text(body + suffix, max_chars))
+        body = "\n".join(window)
+        if has_more:
+            body += "\n...[more lines follow; use offset/limit]..."
+        audit.log("read_file", path=str(path), lines=len(window))
+        return ok(clip_text(body, max_chars))
 
     def write_file(args: dict) -> ToolResult:
         path = _resolve(str(args.get("path") or ""))
@@ -81,6 +117,15 @@ def build(cfg, audit) -> list[Tool]:
             return fail("edit_file: 'old' and 'new' strings are required")
         if not path.is_file():
             return fail(f"edit_file: not a file: {path}")
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            return fail(f"edit_file: {exc}")
+        if size > EDIT_MAX_BYTES:
+            return fail(
+                f"edit_file: {path} is {size // 1024 // 1024} MB, too large to rewrite in memory; "
+                "use the shell tool (sed, perl, or a script) instead"
+            )
         try:
             text = path.read_text(encoding="utf-8")
         except OSError as exc:

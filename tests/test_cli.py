@@ -109,6 +109,11 @@ class TestCommands(ReplTestCase):
         self.repl.handle("/forget notanumber")
         self.assertIn("usage", self.text())
 
+    def test_forget_reports_when_memory_is_off(self) -> None:
+        self.repl.brain = None
+        self.repl.handle("/forget 1")
+        self.assertIn("memory is disabled", self.text())
+
     def test_context_reports_turns(self) -> None:
         self.agent.messages = [{"role": "user", "content": "hi"}]
         self.repl.handle("/context")

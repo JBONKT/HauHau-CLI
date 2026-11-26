@@ -63,7 +63,22 @@ class TestShell(ToolTestCase):
         self.cfg.tools.shell_timeout = 0.5
         result = self.run_tool("shell", cmd="sleep 5")
         self.assertFalse(result.ok)
-        self.assertIn("timed out", result.content)
+        self.assertIn("killed after 0.5s", result.content)
+        self.assertIn("timeout", result.content)
+
+    def test_timeout_kills_background_children(self) -> None:
+        # Regression: the timeout only killed bash, leaving `sleep` running.
+        pidfile = self.root / "child.pid"
+        self.cfg.tools.shell_timeout = 0.5
+        result = self.run_tool("shell", cmd=f"sleep 30 & echo $! > {pidfile}; wait")
+        self.assertFalse(result.ok)
+        import os as _os
+        import time as _time
+
+        _time.sleep(0.5)
+        pid = int(pidfile.read_text().strip())
+        with self.assertRaises(ProcessLookupError):
+            _os.kill(pid, 0)
 
     def test_command_is_audited(self) -> None:
         self.run_tool("shell", cmd="echo audited")
@@ -132,6 +147,42 @@ class TestFiles(ToolTestCase):
         self.assertFalse(result.ok)
         self.assertIn("past the end", result.content)
         self.assertNotIn("empty file", result.content)
+
+    def test_read_is_bounded_by_limit(self) -> None:
+        path = self.root / "many.txt"
+        self.run_tool("write_file", path=str(path), content="\n".join(f"line{i}" for i in range(5000)))
+        result = self.run_tool("read_file", path=str(path), limit=2)
+        self.assertIn("line0", result.content)
+        self.assertIn("line1", result.content)
+        self.assertNotIn("line2", result.content)
+        self.assertIn("more lines follow", result.content)
+
+    def test_over_long_line_is_truncated_not_loaded(self) -> None:
+        path = self.root / "long.txt"
+        self.run_tool("write_file", path=str(path), content="y" * 20000 + "\nshort\n")
+        result = self.run_tool("read_file", path=str(path), limit=2)
+        self.assertIn("line truncated", result.content)
+        self.assertIn("short", result.content)
+        self.assertLess(len(result.content), 20000)
+
+    def test_non_integer_offset_is_a_clear_error(self) -> None:
+        path = self.root / "x.txt"
+        self.run_tool("write_file", path=str(path), content="a\nb")
+        result = self.run_tool("read_file", path=str(path), offset="five")
+        self.assertFalse(result.ok)
+        self.assertIn("must be integers", result.content)
+
+    def test_edit_refuses_a_file_too_large_to_rewrite(self) -> None:
+        from hauhau.tools.files import EDIT_MAX_BYTES
+
+        path = self.root / "huge.log"
+        with path.open("wb") as fh:
+            fh.seek(EDIT_MAX_BYTES + 1)
+            fh.write(b"x")
+        result = self.run_tool("edit_file", path=str(path), old="x", new="y")
+        self.assertFalse(result.ok)
+        self.assertIn("too large", result.content)
+        self.assertIn("shell tool", result.content)
 
     def test_read_empty_file_says_so(self) -> None:
         path = self.root / "empty.txt"

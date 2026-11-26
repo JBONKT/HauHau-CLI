@@ -71,6 +71,65 @@ class TestRoundTrip(ConfigTestCase):
             config_mod.load(self.tmp / "nope.toml")
 
 
+class TestValidation(ConfigTestCase):
+    def write(self, body: str) -> Path:
+        path = self.tmp / "config.toml"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_wrong_list_type_is_ignored_with_a_warning(self) -> None:
+        # Regression: this string was accepted and expanded character by
+        # character into the llama-server command line.
+        path = self.write('[model]\nextra_args = "not-a-list"\n')
+        cfg, warnings = config_mod.load(path)
+        self.assertEqual(cfg.model.extra_args, [])
+        self.assertTrue(any("list of strings" in w for w in warnings), warnings)
+
+    def test_non_numeric_int_is_ignored_with_a_warning(self) -> None:
+        path = self.write('[agent]\nmax_steps = "many"\n')
+        cfg, warnings = config_mod.load(path)
+        self.assertEqual(cfg.agent.max_steps, 12)
+        self.assertTrue(any("integer" in w for w in warnings), warnings)
+
+    def test_boolean_is_not_accepted_as_an_int(self) -> None:
+        path = self.write("[agent]\nmax_steps = true\n")
+        cfg, warnings = config_mod.load(path)
+        self.assertEqual(cfg.agent.max_steps, 12)
+        self.assertTrue(any("integer" in w for w in warnings), warnings)
+
+    def test_int_is_accepted_for_a_float_field(self) -> None:
+        path = self.write("[generation]\ntemperature = 1\n")
+        cfg, warnings = config_mod.load(path)
+        self.assertEqual(cfg.generation.temperature, 1.0)
+        self.assertIsInstance(cfg.generation.temperature, float)
+        self.assertFalse(any("temperature" in w for w in warnings), warnings)
+
+    def test_negative_values_are_clamped(self) -> None:
+        path = self.write("[model]\nn_ctx = -5\n[agent]\nmax_steps = 0\n")
+        cfg, warnings = config_mod.load(path)
+        self.assertGreaterEqual(cfg.model.n_ctx, 256)
+        self.assertGreaterEqual(cfg.agent.max_steps, 1)
+        self.assertTrue(any("n_ctx" in w for w in warnings), warnings)
+
+    def test_bad_server_url_falls_back(self) -> None:
+        path = self.write('[model]\nserver_url = "localhost:8080"\n')
+        cfg, warnings = config_mod.load(path)
+        self.assertTrue(cfg.model.server_url.startswith("http://"))
+        self.assertTrue(any("server_url" in w for w in warnings), warnings)
+
+    def test_valid_values_do_not_warn(self) -> None:
+        path = self.write('[model]\nn_ctx = 4096\n[generation]\ntemperature = 0.2\n')
+        _, warnings = config_mod.load(path)
+        self.assertEqual(warnings, [])
+
+    def test_save_without_a_path_never_writes_to_the_cwd(self) -> None:
+        cfg = Config()
+        cfg.logging.data_dir = str(self.tmp / "data")
+        target = config_mod.save(cfg)
+        self.assertEqual(target.parent, self.tmp / "data")
+        self.assertFalse((self.tmp / "config.toml").exists())
+
+
 class TestGgufDiscovery(ConfigTestCase):
     def test_env_override_wins(self) -> None:
         os.environ["HAUHAU_GGUF"] = "/tmp/custom.gguf"
