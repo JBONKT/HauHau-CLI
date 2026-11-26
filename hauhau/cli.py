@@ -8,96 +8,34 @@ import sys
 import time
 from pathlib import Path
 
-from prompt_toolkit import PromptSession
 from prompt_toolkit import prompt as pt_prompt
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.history import FileHistory
-from rich.console import Console
-from rich.table import Table
 from rich.text import Text
 
 from . import config as config_mod
-from .agent import UI, Agent
+from .agent import Agent
 from .audit import Audit
 from .brain import Brain
 from .brain.learn import Learner
 from .llm import LLMError
 from .profiler import apply_recommendations, probe, recommend
 from .server import ServerManager
-from .tools import ToolResult, build_registry
+from .tools import build_registry
+from .ui import (
+    OK,
+    WARN,
+    RichUI,
+    banner,
+    data_table,
+    error_panel,
+    help_panel,
+    kv_table,
+    make_console,
+    make_prompt_session,
+    note,
+    prompt_glyph,
+    toolbar_text,
+)
 from .util import estimate_messages_tokens, human_bytes
-
-HELP = """\
-[bold]Slash commands[/bold]
-  /help              this list
-  /tools             tools the model can call
-  /mem [query]       memory stats, or search memories
-  /compact           merge near-duplicate memories
-  /remember <text>   store a fact yourself
-  /forget <id>       delete a memory by id
-  /learn             distil this session into long-term memory now
-  /model             backend and model status
-  /perf              measure real tokens/second
-  /config            effective configuration
-  /audit [n]         tail the audit log
-  /context           token usage of the current conversation
-  /clear             forget the current conversation (memory stays)
-  /save              persist the session now
-  /quit              leave (runs a /learn pass first)
-"""
-
-
-class RichUI(UI):
-    """Streams tokens to the terminal without Rich re-parsing model output."""
-
-    def __init__(self, console: Console) -> None:
-        self.console = console
-        self._open = False
-        self._thinking = False
-
-    def _close_thinking(self) -> None:
-        if self._thinking:
-            self.console.print()
-            self._thinking = False
-
-    def token(self, text: str) -> None:
-        self._close_thinking()
-        self._open = True
-        self.console.print(text, end="", markup=False, highlight=False, soft_wrap=True)
-
-    def reasoning(self, text: str) -> None:
-        if not self._thinking:
-            if self._open:
-                self.console.print()
-                self._open = False
-            self.console.print(Text("thinking…", style="dim italic"))
-            self._thinking = True
-        self.console.print(Text(text, style="dim italic"), end="", soft_wrap=True)
-
-    def newline(self) -> None:
-        if self._open or self._thinking:
-            self.console.print()
-        self._open = self._thinking = False
-
-    def status(self, text: str) -> None:
-        self.newline()
-        self.console.print(Text(f"· {text}", style="dim"))
-
-    def tool_call(self, name: str, args: str) -> None:
-        self.newline()
-        self.console.print(Text(f"⚙ {name} {args}", style="cyan"), soft_wrap=True, markup=False)
-
-    def tool_result(self, name: str, result: ToolResult) -> None:
-        lines = [ln for ln in (result.content or "").strip().splitlines() if ln.strip()]
-        # The shell tool prefixes "exit=N"; show the actual output instead.
-        body = [ln for ln in lines if not ln.startswith("exit=")] or lines
-        preview = body[0][:200] if body else "(empty)"
-        extra = f" (+{len(body) - 1} lines)" if len(body) > 1 else ""
-        self.console.print(
-            Text(f"  ↳ {preview}{extra}", style="green" if result.ok else "red"),
-            soft_wrap=True,
-            markup=False,
-        )
 
 
 class Repl:
@@ -116,12 +54,7 @@ class Repl:
 
     # --- helpers -------------------------------------------------------
     def _table(self, title: str, rows: list[tuple[str, str]]) -> None:
-        table = Table(title=title, title_justify="left", show_header=False, box=None, padding=(0, 1))
-        table.add_column(style="dim", no_wrap=True)
-        table.add_column(overflow="fold")
-        for key, value in rows:
-            table.add_row(key, value)
-        self.console.print(table)
+        kv_table(self.console, title, rows)
 
     # --- commands ------------------------------------------------------
     def handle(self, line: str) -> None:
@@ -148,38 +81,37 @@ class Repl:
             "/exit": self.cmd_quit,
         }.get(command)
         if handler is None:
-            self.console.print(Text(f"unknown command {command}; try /help", style="red"))
+            error_panel(self.console, f"unknown command {command} — try /help")
             return
         handler(arg)
 
     def cmd_help(self, _arg: str) -> None:
-        self.console.print(HELP, markup=True)
+        help_panel(self.console)
 
     def cmd_tools(self, _arg: str) -> None:
-        table = Table(title="Tools", title_justify="left")
-        table.add_column("name", style="cyan", no_wrap=True)
-        table.add_column("description", overflow="fold")
-        for tool in self.agent.registry.tools():
-            table.add_row(tool.name, tool.description.splitlines()[0])
-        self.console.print(table)
+        data_table(
+            self.console,
+            "Tools",
+            ["name", "description"],
+            [[t.name, t.description.splitlines()[0]] for t in self.agent.registry.tools()],
+        )
 
     def cmd_mem(self, arg: str) -> None:
         if self.brain is None:
-            self.console.print(Text("memory is disabled (--no-brain)", style="yellow"))
+            note(self.console, "memory is disabled (--no-brain)", WARN)
             return
         if arg.strip():
             hits = self.brain.recall(arg.strip(), k=10)
             if not hits:
-                self.console.print(Text(f"nothing remembered about {arg.strip()!r}", style="dim"))
+                note(self.console, f"nothing remembered about {arg.strip()!r}")
                 return
-            table = Table(title=f"memory: {arg.strip()}", title_justify="left")
-            table.add_column("id", style="dim", no_wrap=True)
-            table.add_column("kind", style="cyan", no_wrap=True)
-            table.add_column("score", no_wrap=True)
-            table.add_column("text", overflow="fold")
-            for hit in hits:
-                table.add_row(str(hit.id), hit.kind, f"{hit.score:.2f}", hit.text)
-            self.console.print(table)
+            data_table(
+                self.console,
+                f"memory: {arg.strip()}",
+                ["id", "kind", "score", "text"],
+                [[str(h.id), h.kind, f"{h.score:.2f}", h.text] for h in hits],
+                no_wrap=3,
+            )
             return
         stats = self.brain.stats()
         rows = [
@@ -194,22 +126,20 @@ class Repl:
 
     def cmd_compact(self, _arg: str) -> None:
         if self.brain is None:
-            self.console.print(Text("memory is disabled (--no-brain)", style="yellow"))
+            note(self.console, "memory is disabled (--no-brain)", WARN)
             return
         before = self.brain.stats()["total"]
         absorbed = self.brain.store.compact()
         after = self.brain.stats()["total"]
-        self.console.print(
-            Text(f"merged {absorbed} duplicate memories ({before} -> {after})", style="green")
-        )
+        note(self.console, f"merged {absorbed} duplicate memories ({before} → {after})", OK)
 
     def cmd_remember(self, arg: str) -> None:
         if self.brain is None or not arg.strip():
-            self.console.print(Text("usage: /remember <text>", style="yellow"))
+            note(self.console, "usage: /remember <text>", WARN)
             return
         row_id, created = self.brain.remember("semantic", arg.strip(), "", 0.7)
         verb = "stored" if created else "merged into"
-        self.console.print(Text(f"{verb} memory #{row_id}", style="green"))
+        note(self.console, f"{verb} memory #{row_id}", OK)
 
     def cmd_forget(self, arg: str) -> None:
         if self.brain is None:
@@ -217,26 +147,26 @@ class Repl:
         try:
             row_id = int(arg.strip())
         except ValueError:
-            self.console.print(Text("usage: /forget <id>", style="yellow"))
+            note(self.console, "usage: /forget <id>", WARN)
             return
         removed = self.brain.store.forget(row_id)
-        self.console.print(Text("forgotten" if removed else "no such memory", style="green" if removed else "yellow"))
+        note(self.console, "forgotten" if removed else "no such memory", OK if removed else WARN)
 
     def cmd_learn(self, _arg: str) -> None:
         if self.brain is None:
-            self.console.print(Text("memory is disabled (--no-brain)", style="yellow"))
+            note(self.console, "memory is disabled (--no-brain)", WARN)
             return
         if not self.agent.messages:
-            self.console.print(Text("nothing to learn from yet", style="dim"))
+            note(self.console, "nothing to learn from yet")
             return
-        self.console.print(Text("distilling this session…", style="dim"))
+        note(self.console, "distilling this session…")
         try:
             drafts, written = self.learner.distill(self.agent.messages)
         except LLMError as exc:
-            self.console.print(Text(f"learn failed: {exc}", style="red"))
+            error_panel(self.console, f"learn failed: {exc}")
             return
         if not drafts:
-            self.console.print(Text("nothing durable found", style="dim"))
+            note(self.console, "nothing durable found")
             return
         for draft, (row_id, created) in zip(drafts, written, strict=False):
             mark = "new" if created else "merged"
@@ -257,7 +187,7 @@ class Repl:
         self._table("Backend", rows)
 
     def cmd_perf(self, _arg: str) -> None:
-        self.console.print(Text("benchmarking…", style="dim"))
+        note(self.console, "benchmarking…")
         try:
             started = time.monotonic()
             warm = self.client.chat(
@@ -276,7 +206,7 @@ class Repl:
                 temperature=0.0,
             )
         except LLMError as exc:
-            self.console.print(Text(f"benchmark failed: {exc}", style="red"))
+            error_panel(self.console, f"benchmark failed: {exc}")
             return
         self._table(
             "Performance",
@@ -312,7 +242,7 @@ class Repl:
             count = 10
         entries = self.audit.tail(count)
         if not entries:
-            self.console.print(Text("audit log is empty", style="dim"))
+            note(self.console, "audit log is empty")
             return
         for entry in entries:
             when = str(entry.get("ts", ""))[11:19]
@@ -334,11 +264,11 @@ class Repl:
 
     def cmd_clear(self, _arg: str) -> None:
         self.agent.reset()
-        self.console.print(Text("conversation cleared", style="green"))
+        note(self.console, "conversation cleared", OK)
 
     def cmd_save(self, _arg: str) -> None:
         self.agent.persist(self.session_path)
-        self.console.print(Text(f"saved to {self.session_path}", style="green"))
+        note(self.console, f"saved to {self.session_path}", OK)
 
     def cmd_quit(self, _arg: str) -> None:
         self.running = False
@@ -400,43 +330,39 @@ def _session_path(cfg, resume: str | None) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    console = Console()
+    console = make_console()
     ui = RichUI(console)
 
     try:
         cfg, warnings = config_mod.load(args.config)
     except FileNotFoundError as exc:
-        console.print(Text(str(exc), style="red"))
+        error_panel(console, str(exc))
         return 2
     for warning in warnings:
-        console.print(Text(f"config: {warning}", style="yellow"))
+        note(console, f"config: {warning}", WARN)
     _apply_args(cfg, args)
 
     profile = probe()
     if args.profile:
-        rows = list(profile.as_dict().items())
-        table = Table(title="Hardware", title_justify="left", show_header=False, box=None)
-        table.add_column(style="dim", no_wrap=True)
-        table.add_column(overflow="fold")
-        for key, value in rows:
-            if key == "notes":
-                continue
-            table.add_row(key, str(value))
-        console.print(table)
+        kv_table(
+            console,
+            "Hardware",
+            [(key, str(value)) for key, value in profile.as_dict().items() if key != "notes"],
+        )
         size = 0
         if cfg.model.gguf:
             gguf_path = os.path.expanduser(cfg.model.gguf)
             size = os.path.getsize(gguf_path) if os.path.isfile(gguf_path) else 0
         for name, (value, reason) in recommend(profile, size).items():
-            console.print(Text(f"{name} = {value}: {reason}", style="dim"))
+            note(console, f"  {name} = {value}: {reason}")
         return 0
 
     if cfg.source is None:
         changes = apply_recommendations(cfg, profile)
         if changes:
-            console.print(Text("auto-tuned for this machine:", style="dim"))
+            note(console, "auto-tuned for this machine:")
             for change in changes:
-                console.print(Text(f"  {change}", style="dim"))
+                note(console, f"  {change}")
 
     session_path = _session_path(cfg, args.resume)
     session_id = session_path.stem
@@ -446,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         client = manager.ensure()
     except LLMError as exc:
-        console.print(Text(str(exc), style="red"))
+        error_panel(console, str(exc))
         audit.close()
         return 1
 
@@ -455,7 +381,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             brain = Brain(cfg, audit)
         except Exception as exc:  # memory must never block startup
-            console.print(Text(f"memory disabled: {exc}", style="yellow"))
+            note(console, f"memory disabled: {exc}", WARN)
 
     def confirm(cmd: str) -> bool:
         try:
@@ -468,22 +394,21 @@ def main(argv: list[str] | None = None) -> int:
     agent = Agent(cfg, client, registry, brain, audit, ui)
     learner = Learner(cfg, client, brain, audit)
     if args.resume and session_path.exists() and agent.load(session_path):
-        console.print(Text(f"resumed {agent.turn_count()} turns from {session_path.name}", style="dim"))
+        note(console, f"resumed {agent.turn_count()} turns from {session_path.name}")
 
     # --- banner --------------------------------------------------------
     stats = brain.stats() if brain else {"total": 0}
-    console.print(
-        Text(
-            f"{cfg.agent.name} · {os.path.basename(os.path.expanduser(cfg.model.gguf)) or 'unknown model'} · "
-            f"{cfg.model.n_ctx} ctx · {profile.ram_gb:g} GB RAM · {stats['total']} memories",
-            style="bold",
-        ),
-        soft_wrap=True,
-    )
-    console.print(
-        Text(f"{cfg.model.server_url} · workspace {cfg.workspace} · /help for commands", style="dim"),
-        soft_wrap=True,
-    )
+    if console.is_terminal:  # a boxed banner is noise when piped
+        banner(
+            console,
+            name=cfg.agent.name,
+            model=os.path.basename(os.path.expanduser(cfg.model.gguf)),
+            ctx=cfg.model.n_ctx,
+            threads=cfg.model.n_threads,
+            ram=profile.ram_gb,
+            memories=stats["total"],
+            url=cfg.model.server_url,
+        )
 
     repl = Repl(cfg, client, manager, brain, learner, agent, audit, ui, session_path)
 
@@ -491,10 +416,11 @@ def main(argv: list[str] | None = None) -> int:
         if brain is not None and agent.messages:
             try:
                 _, written = learner.distill(agent.messages)
-                if written:
+                if written and console.is_terminal:
                     new = sum(1 for _, created in written if created)
-                    console.print(
-                        Text(f"learned {len(written)} memories ({new} new, {len(written) - new} merged)", style="dim")
+                    note(
+                        console,
+                        f"learned {len(written)} memories ({new} new, {len(written) - new} merged)",
                     )
             except LLMError:
                 pass
@@ -509,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
             agent.run_turn(" ".join(args.prompt))
             ui.newline()
         except LLMError as exc:
-            console.print(Text(str(exc), style="red"))
+            error_panel(console, str(exc))
         finally:
             finish()
         return 0
@@ -517,14 +443,19 @@ def main(argv: list[str] | None = None) -> int:
     # --- interactive ---------------------------------------------------
     history_file = cfg.data_dir / "history"
     history_file.parent.mkdir(parents=True, exist_ok=True)
-    session = PromptSession(
-        history=FileHistory(str(history_file)),
-        auto_suggest=AutoSuggestFromHistory(),
-    )
+    def toolbar() -> str:
+        return toolbar_text(
+            ctx=cfg.model.n_ctx,
+            memories=brain.stats()["total"] if brain else 0,
+            ram=profile.ram_gb,
+            shell_mode="confirm" if cfg.tools.shell_confirm else "auto",
+        )
+
+    session = make_prompt_session(history_file, toolbar)
     try:
         while repl.running:
             try:
-                line = session.prompt("you › ")  # noqa: RUF001 - deliberate prompt glyph
+                line = session.prompt(prompt_glyph())
             except KeyboardInterrupt:
                 continue
             except EOFError:
@@ -539,13 +470,15 @@ def main(argv: list[str] | None = None) -> int:
                 agent.run_turn(text)
                 ui.newline()
             except LLMError as exc:
-                console.print(Text(f"error: {exc}", style="red"))
+                ui.interrupt()
+                error_panel(console, str(exc))
             except KeyboardInterrupt:
-                ui.newline()
-                console.print(Text("interrupted", style="yellow"))
+                ui.interrupt()
+                note(console, "interrupted", WARN)
     finally:
         finish()
-        console.print(Text("bye", style="dim"))
+        if console.is_terminal:
+            note(console, "bye")
     return 0
 
 

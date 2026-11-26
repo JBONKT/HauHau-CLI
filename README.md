@@ -63,11 +63,45 @@ untouched.
 Runtime state — memory, audit log, sessions, snapshots, server log — lives in
 `~/.hauhau`, never in the repo.
 
+## The interface
+
+```
+╭─ Hauhau ──────────────────────────────────────╮
+│ Gemma-4-E2B…Q4_K_P.gguf                       │
+│ 8192 ctx · 4 threads · 8 GB RAM · 11 memories │
+│ http://127.0.0.1:8080 · /help for commands    │
+╰───────────────────────────────────────────────╯
+❯ how much disk is left?
+  ⚙ shell  df -h /
+    ✓ /dev/disk3s3s1  228Gi  13Gi  109Gi  11%  /  +1 lines
+
+The volume is 11% full (109 GB free).
+  11.0s · 53 tok · 27 tok/s
+```
+
+- **Answers render as Markdown**, not raw tokens. The model emits `**bold**`,
+  bullets and fences constantly, so tokens accumulate into a Live region that
+  re-renders the block (throttled to 8 fps — a re-parse per token is wasted work).
+- **Tool calls show the interesting argument**, not raw JSON: `⚙ shell  df -h /`
+  rather than `{"cmd":"df -h /"}`. Results are one line with `✓`/`✗`, a count of
+  hidden lines, and the full text in `~/.hauhau/logs/audit.jsonl`.
+- **The meta line** after each turn reports wall time, completion tokens and
+  measured tok/s, so you can see what a slow answer cost.
+- **Prompt:** `Tab` completes `/commands` with descriptions, `Esc`+`Enter` adds a
+  newline, `Ctrl-C` cancels generation without leaving, `Ctrl-D` exits.
+- **Piped output stays clean**: `hauhau "what is in /tmp" | jq` gets only the
+  answer on stdout — no banner, no colour, no session chatter. Markdown is left
+  raw so it stays greppable.
+
+Colour and the bottom status bar are plain `prompt_toolkit`/`rich`, so they
+follow `TERM`/`NO_COLOR`. In a `TERM=dumb` environment both degrade silently to
+plain text.
+
 ## Development
 
 ```bash
 .venv/bin/ruff check hauhau tests                      # clean
-.venv/bin/python -m unittest discover -s tests -t .    # 134 tests
+.venv/bin/python -m unittest discover -s tests -t .    # 200 tests
 ```
 
 ## Assumptions this build corrects

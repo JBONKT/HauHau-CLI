@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .llm import Completion, LlamaClient, LLMError
+from .llm import Completion, LlamaClient, LLMError, Usage
 from .tools import Registry, ToolResult, fail
 from .util import estimate_messages_tokens, estimate_tokens
 
@@ -30,6 +30,9 @@ class UI:
     def tool_result(self, name: str, result: ToolResult) -> None: ...
     def status(self, text: str) -> None: ...
     def newline(self) -> None: ...
+    def turn_start(self, label: str = "thinking…") -> None: ...
+    def turn_end(self, usage: Usage | None = None, elapsed: float = 0.0) -> None: ...
+    def interrupt(self) -> None: ...
 
 
 class Agent:
@@ -53,6 +56,7 @@ class Agent:
         self.messages: list[dict[str, Any]] = []
         self.summary = ""
         self.last_completion: Completion | None = None
+        self._turn_usage = Usage()
 
     # --- prompt --------------------------------------------------------
     def system_prompt(self, query: str = "") -> str:
@@ -88,7 +92,15 @@ class Agent:
     def run_turn(self, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
         self.compress_if_needed()
+        self._turn_usage = Usage()
+        started = time.monotonic()
+        self.ui.turn_start()
+        try:
+            return self._run_steps(user_text)
+        finally:
+            self.ui.turn_end(self._turn_usage, time.monotonic() - started)
 
+    def _run_steps(self, user_text: str) -> str:
         for _ in range(self.cfg.agent.max_steps):
             completion = self._chat(user_text, with_tools=True, stream=True)
             if completion.tool_calls:
@@ -135,6 +147,12 @@ class Agent:
             on_reasoning=self.ui.reasoning,
         )
         self.last_completion = completion
+        self._turn_usage.prompt_tokens += completion.usage.prompt_tokens
+        self._turn_usage.completion_tokens += completion.usage.completion_tokens
+        if completion.usage.tok_per_second:
+            self._turn_usage.tok_per_second = completion.usage.tok_per_second
+        if completion.usage.prompt_per_second:
+            self._turn_usage.prompt_per_second = completion.usage.prompt_per_second
         if completion.reasoning and not completion.content and not completion.tool_calls:
             self.ui.status("the model spent its whole budget thinking; raise max_tokens or disable think")
         return completion
@@ -173,6 +191,8 @@ class Agent:
                     result = tool.run(args)
                 except Exception as exc:  # a tool crash must not kill the turn
                     result = fail(f"{call.name} crashed: {exc.__class__.__name__}: {exc}")
+                if not isinstance(result, ToolResult):
+                    result = fail(f"{call.name} returned {type(result).__name__}, not a ToolResult")
         content = result.clipped(self.cfg.tools.max_output_chars)
         self.messages.append(
             {"role": "tool", "tool_call_id": call.id, "name": call.name, "content": content}

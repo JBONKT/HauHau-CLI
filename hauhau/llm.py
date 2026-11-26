@@ -133,6 +133,10 @@ class LlamaClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if stream:
+            # Without this, llama.cpp omits usage from a streamed response, so
+            # the caller cannot report token counts.
+            payload["stream_options"] = {"include_usage": True}
         payload.update(params)
 
         req = self._request("/v1/chat/completions", payload)
