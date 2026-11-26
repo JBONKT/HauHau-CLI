@@ -136,7 +136,7 @@ plain text.
 
 ```bash
 .venv/bin/ruff check hauhau tests                      # clean
-.venv/bin/python -m unittest discover -s tests -t .    # 462 tests
+.venv/bin/python -m unittest discover -s tests -t .    # 472 tests
 ```
 
 ## Assumptions this build corrects
@@ -287,9 +287,8 @@ facts.
 
 ## Auto-tuning and self-evolution
 
-The agent can now measure itself and change two things: `n_threads`/`n_ctx`, and
-its own system prompt. Nothing is changed without a measurement that beats the
-current state.
+The agent can measure itself and change its own runtime knobs and system prompt.
+Nothing is changed without a measurement that beats the current state.
 
 **`/eval` — the yardstick.** 14 tasks, one short completion each (~12 s here).
 A task passes if the model's *first action* is the right tool **and** the
@@ -299,9 +298,29 @@ and no tool was called. It measures behaviour — "does it inspect the file or
 invent a number" — not facts, because a 2B model's facts are not a stable
 signal. Tasks whose tools are missing (brain off → `rag_*`) are dropped.
 
-**`/tune [trials]` — the hill-climb.** Benchmarks the current config with a
-fixed prompt, then tries `n_threads` (half the cores, all-but-one, capped at 8)
-and `n_ctx` (4k/8k/16k), restarting the backend for each trial (~25 s each).
+**`/tune [trials]` — the hill-climb.** Each key is climbed separately, with its
+own baseline and its own yardstick: `model.*` keys need a backend restart and
+are scored on generation tok/s, `brain.*` keys only change the prompt and are
+scored on prompt tok/s. What it can try, all hardware-aware:
+
+| key | candidates |
+|---|---|
+| `model.n_threads` | half the cores, all-but-one, capped at 8, every core |
+| `model.n_ctx` | scaled by RAM: 2k on a 4 GB box up to 128k on a 64 GB box |
+| `model.n_gpu_layers` | all layers, CPU only, all-but-8 (GPU machines only) |
+| `model.extra_args` | registered flag bundles (below), never stacked |
+| `brain.top_k` | 3 / 8 / 12 memories in the prompt |
+
+The flag bundles are the llama.cpp knobs that change speed or memory without
+changing output, each verified against `llama-server --help`: `-fa on|off`
+(flash attention), `-lm none` / `-lm dio` (stream the model from SSD instead of
+mmap — offered when RAM is tight), `-ctk q8_0 -ctv q8_0` (quantized KV cache),
+`--cache-reuse 256` (reuse KV chunks across turns), `--context-shift`
+(auto-compact a full context instead of failing), `-cram` (KV cache cap, scaled
+by RAM) and `-ub 1024` (physical batch, big machines only). `set_value()` only
+accepts tokens from that registry plus whatever you put in `extra_args`
+yourself, so the tuner cannot smuggle in `--host` or a different model path.
+
 A value is adopted only if it beats the best by 2 %. On this machine the honest
 answer was *nothing*: 29.5 and 29.9 tok/s against a 29.7 baseline is noise, so
 the config was left alone. Adopted values are snapshotted and written to
@@ -327,7 +346,7 @@ this hardware:
   re-downloads, so they remain one-shot profiler output.
 - **Soak testing** for memory growth and config thrash.
 
-Safety rails for the tuner itself: `TUNABLE` is an allowlist of two keys, and
-`set_value()` refuses anything else, so the tuner cannot edit `shell_confirm`,
-the denylist, the workspace or the audit switch. `audit.jsonl` stays
-append-only and outside every write tool's path.
+Safety rails for the tuner itself: `TUNABLE` is an allowlist of five keys,
+`set_value()` enforces a numeric range per key and refuses anything else, so the
+tuner cannot edit `shell_confirm`, the denylist, the workspace or the audit
+switch. `audit.jsonl` stays append-only and outside every write tool's path.

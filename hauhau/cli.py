@@ -20,11 +20,14 @@ from .brain import Brain
 from .brain.learn import Learner, worth_distilling
 from .evolve import (
     DEFAULT_TASKS,
+    TUNABLE,
     PromptStore,
     available,
     benchmark,
+    benchmark_prompt,
     evolve_prompt,
     hill_climb,
+    metric_for,
     run_suite,
 )
 from .evolve import (
@@ -33,7 +36,7 @@ from .evolve import (
 from .evolve import (
     record as record_tuning,
 )
-from .evolve.tune import set_value
+from .evolve.tune import get_value, set_value
 from .llm import LLMError
 from .profiler import apply_recommendations, probe, recommend
 from .server import ServerManager
@@ -377,78 +380,103 @@ class Repl:
             )
             return
         try:
+            # Trials *per key*, not in total: with several keys tunable, a single
+            # shared budget would only ever reach the first one.
             budget = int(arg) if arg.strip() else 4
         except ValueError:
-            note(self.console, "usage: /tune [max_trials]", WARN)
+            note(self.console, "usage: /tune [trials-per-key]", WARN)
             return
-        cores = (self.profile.cores if self.profile else 0) or os.cpu_count() or 4
-        options = tune_candidates(self.cfg, cores)
+        profile = self.profile
+        cores = (profile.cores if profile else 0) or os.cpu_count() or 4
+        ram_gb = profile.ram_gb if profile else 0.0
+        has_gpu = bool(profile and (profile.metal or "nvidia" in profile.gpu.lower()))
+        options = tune_candidates(self.cfg, cores, ram_gb=ram_gb, has_gpu=has_gpu)
         if not options:
             note(self.console, "nothing to try: the config already has the candidate values")
             return
+        groups: dict[str, list] = {}
+        for option in options:
+            groups.setdefault(option.key, []).append(option)
+        # Every tunable value, so the finally-block can restore all of them.
+        original = {key: get_value(self.cfg, key) for key in TUNABLE}
+        trials: list = []
+        adopted: list = []
+        stopped = ""
+        baseline_note = ""
         with Progress(self.console, "benchmarking the current config…") as progress:
-            try:
-                baseline = benchmark(self.client)
-            except LLMError as exc:
-                error_panel(self.console, f"benchmark failed: {exc}")
-                return
-            progress.step(f"baseline {baseline:.1f} tok/s · trying up to {budget} values")
-            original = {
-                key: getattr(self.cfg.model, key.split(".", 1)[1]) for key in ("model.n_threads", "model.n_ctx")
-            }
-            self.audit.log("tune.start", baseline=round(baseline, 2), trials=budget)
+            self.audit.log("tune.start", trials=budget, keys=sorted(groups))
 
             def measure(option) -> float:
-                progress.update(f"restarting for {option}…")
                 set_value(self.cfg, option.key, option.value)
                 self.audit.log("tune.trial", setting=option.key, value=option.value)
-                self.manager.restart()
-                progress.update(f"benchmarking {option}…")
-                return benchmark(self.client)
-
-            def on_trial(trial) -> None:
-                progress.step(f"  {trial.candidate} → {trial.score:.1f} tok/s")
+                if option.key.startswith("model."):
+                    # Server flags and model settings only exist after a restart.
+                    progress.update(f"restarting for {option}…")
+                    self.manager.restart()
+                    progress.update(f"benchmarking {option}…")
+                    return benchmark(self.client)
+                progress.update(f"benchmarking {option} (prompt speed)…")
+                return benchmark_prompt(self.client)
 
             try:
-                result = hill_climb(baseline, options, measure, max_trials=budget, on_trial=on_trial)
-            except LLMError as exc:
-                error_panel(self.console, f"tuning aborted: {exc}")
-                result = None
+                for key, group in groups.items():
+                    metric = metric_for(key)
+                    try:
+                        base = benchmark(self.client) if metric == "gen" else benchmark_prompt(self.client)
+                    except LLMError as exc:
+                        # One key without timings must not stop the others.
+                        error_panel(self.console, f"baseline benchmark failed for {key}: {exc}")
+                        stopped = f"{key} baseline failed: {exc}"
+                        continue
+                    piece = f"{key}={base:.1f} tok/s"
+                    baseline_note = f"{baseline_note} · {piece}" if baseline_note else f"{piece}"
+                    progress.step(f"{key}: baseline {base:.1f} tok/s · up to {budget} values")
+                    try:
+                        result = hill_climb(base, group, measure, max_trials=budget)
+                    except LLMError as exc:
+                        error_panel(self.console, f"tuning {key} aborted: {exc}")
+                        stopped = f"{key} aborted: {exc}"
+                        break
+                    trials.extend(result.trials)
+                    adopted.extend(result.adopted)
+                    if result.stopped:
+                        stopped = result.stopped
             finally:
                 # Whatever happened, the running server must match the chosen values.
                 for key, value in original.items():
                     set_value(self.cfg, key, value)
-                if result is not None:
-                    for chosen in result.adopted:
-                        set_value(self.cfg, chosen.key, chosen.value)
+                for chosen in adopted:
+                    set_value(self.cfg, chosen.key, chosen.value)
                 try:
                     self.manager.restart()
-                except LLMError as exc:
+                except (LLMError, OSError) as exc:
                     # Tuning must never take the session down with it.
                     note(self.console, f"backend restart failed: {exc} - run /model to check it", WARN)
 
-        if result is None:
+        if not trials:
+            note(self.console, f"nothing was measured. {stopped}", WARN)
             return
         rows = [
             (trial.candidate, f"{trial.score:.1f} tok/s", "✓ adopted" if trial.adopted else "kept")
-            for trial in result.trials
+            for trial in trials
         ]
-        if rows:
-            data_table(self.console, "Tuning trials", ["setting", "speed", "result"], rows, no_wrap=2)
-        if result.adopted:
+        data_table(self.console, "Tuning trials", ["setting", "speed", "result"], rows, no_wrap=2)
+        if adopted:
+            from .evolve.tune import TuneResult
+
+            merged = TuneResult(baseline=0.0, best=0.0, trials=trials, adopted=adopted, stopped=stopped)
             target = self._save_config("tune")
-            record_tuning(self.cfg.data_dir / "evolve" / "tuning.jsonl", result, adopted_config=str(target))
-            self.audit.log("tune.adopt", best=round(result.best, 2), settings=[str(c) for c in result.adopted])
+            record_tuning(self.cfg.data_dir / "evolve" / "tuning.jsonl", merged, adopted_config=str(target))
+            self.audit.log("tune.adopt", settings=[str(c) for c in adopted])
             note(
                 self.console,
-                f"adopted {', '.join(str(c) for c in result.adopted)}: "
-                f"{baseline:.1f} → {result.best:.1f} tok/s, saved to {target}",
+                f"adopted {', '.join(str(c) for c in adopted)} ({baseline_note.strip()}) - saved to {target}",
                 OK,
             )
         else:
             note(
                 self.console,
-                f"kept the current settings ({baseline:.1f} tok/s). {result.stopped or 'no candidate was faster'}",
+                f"kept the current settings ({baseline_note.strip()}). {stopped or 'no candidate was faster'}",
                 WARN,
             )
 

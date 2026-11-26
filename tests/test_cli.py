@@ -44,6 +44,9 @@ class FakeManager:
     def stop(self) -> None:
         pass
 
+    def restart(self):
+        return self
+
 
 class ReplTestCase(unittest.TestCase):
     def setUp(self) -> None:
@@ -296,6 +299,20 @@ class TestEvolveCommands(ReplTestCase):
     def test_tune_rejects_a_bad_budget(self) -> None:
         self.repl.handle("/tune many")
         self.assertIn("usage: /tune", self.text())
+
+    def test_tune_restores_every_tunable_value_after_a_run(self) -> None:
+        # Whatever the trials did to the config, the finally-block puts all
+        # TUNABLE values back (plus whatever was adopted).
+        from hauhau.evolve import TUNABLE
+        from hauhau.evolve.tune import get_value
+
+        before = {key: get_value(self.cfg, key) for key in TUNABLE}
+        with mock.patch("hauhau.cli.benchmark", side_effect=lambda client: 30.0), \
+                mock.patch("hauhau.cli.benchmark_prompt", side_effect=lambda client: 30.0):
+            self.repl.handle("/tune 3")
+        after = {key: get_value(self.cfg, key) for key in TUNABLE}
+        self.assertEqual(before, after, "no candidate beat the baseline, so nothing may change")
+        self.assertIn("kept the current settings", self.text())
 
     def test_tune_reports_a_backend_without_timings(self) -> None:
         # FakeClient returns no usage, so the benchmark cannot compare anything.

@@ -160,5 +160,95 @@ class TestBenchmark(unittest.TestCase):
         self.assertIn("no timings", str(ctx.exception))
 
 
+class TestExpandedTunables(unittest.TestCase):
+    def test_the_allowlist_covers_model_flags_and_prompt_size(self) -> None:
+        self.assertEqual(
+            TUNABLE,
+            ("model.n_threads", "model.n_ctx", "model.n_gpu_layers", "model.extra_args", "brain.top_k"),
+        )
+
+    def test_ranges_are_enforced(self) -> None:
+        cfg = Config()
+        for key, bad in (
+            ("model.n_ctx", 10),
+            ("model.n_ctx", 1 << 30),
+            ("model.n_threads", 0),
+            ("model.n_gpu_layers", 5000),
+            ("brain.top_k", 0),
+            ("brain.top_k", True),
+        ):
+            with self.assertRaises(ValueError, msg=f"{key}={bad}"):
+                set_value(cfg, key, bad)
+
+    def test_extra_args_rejects_unregistered_flags(self) -> None:
+        cfg = Config()
+        cfg.model.extra_args = ["--my-own-flag"]
+        with self.assertRaises(ValueError):
+            set_value(cfg, "model.extra_args", ["--my-own-flag", "--host", "0.0.0.0"])
+        # A registered bundle, plus the user's own token, is fine.
+        set_value(cfg, "model.extra_args", ["--my-own-flag", "-fa", "on"])
+        self.assertEqual(cfg.model.extra_args, ["--my-own-flag", "-fa", "on"])
+
+    def test_gpu_layers_are_only_offered_with_a_gpu(self) -> None:
+        cfg = Config()
+        with_gpu = candidates(cfg, cores=8, has_gpu=True)
+        without = candidates(cfg, cores=8, has_gpu=False)
+        self.assertTrue(any(c.key == "model.n_gpu_layers" for c in with_gpu))
+        self.assertFalse(any(c.key == "model.n_gpu_layers" for c in without))
+
+    def test_ssd_streaming_is_offered_on_ram_tight_machines_only(self) -> None:
+        cfg = Config()
+        tight = [c for c in candidates(cfg, cores=8, ram_gb=8.0) if c.key == "model.extra_args"]
+        roomy = [c for c in candidates(cfg, cores=8, ram_gb=64.0) if c.key == "model.extra_args"]
+        self.assertTrue(any("-lm" in c.value for c in tight), "SSD streaming on an 8 GB box")
+        self.assertFalse(any("-lm" in c.value for c in roomy))
+        self.assertTrue(any("-cram" in c.value and "16384" in c.value for c in roomy))
+
+    def test_bundle_families_are_alternatives_not_stacks(self) -> None:
+        cfg = Config()
+        cfg.model.extra_args = ["-fa", "on"]
+        options = [c for c in candidates(cfg, cores=8) if c.key == "model.extra_args"]
+        for candidate in options:
+            value = candidate.value
+            self.assertNotIn("-fa", value[:-2] if value[-2:] in ("on", "off") else value,
+                             f"two flash-attention flags stacked: {value}")
+            self.assertLessEqual(value.count("-fa"), 1)
+
+    def test_top_k_candidates_exclude_the_current_value(self) -> None:
+        cfg = Config()
+        cfg.brain.top_k = 8
+        values = [c.value for c in candidates(cfg, cores=8) if c.key == "brain.top_k"]
+        self.assertNotIn(8, values)
+        self.assertTrue(values)
+
+    def test_metric_is_per_key(self) -> None:
+        from hauhau.evolve.tune import metric_for
+
+        self.assertEqual(metric_for("model.n_ctx"), "gen")
+        self.assertEqual(metric_for("model.extra_args"), "gen")
+        self.assertEqual(metric_for("brain.top_k"), "prompt")
+
+    def test_prompt_benchmark_uses_prompt_timings(self) -> None:
+        from hauhau.evolve.tune import benchmark_prompt
+
+        class PromptClient:
+            def __init__(self, rates):
+                self.rates = list(rates)
+                self.calls = 0
+
+            def chat(self, messages, tools=None, **kwargs):
+                self.calls += 1
+                rate = self.rates.pop(0) if self.rates else 0.0
+                return Completion(content="ok", usage=Usage(prompt_tokens=1500, prompt_per_second=rate))
+
+        client = PromptClient([0.0, 100.0, 200.0])
+        self.assertEqual(benchmark_prompt(client, reps=2), 150.0)
+        self.assertEqual(client.calls, 3, "one warmup plus two measured calls")
+        with self.assertRaises(LLMError):
+            benchmark_prompt(PromptClient([0.0, 0.0]), reps=1)
+
+
+
+
 if __name__ == "__main__":
     unittest.main()
