@@ -36,7 +36,7 @@ from .evolve import (
 from .evolve import (
     record as record_tuning,
 )
-from .evolve.tune import get_value, set_value
+from .evolve.tune import get_value, log_tail, rejected_tokens, set_value
 from .llm import LLMError
 from .profiler import apply_recommendations, probe, recommend
 from .server import ServerManager
@@ -413,7 +413,20 @@ class Repl:
                 if option.key.startswith("model."):
                     # Server flags and model settings only exist after a restart.
                     progress.update(f"restarting for {option}…")
+                    log = self.cfg.data_dir / "logs" / "server.log"
+                    before = log.stat().st_size if log.is_file() else 0
                     self.manager.restart()
+                    refused = rejected_tokens(log_tail(log, before), _flag_tokens(option))
+                    if refused:
+                        # llama-server started, declined the flag and measured
+                        # something else - exactly how --cache-reuse "won" a
+                        # trial while the log said it was disabled.
+                        note(
+                            self.console,
+                            f"{option}: llama-server refused {', '.join(refused)}, trial discarded",
+                            WARN,
+                        )
+                        return 0.0
                     progress.update(f"benchmarking {option}…")
                     return benchmark(self.client)
                 progress.update(f"benchmarking {option} (prompt speed)…")
@@ -445,7 +458,7 @@ class Repl:
             finally:
                 # Whatever happened, the running server must match the chosen values.
                 for key, value in original.items():
-                    set_value(self.cfg, key, value)
+                    set_value(self.cfg, key, value, allow_below_floor=True)
                 for chosen in adopted:
                     set_value(self.cfg, chosen.key, chosen.value)
                 try:
@@ -670,6 +683,14 @@ class Repl:
 
     def cmd_quit(self, _arg: str) -> None:
         self.running = False
+
+
+def _flag_tokens(option) -> list[str]:
+    """The server flags a trial candidate asks for: the part that can be refused."""
+    value = getattr(option, "value", None)
+    if getattr(option, "key", "") != "model.extra_args" or not isinstance(value, list):
+        return []
+    return [token for token in value if isinstance(token, str) and token.startswith("-")]
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -17,6 +17,7 @@ no improvement.
 from __future__ import annotations
 
 import json
+import re
 import statistics
 import time
 from collections.abc import Callable, Iterable
@@ -162,14 +163,25 @@ def get_value(cfg, key: str) -> Any:
     return getattr(getattr(cfg, section), name)
 
 
-def set_value(cfg, key: str, value: Any) -> None:
-    """Set a config value, but only one the tuner is allowed to touch."""
+def set_value(cfg, key: str, value: Any, *, allow_below_floor: bool = False) -> None:
+    """Set a config value, but only one the tuner is allowed to touch.
+
+    ``allow_below_floor`` exists for restoring a value the user already had: the
+    floor governs what the tuner may *adopt*, never what it may put back.
+    """
     if key not in TUNABLE:
         raise ValueError(f"{key} is not tunable; allowed: {', '.join(TUNABLE)}")
     if key in RANGES:
         low, high = RANGES[key]
         if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
             raise ValueError(f"{key} must be an integer in {low}..{high}, got {value!r}")
+    if key == "model.n_ctx" and not allow_below_floor:
+        floor = ctx_floor(cfg)
+        if value < floor:
+            raise ValueError(
+                f"model.n_ctx must be at least {floor}: a smaller context cannot hold a "
+                f"turn, so it measures faster and then rejects the next request"
+            )
     if key == "model.extra_args":
         _check_extra_args(cfg, value)
     section, name = _split(key)
@@ -211,6 +223,70 @@ def _ctx_options(ram_gb: float) -> list[tuple[int, str]]:
     return [(16384, "16k context"), (32768, "32k context"), (65536, "64k context"), (131072, "128k context")]
 
 
+MIN_CTX = 8192
+
+
+def ctx_floor(cfg) -> int:
+    """The smallest context worth adopting, in tokens.
+
+    ``model.*`` trials are scored on tok/s alone, so a smaller KV cache always
+    looks better - it won one sweep here and adopted 4096 while the session was
+    already sending 5.6k-token prompts, which rejected every following request.
+    A turn has to fit the conversation budget *and* the tool output that follows
+    it, so the floor is twice the budget, never below ``MIN_CTX``.
+    """
+    budget = int(getattr(cfg.agent, "context_budget_tokens", 5000) or 0)
+    return max(MIN_CTX, 2 * budget)
+
+
+# What llama-server prints when it accepts a flag and then declines to use it,
+# or does not know the flag at all. A trial that triggers one of these measured
+# nothing, so it must not win on speed.
+UNSUPPORTED_MARKERS: tuple[str, ...] = (
+    "not supported",
+    "unsupported",
+    "will be disabled",
+    "unknown argument",
+    "invalid argument",
+    "unrecognized",
+)
+
+
+def rejected_tokens(log_tail: str, tokens: Iterable[str]) -> list[str]:
+    """Which of ``tokens`` the server log says it cannot honour.
+
+    llama.cpp names a feature in its warnings rather than repeating the flag -
+    `--cache-reuse` is reported as "cache_reuse is not supported by this
+    context" - so a flag is matched by its normalised feature name on word
+    boundaries, never as a bare substring ("fa" would otherwise hit "failed").
+    """
+    refused: list[str] = []
+    lines = [line.lower() for line in log_tail.splitlines()]
+    for token in tokens:
+        name = token.lstrip("-").replace("-", "_").lower()
+        if not name:
+            continue
+        pattern = re.compile(rf"(?<![\w]){re.escape(name)}(?![\w])")
+        for line in lines:
+            if any(marker in line for marker in UNSUPPORTED_MARKERS) and pattern.search(line):
+                if token not in refused:
+                    refused.append(token)
+                break
+    return refused
+
+
+def log_tail(path: Path, offset: int = 0, limit: int = 200_000) -> str:
+    """The part of a log written since ``offset`` (0 for the whole tail)."""
+    try:
+        size = path.stat().st_size
+        start = max(0, offset if offset else max(0, size - limit))
+        with path.open("rb") as fh:
+            fh.seek(start)
+            return fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def candidates(
     cfg,
     cores: int,
@@ -227,7 +303,9 @@ def candidates(
             (max(2, min(cores, 8)), "capped at 8 threads"),
             (max(2, cores), "every core"),
         ],
-        "model.n_ctx": _ctx_options(ram_gb),
+        "model.n_ctx": [
+            (value, why) for value, why in _ctx_options(ram_gb) if value >= ctx_floor(cfg)
+        ],
         "brain.top_k": [
             (3, "fewer memories in the prompt = faster prompt processing"),
             (8, "a wider memory block"),

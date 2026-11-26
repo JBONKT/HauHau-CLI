@@ -7,12 +7,16 @@ from pathlib import Path
 
 from hauhau.config import Config
 from hauhau.evolve.tune import (
+    MIN_CTX,
     TUNABLE,
     Candidate,
     candidates,
+    ctx_floor,
     get_value,
     hill_climb,
+    log_tail,
     record,
+    rejected_tokens,
     set_value,
 )
 from hauhau.llm import Completion, LLMError, Usage
@@ -110,6 +114,81 @@ class TestHillClimb(unittest.TestCase):
         options = [Candidate("model.n_threads", 2), Candidate("model.n_threads", 6)]
         hill_climb(10.0, options, lambda c: 11.0, max_trials=2, on_trial=lambda t: seen.append(t.candidate))
         self.assertEqual(seen, ["n_threads=2", "n_threads=6"])
+
+
+class TestContextFloor(unittest.TestCase):
+    """A smaller KV cache always benchmarks faster, so it needs a floor."""
+
+    def test_the_floor_is_twice_the_conversation_budget(self) -> None:
+        cfg = Config()
+        cfg.agent.context_budget_tokens = 6000
+        self.assertEqual(ctx_floor(cfg), 12000)
+
+    def test_a_tiny_budget_still_gets_the_minimum(self) -> None:
+        cfg = Config()
+        cfg.agent.context_budget_tokens = 200
+        self.assertEqual(ctx_floor(cfg), MIN_CTX)
+
+    def test_candidates_never_offer_a_context_below_the_floor(self) -> None:
+        cfg = Config()
+        cfg.agent.context_budget_tokens = 5000
+        offered = [c.value for c in candidates(cfg, 8, keys=("model.n_ctx",), ram_gb=16)]
+        self.assertTrue(offered, "some context sizes must remain offerable")
+        self.assertTrue(all(value >= ctx_floor(cfg) for value in offered), offered)
+        self.assertNotIn(4096, offered)
+
+    def test_adopting_below_the_floor_is_refused(self) -> None:
+        cfg = Config()
+        with self.assertRaises(ValueError) as caught:
+            set_value(cfg, "model.n_ctx", 4096)
+        self.assertIn("at least", str(caught.exception))
+        self.assertNotEqual(cfg.model.n_ctx, 4096)
+
+    def test_a_value_the_user_already_had_can_be_restored(self) -> None:
+        cfg = Config()
+        cfg.model.n_ctx = 4096
+        set_value(cfg, "model.n_ctx", 16384)
+        set_value(cfg, "model.n_ctx", 4096, allow_below_floor=True)
+        self.assertEqual(cfg.model.n_ctx, 4096)
+
+
+class TestRejectedFlags(unittest.TestCase):
+    """A flag the server declines must not win a trial on borrowed speed."""
+
+    REAL_LINE = (
+        "0.01.616.975 W srv    load_model: cache_reuse is not supported by this "
+        "context, it will be disabled\n"
+    )
+
+    def test_the_disabled_flag_is_named(self) -> None:
+        refused = rejected_tokens(self.REAL_LINE, ["--cache-reuse", "-lm"])
+        self.assertEqual(refused, ["--cache-reuse"])
+
+    def test_a_flag_that_worked_is_not_named(self) -> None:
+        log = "0.01.674.370 I srv  server_run_i: model loaded\n"
+        self.assertEqual(rejected_tokens(log, ["-fa", "-lm"]), [])
+
+    def test_an_unknown_argument_is_named(self) -> None:
+        log = "error: unknown argument: --bogus\n"
+        self.assertEqual(rejected_tokens(log, ["--bogus"]), ["--bogus"])
+
+    def test_case_does_not_matter(self) -> None:
+        log = "W srv load_model: CACHE_REUSE is not supported\n"
+        self.assertEqual(rejected_tokens(log, ["--cache-reuse"]), ["--cache-reuse"])
+
+    def test_log_tail_reads_only_what_is_new(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "server.log"
+            path.write_text("old line\n", encoding="utf-8")
+            cut = path.stat().st_size
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(self.REAL_LINE)
+            fresh = log_tail(path, cut)
+            self.assertNotIn("old line", fresh)
+            self.assertIn("cache_reuse", fresh)
+
+    def test_a_missing_log_reads_as_empty(self) -> None:
+        self.assertEqual(log_tail(Path("/nonexistent/server.log")), "")
 
 
 class TestRecord(unittest.TestCase):

@@ -385,6 +385,17 @@ asked for; nothing wins, because the last failure is the model's tool choice on
 one phrasing, not the prompt's clarity. That is what a gate is for: the file
 says `kept the current prompt`, and the reason is now in the audit trail.
 
+**Two guards came from a real failure.** A sweep adopted `n_ctx=4096` while the
+session was sending 5.6k-token prompts, because `model.*` trials are scored on
+tok/s alone and a smaller KV cache always wins; every turn after that was
+rejected by the server. `model.n_ctx` candidates are now filtered by
+`ctx_floor()` — twice `agent.context_budget_tokens`, never below 8192 — and
+`set_value` refuses to adopt below it (a value the user already had can still be
+restored). The same sweep also adopted `--cache-reuse 256`, which llama-server
+logged as `cache_reuse is not supported by this context, it will be disabled`:
+a trial that produces such a line is now scored 0 and discarded, matched by the
+feature name llama.cpp prints rather than the flag that was passed.
+
 **`/prompt [vN]` — history and rollback.** Versions live in
 `<data_dir>/evolve/prompts/versions/v<N>.md` with a JSONL index and an `active`
 pointer; the store wins over `config.toml` at startup. `/prompt v1` is the undo.
