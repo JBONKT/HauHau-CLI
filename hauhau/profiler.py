@@ -36,7 +36,7 @@ class HardwareProfile:
 
 def _run(cmd: list[str], timeout: float = 10.0) -> str:
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError):
         return ""
     # llama-server prints its version banner to stderr, sysctl to stdout.
@@ -59,17 +59,19 @@ def _darwin_ram_gb() -> float:
 def _linux_info() -> tuple[str, float]:
     cpu, ram_gb = platform.processor() or "unknown", 0.0
     try:
-        for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
-            if line.startswith("model name"):
-                cpu = line.split(":", 1)[1].strip()
-                break
+        with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("model name"):
+                    cpu = line.split(":", 1)[1].strip()
+                    break
     except OSError:
         pass
     try:
-        for line in open("/proc/meminfo", encoding="utf-8"):
-            if line.startswith("MemTotal:"):
-                ram_gb = round(int(line.split()[1]) / 1024**2, 1)
-                break
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    ram_gb = round(int(line.split()[1]) / 1024**2, 1)
+                    break
     except OSError:
         pass
     return cpu, ram_gb

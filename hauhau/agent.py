@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .llm import Completion, LLMError, LlamaClient
+from .llm import Completion, LlamaClient, LLMError
 from .tools import Registry, ToolResult, fail
 from .util import estimate_messages_tokens, estimate_tokens
 
@@ -89,15 +89,19 @@ class Agent:
         self.messages.append({"role": "user", "content": user_text})
         self.compress_if_needed()
 
-        for step in range(self.cfg.agent.max_steps):
+        for _ in range(self.cfg.agent.max_steps):
             completion = self._chat(user_text, with_tools=True, stream=True)
             if completion.tool_calls:
                 self._record_assistant(completion)
+                # A call cut off at the token limit has incomplete arguments;
+                # running it would mean guessing the rest. Make the model redo it.
+                truncated = completion.finish_reason == "length"
                 for call in completion.tool_calls:
-                    self._execute(call)
+                    self._execute(call, truncated=truncated)
                 continue
             text = completion.content.strip()
             self.messages.append({"role": "assistant", "content": text})
+            self._warn_if_truncated(completion)
             return text
 
         self.ui.status(f"step budget ({self.cfg.agent.max_steps}) reached - answering without tools")
@@ -105,7 +109,16 @@ class Agent:
         completion = self._chat(user_text, with_tools=False, stream=True)
         text = completion.content.strip()
         self.messages.append({"role": "assistant", "content": text})
+        self._warn_if_truncated(completion)
         return text
+
+    def _warn_if_truncated(self, completion: Completion) -> None:
+        """Never let a cut-off answer look complete."""
+        if completion.finish_reason == "length":
+            self.ui.status(
+                f"answer hit the {self.cfg.generation.max_tokens}-token cap and was cut off; "
+                "raise [generation] max_tokens to finish it"
+            )
 
     def _chat(self, query: str, with_tools: bool, stream: bool) -> Completion:
         messages, tools = self._request(query, with_tools)
@@ -117,7 +130,7 @@ class Agent:
             think=g.think,
             temperature=g.temperature,
             top_p=g.top_p,
-            max_tokens=g.max_tokens if not tools else g.tool_max_tokens,
+            max_tokens=g.max_tokens,
             on_token=self.ui.token,
             on_reasoning=self.ui.reasoning,
         )
@@ -139,10 +152,16 @@ class Agent:
             ]
         self.messages.append(message)
 
-    def _execute(self, call) -> None:
+    def _execute(self, call, truncated: bool = False) -> None:
         self.ui.tool_call(call.name, call.arguments)
         tool = self.registry.get(call.name)
-        if tool is None:
+        if truncated:
+            result = fail(
+                f"{call.name}: this call was cut off at the {self.cfg.generation.max_tokens}-token "
+                "limit, so its arguments are incomplete and it was NOT run. Retry with less content "
+                "per call (for example write_file in several smaller writes)."
+            )
+        elif tool is None:
             result = fail(f"unknown tool {call.name!r}; available: {', '.join(self.registry.names())}")
         else:
             try:
@@ -152,7 +171,7 @@ class Agent:
             else:
                 try:
                     result = tool.run(args)
-                except Exception as exc:  # noqa: BLE001 - a tool crash must not kill the turn
+                except Exception as exc:  # a tool crash must not kill the turn
                     result = fail(f"{call.name} crashed: {exc.__class__.__name__}: {exc}")
         content = result.clipped(self.cfg.tools.max_output_chars)
         self.messages.append(

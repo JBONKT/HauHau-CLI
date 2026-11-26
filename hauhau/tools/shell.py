@@ -11,10 +11,10 @@ import os
 import re
 import subprocess
 import time
-from typing import Callable
+from collections.abc import Callable
 
 from ..util import clip_text
-from .base import Tool, ToolResult, fail, ok
+from .base import Tool, ToolResult, fail
 
 
 def _denylist_hit(cmd: str, patterns: list[str]) -> str | None:
@@ -39,20 +39,16 @@ def build(
         cmd = (args.get("cmd") or "").strip()
         if not cmd:
             return fail("shell: 'cmd' is required")
-        if args.get("cwd"):
-            cwd = os.path.expanduser(str(args["cwd"]))
-        else:
-            cwd = str(cfg.workspace)
+        cwd = os.path.expanduser(str(args["cwd"])) if args.get("cwd") else str(cfg.workspace)
         timeout = float(args.get("timeout") or cfg.tools.shell_timeout)
 
         hit = _denylist_hit(cmd, cfg.tools.denylist)
         if hit:
             audit.log("shell.denied", cmd=cmd, pattern=hit)
             return fail(f"shell: command blocked by denylist pattern {hit!r}")
-        if cfg.tools.shell_confirm and confirm is not None:
-            if not confirm(cmd):
-                audit.log("shell.declined", cmd=cmd)
-                return fail("shell: the user declined to run this command")
+        if cfg.tools.shell_confirm and confirm is not None and not confirm(cmd):
+            audit.log("shell.declined", cmd=cmd)
+            return fail("shell: the user declined to run this command")
 
         started = time.monotonic()
         try:
@@ -62,6 +58,7 @@ def build(
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                check=False,
             )
             duration = time.monotonic() - started
             output = (proc.stdout or "") + (proc.stderr or "")

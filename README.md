@@ -27,7 +27,10 @@ Requires Python 3.11+ and a `llama-server` on `PATH`.
 python3 -m venv .venv && .venv/bin/pip install -e .
 .venv/bin/hauhau                       # interactive
 .venv/bin/hauhau "what is in /tmp?"    # one-shot
-.venv/bin/python -m unittest discover -s tests -t .   # 124 tests
+
+.venv/bin/pip install -e ".[dev]"      # lint tooling
+.venv/bin/ruff check hauhau tests      # clean
+.venv/bin/python -m unittest discover -s tests -t .   # 133 tests
 ```
 
 Configuration lives in `config.toml` (see `hauhau --profile` for what the
@@ -95,6 +98,15 @@ would cost more latency than it saves.
 **Context.** Above `context_budget_tokens` the oldest turns are summarised by a
 cheap non-streaming call. Trimming only ever cuts at a `user` boundary, so an
 assistant `tool_calls` message is never separated from its `tool` result.
+
+**Token budget.** `[generation] max_tokens` applies to *every* call, tool turns
+included. That is a correction, not a default: tool turns were originally capped
+separately at 512, and a measured 600-word answer needs ~750 tokens, so long
+answers were silently cut mid-sentence and returned as if complete. Now a
+truncated answer is announced (`answer hit the N-token cap and was cut off`) and
+a tool call cut off at the cap is **not executed** — its arguments are
+incomplete, so the model is told to retry in smaller pieces rather than the
+agent guessing the rest.
 
 ## Safety
 

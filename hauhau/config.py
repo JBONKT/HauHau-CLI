@@ -40,7 +40,6 @@ class GenerationConfig:
     temperature: float = 0.7
     top_p: float = 0.95
     max_tokens: int = 1024
-    tool_max_tokens: int = 512
     think: bool = False
 
 
@@ -72,7 +71,6 @@ class BrainConfig:
     inject_max_chars: int = 1500
     embeddings_url: str = ""
     embeddings_model: str = "embeddinggemma-300m"
-    learn_after_turns: int = 0
 
 
 @dataclass

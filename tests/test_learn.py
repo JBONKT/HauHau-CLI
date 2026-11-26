@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from hauhau.brain import Brain
-from hauhau.brain.learn import Draft, Learner, build_transcript, parse_drafts
+from hauhau.brain.learn import Learner, build_transcript, parse_drafts
 from hauhau.config import Config
 from hauhau.llm import Completion, LLMError
 
@@ -33,10 +33,14 @@ class TestParseDrafts(unittest.TestCase):
         self.assertAlmostEqual(drafts[0].importance, 0.8)
 
     def test_fenced_and_chatty_output(self) -> None:
-        raw = 'Sure!\n```json\n[{"kind":"semantic","text":"The repo lives in ~/hauhau."}]\n```\nHope that helps.'
+        raw = (
+            "Sure!\n```json\n"
+            '[{"kind":"semantic","text":"The repo lives in ~/Documents/HauHau-CLI."}]\n'
+            "```\nHope that helps."
+        )
         drafts = parse_drafts(raw)
         self.assertEqual(len(drafts), 1)
-        self.assertIn("hauhau", drafts[0].text)
+        self.assertIn("HauHau-CLI", drafts[0].text)
 
     def test_empty_array(self) -> None:
         self.assertEqual(parse_drafts("[]"), [])
@@ -98,9 +102,11 @@ class TestLearner(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_distilled_memories_are_stored(self) -> None:
-        client = FakeClient([
-            '[{"kind":"preference","text":"The user wants pytest run with the -x flag here.","tags":"testing","importance":0.8}]'
-        ])
+        payload = (
+            '[{"kind":"preference","text":"The user wants pytest run with the -x flag here.",'
+            '"tags":"testing","importance":0.8}]'
+        )
+        client = FakeClient([payload])
         learner = Learner(self.cfg, client, self.brain)
         drafts, written = learner.distill(self.messages)
         self.assertEqual(len(drafts), 1)

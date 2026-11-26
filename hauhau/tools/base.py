@@ -6,8 +6,9 @@ model through llama.cpp's native ``tools`` parameter - no ReAct text protocol.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from ..util import clip_text
 

@@ -7,19 +7,19 @@ from hauhau.profiler import HardwareProfile, apply_recommendations, recommend
 
 
 def profile(**kwargs) -> HardwareProfile:
-    base = dict(
-        os_name="Darwin",
-        arch="arm64",
-        cpu="Apple M1",
-        cores=8,
-        ram_gb=8.0,
-        gpu="Apple Silicon (Metal)",
-        metal=True,
-        disk_free_gb=100.0,
-        llama_server="/opt/homebrew/bin/llama-server",
-        llama_version="12359",
-        notes=[],
-    )
+    base = {
+        "os_name": "Darwin",
+        "arch": "arm64",
+        "cpu": "Apple M1",
+        "cores": 8,
+        "ram_gb": 8.0,
+        "gpu": "Apple Silicon (Metal)",
+        "metal": True,
+        "disk_free_gb": 100.0,
+        "llama_server": "/opt/homebrew/bin/llama-server",
+        "llama_version": "12359",
+        "notes": [],
+    }
     base.update(kwargs)
     return HardwareProfile(**base)
 

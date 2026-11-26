@@ -14,7 +14,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
-from .llm import LLMError, LlamaClient
+from .llm import LlamaClient, LLMError
 
 
 class ServerManager:
@@ -81,7 +81,9 @@ class ServerManager:
             if client.health():
                 return client
             time.sleep(0.5)
-        raise LLMError(f"llama-server did not become healthy in {self.cfg.model.startup_timeout}s; see {self._log_path}")
+        raise LLMError(
+            f"llama-server did not become healthy in {self.cfg.model.startup_timeout}s; see {self._log_path}"
+        )
 
     def restart(self) -> LlamaClient:
         self.stop()

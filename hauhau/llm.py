@@ -17,8 +17,9 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any
 
 
 class LLMError(RuntimeError):
@@ -80,11 +81,10 @@ class LlamaClient:
         try:
             return urllib.request.urlopen(req, timeout=self.timeout)
         except urllib.error.HTTPError as exc:
-            body = ""
             try:
                 body = exc.read().decode("utf-8", "replace")[:600]
-            except Exception:  # pragma: no cover - best effort
-                pass
+            except (OSError, ValueError):  # pragma: no cover - best effort
+                body = ""
             raise LLMError(f"llama-server HTTP {exc.code} on {req.full_url}: {body}") from exc
         except urllib.error.URLError as exc:
             raise LLMError(
@@ -191,7 +191,7 @@ class LlamaClient:
             if "timings" in event:
                 out.usage.tok_per_second = (event["timings"] or {}).get("predicted_per_second", 0.0)
                 out.usage.prompt_per_second = (event["timings"] or {}).get("prompt_per_second", 0.0)
-            if "usage" in event and event["usage"]:
+            if event.get("usage"):
                 out.usage.prompt_tokens = event["usage"].get("prompt_tokens", out.usage.prompt_tokens)
                 out.usage.completion_tokens = event["usage"].get(
                     "completion_tokens", out.usage.completion_tokens

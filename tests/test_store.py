@@ -88,6 +88,33 @@ class TestSearch(StoreTestCase):
         self.assertTrue(hits)
         self.assertIn("M1", hits[0].text)
 
+    def test_best_match_scores_near_one(self) -> None:
+        # Regression: a symmetric tanh mapped the best hit to 0.5, so /mem showed
+        # a perfect match as 0.50.
+        self.store.write("semantic", "Ruff is the linter and mypy runs separately.")
+        self.store.write("semantic", "The release branch is cut on Fridays.")
+        hits = self.store.search("ruff linter", k=2)
+        self.assertTrue(hits)
+        self.assertGreater(hits[0].score, 0.85, f"best hit scored {hits[0].score:.2f}")
+        self.assertIn("Ruff", hits[0].text)
+
+    def test_scores_never_exceed_one(self) -> None:
+        # Regression: the importance boost could push a score to 1.23, which read
+        # as a bug in /mem. Max importance plus maximum recency must still be <= 1.
+        row_id, _ = self.store.write("semantic", "Everything about the deploy pipeline.", importance=1.0)
+        self.store.db.execute("UPDATE memories SET uses = 20 WHERE id = ?", (row_id,))
+        self.store.db.commit()
+        hits = self.store.search("deploy pipeline", k=1)
+        self.assertTrue(hits)
+        self.assertLessEqual(hits[0].score, 1.0)
+
+    def test_scores_are_monotonic_with_rank(self) -> None:
+        self.store.write("semantic", "deploy script one")
+        self.store.write("semantic", "deploy script two")
+        hits = self.store.search("deploy script", k=5)
+        scores = [h.score for h in hits]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
     def test_no_match_returns_empty(self) -> None:
         self.store.write("semantic", "Postgres runs on port 5432.")
         self.assertEqual(self.store.search("zzzqqq"), [])

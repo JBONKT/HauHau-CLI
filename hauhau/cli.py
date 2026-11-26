@@ -17,7 +17,7 @@ from rich.table import Table
 from rich.text import Text
 
 from . import config as config_mod
-from .agent import Agent, UI
+from .agent import UI, Agent
 from .audit import Audit
 from .brain import Brain
 from .brain.learn import Learner
@@ -238,7 +238,7 @@ class Repl:
         if not drafts:
             self.console.print(Text("nothing durable found", style="dim"))
             return
-        for draft, (row_id, created) in zip(drafts, written):
+        for draft, (row_id, created) in zip(drafts, written, strict=False):
             mark = "new" if created else "merged"
             self.console.print(Text(f"  [{draft.kind}/{mark} #{row_id}] {draft.text}", style="green"), markup=False)
 
@@ -361,7 +361,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, help="max tool steps per turn")
     parser.add_argument("--profile", action="store_true", help="print hardware profile and exit")
     parser.add_argument("--resume", nargs="?", const="last", help="resume the last (or named) session")
-    parser.add_argument("--yolo", action="store_true", help="accepted for compatibility; auto-run is already the default")
+    parser.add_argument(
+        "--yolo", action="store_true", help="accepted for compatibility; auto-run is already the default"
+    )
     return parser
 
 
@@ -452,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.brain.enabled:
         try:
             brain = Brain(cfg, audit)
-        except Exception as exc:  # noqa: BLE001 - memory must never block startup
+        except Exception as exc:  # memory must never block startup
             console.print(Text(f"memory disabled: {exc}", style="yellow"))
 
     def confirm(cmd: str) -> bool:
@@ -465,9 +467,8 @@ def main(argv: list[str] | None = None) -> int:
     registry = build_registry(cfg, audit, brain, confirm if cfg.tools.shell_confirm else None)
     agent = Agent(cfg, client, registry, brain, audit, ui)
     learner = Learner(cfg, client, brain, audit)
-    if args.resume and session_path.exists():
-        if agent.load(session_path):
-            console.print(Text(f"resumed {agent.turn_count()} turns from {session_path.name}", style="dim"))
+    if args.resume and session_path.exists() and agent.load(session_path):
+        console.print(Text(f"resumed {agent.turn_count()} turns from {session_path.name}", style="dim"))
 
     # --- banner --------------------------------------------------------
     stats = brain.stats() if brain else {"total": 0}
@@ -523,7 +524,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         while repl.running:
             try:
-                line = session.prompt("you › ")
+                line = session.prompt("you › ")  # noqa: RUF001 - deliberate prompt glyph
             except KeyboardInterrupt:
                 continue
             except EOFError:

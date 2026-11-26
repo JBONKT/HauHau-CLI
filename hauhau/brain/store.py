@@ -90,7 +90,7 @@ def _unpack(blob: bytes) -> list[float]:
 def _cosine(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
     return dot / (na * nb) if na and nb else 0.0
@@ -223,10 +223,13 @@ class MemoryStore:
             except sqlite3.OperationalError:
                 rows = []
             if rows:
+                # bm25() is negative and lower-is-better. Spread the results
+                # across 0.5..1.0 so the best hit scores 1.0 instead of the 0.5
+                # that a symmetric tanh put it at.
                 best = min(r["rank"] for r in rows)
+                spread = max(1e-6, max(r["rank"] for r in rows) - best)
                 for r in rows:
-                    # bm25() is negative and lower-is-better; flip to a 0..1 scale.
-                    base[int(r["id"])] = math.tanh((best - r["rank"]) * 0.5) * 0.5 + 0.5
+                    base[int(r["id"])] = 1.0 - 0.5 * ((r["rank"] - best) / spread)
 
         if query_embedding:
             for r in self.db.execute("SELECT id, embedding FROM memories WHERE embedding IS NOT NULL"):
@@ -245,7 +248,10 @@ class MemoryStore:
             if kinds and r["kind"] not in kinds:
                 continue
             decay = self._decay(r["created_at"], now)
-            score = base[int(r["id"])] * (0.35 + 0.65 * decay) * (0.75 + 0.5 * r["importance"])
+            # Both factors are <= 1.0, so the score stays within 0..1 and /mem
+            # never shows a "perfect" match as 1.23. Importance nudges the rank
+            # by at most 20%.
+            score = base[int(r["id"])] * (0.35 + 0.65 * decay) * (0.8 + 0.2 * r["importance"])
             hits.append(Hit(int(r["id"]), r["kind"], r["text"], r["tags"], score, r["created_at"], r["uses"]))
 
         hits.sort(key=lambda h: h.score, reverse=True)

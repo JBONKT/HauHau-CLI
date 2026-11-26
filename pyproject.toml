@@ -11,9 +11,19 @@ dependencies = [
 [project.scripts]
 hauhau = "hauhau.cli:main"
 
+[project.optional-dependencies]
+dev = ["ruff>=0.6"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["hauhau*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "PIE", "RUF"]

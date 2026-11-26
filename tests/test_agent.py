@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from hauhau.agent import Agent, UI
+from hauhau.agent import UI, Agent
 from hauhau.config import Config
 from hauhau.llm import Completion, ToolCall, Usage
 from hauhau.tools.base import Registry, Tool, fail, ok
@@ -47,6 +47,20 @@ def make_registry(log: list) -> Registry:
     ])
 
 
+class SpyUI(UI):
+    """Records what the CLI would have shown."""
+
+    def __init__(self) -> None:
+        self.statuses: list[str] = []
+        self.tokens: list[str] = []
+
+    def status(self, text: str) -> None:
+        self.statuses.append(text)
+
+    def token(self, text: str) -> None:
+        self.tokens.append(text)
+
+
 class AgentTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -60,10 +74,10 @@ class AgentTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def make_agent(self, client, **cfg_overrides) -> Agent:
+    def make_agent(self, client, ui=None, **cfg_overrides) -> Agent:
         for key, value in cfg_overrides.items():
             setattr(self.cfg.agent, key, value)
-        return Agent(self.cfg, client, make_registry(self.log), brain=None, ui=UI())
+        return Agent(self.cfg, client, make_registry(self.log), brain=None, ui=ui or UI())
 
 
 class TestToolLoop(AgentTestCase):
@@ -146,6 +160,49 @@ class TestToolLoop(AgentTestCase):
         self.assertEqual(len(client.calls), 3)
         self.assertIsNotNone(client.calls[1]["tools"])
         self.assertIsNone(client.calls[2]["tools"], "final call must withhold tools")
+
+
+class TestTruncation(AgentTestCase):
+    def test_prose_uses_the_configured_max_tokens(self) -> None:
+        client = FakeClient([reply("short")])
+        agent = self.make_agent(client)
+        agent.run_turn("hi")
+        self.assertEqual(client.calls[0]["max_tokens"], self.cfg.generation.max_tokens)
+
+    def test_tool_turn_uses_the_same_budget_as_prose(self) -> None:
+        # Regression: tool turns were capped at 512, which silently truncated
+        # any answer longer than ~400 words mid-sentence.
+        client = FakeClient([tool_call(), reply("done")])
+        agent = self.make_agent(client)
+        agent.run_turn("go")
+        for call in client.calls:
+            self.assertEqual(call["max_tokens"], self.cfg.generation.max_tokens)
+
+    def test_truncated_tool_call_is_not_executed(self) -> None:
+        cut = Completion(
+            tool_calls=[ToolCall(id="c1", name="echo", arguments='{"text":"partial')],
+            finish_reason="length",
+        )
+        client = FakeClient([cut, reply("retried smaller")])
+        agent = self.make_agent(client)
+        agent.run_turn("write a lot")
+        self.assertEqual(self.log, [], "a cut-off call must not run with guessed arguments")
+        self.assertIn("cut off", agent.messages[2]["content"])
+        self.assertIn("NOT run", agent.messages[2]["content"])
+
+    def test_cut_off_answer_is_announced(self) -> None:
+        ui = SpyUI()
+        client = FakeClient([Completion(content="This sentence stops", finish_reason="length")])
+        agent = self.make_agent(client, ui=ui)
+        agent.run_turn("write a long essay")
+        self.assertTrue(any("cut off" in s for s in ui.statuses), ui.statuses)
+        self.assertTrue(any("max_tokens" in s for s in ui.statuses), ui.statuses)
+
+    def test_complete_answer_raises_no_warning(self) -> None:
+        ui = SpyUI()
+        agent = self.make_agent(FakeClient([reply("all done")]), ui=ui)
+        agent.run_turn("hi")
+        self.assertEqual(ui.statuses, [])
 
 
 class TestCompression(AgentTestCase):

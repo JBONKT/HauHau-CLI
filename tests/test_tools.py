@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 import unittest
@@ -125,6 +124,19 @@ class TestFiles(ToolTestCase):
         self.assertIn("line5", result.content)
         self.assertIn("line7", result.content)
         self.assertNotIn("line8", result.content)
+
+    def test_read_offset_past_end_is_an_error(self) -> None:
+        path = self.root / "short.txt"
+        self.run_tool("write_file", path=str(path), content="only\nthree\nlines")
+        result = self.run_tool("read_file", path=str(path), offset=99)
+        self.assertFalse(result.ok)
+        self.assertIn("past the end", result.content)
+        self.assertNotIn("empty file", result.content)
+
+    def test_read_empty_file_says_so(self) -> None:
+        path = self.root / "empty.txt"
+        self.run_tool("write_file", path=str(path), content="")
+        self.assertIn("empty file", self.run_tool("read_file", path=str(path)).content)
 
     def test_edit_replaces_single_occurrence(self) -> None:
         path = self.root / "d.txt"

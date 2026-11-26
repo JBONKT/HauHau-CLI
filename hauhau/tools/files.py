@@ -44,13 +44,19 @@ def build(cfg, audit) -> list[Tool]:
         except OSError as exc:
             return fail(f"read_file: {exc}")
         lines = text.splitlines()
+        if not lines:
+            return ok("(empty file)")
+        if offset >= len(lines):
+            return fail(
+                f"read_file: offset {offset} is past the end of the file ({len(lines)} lines)"
+            )
         chunk = lines[offset : offset + limit] if limit else lines[offset:]
         body = "\n".join(chunk)
         suffix = ""
         if len(chunk) < len(lines) - offset:
             suffix = f"\n...[{len(lines) - offset - len(chunk)} more lines; use offset/limit]..."
         audit.log("read_file", path=str(path), lines=len(chunk))
-        return ok(clip_text(body + suffix, max_chars) or "(empty file)")
+        return ok(clip_text(body + suffix, max_chars))
 
     def write_file(args: dict) -> ToolResult:
         path = _resolve(str(args.get("path") or ""))
