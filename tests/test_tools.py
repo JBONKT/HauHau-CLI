@@ -192,6 +192,27 @@ class TestShell(ToolTestCase):
         for cmd in ("rm -rf /", "echo ok && rm -rf /", "printf 'x'; rm -rf /"):
             self.assertFalse(self.run_tool("shell", cmd=cmd).ok, cmd)
 
+    def test_starting_another_agent_is_refused(self) -> None:
+        # Observed in a live session: the tool ran `hauhau /config` to print a
+        # configuration it could have read as a file, loading a second model.
+        for cmd in (
+            "hauhau /config",
+            "hauhau",
+            ".venv/bin/python -m hauhau",
+            "cd /tmp && hauhau --resume",
+            "uv run hauhau /status",
+        ):
+            result = self.run_tool("shell", cmd=cmd)
+            self.assertFalse(result.ok, cmd)
+            self.assertIn("second copy of this agent", result.content, cmd)
+        denied = [e for e in self.audit.tail(10) if e["event"] == "shell.denied"]
+        self.assertTrue(denied)
+
+    def test_mentioning_the_agent_is_not_starting_it(self) -> None:
+        for cmd in ("echo hauhau", "printf 'hauhau\\n' | wc -l", "python -c 'print(1)'"):
+            result = self.run_tool("shell", cmd=cmd)
+            self.assertTrue(result.ok, f"{cmd}: {result.content}")
+
     def test_output_of_a_background_child_is_flagged_as_incomplete(self) -> None:
         # The shell exits while the child still holds the pipe; reporting a clean
         # exit=0 over the truncated output looks like a success.

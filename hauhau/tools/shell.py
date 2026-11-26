@@ -49,6 +49,11 @@ def _normalise(cmd: str) -> str:
     return re.sub(r"\s+", " ", flat).strip().lower()
 
 
+def _segments(cmd: str) -> list[str]:
+    """The statements a command runs, in order, after normalisation."""
+    return [segment.strip() for segment in re.split(r"&&|\|\||;|\|", _normalise(cmd)) if segment.strip()]
+
+
 def _denylist_hit(cmd: str, patterns: list[str]) -> str | None:
     """Match a pattern at the start of a statement, not anywhere in the line.
 
@@ -57,17 +62,34 @@ def _denylist_hit(cmd: str, patterns: list[str]) -> str | None:
     that would run is ``echo``. Each ``;``/``&&``/``||``/``|``-separated segment
     is therefore matched from its start.
     """
-    segments = [segment.strip() for segment in re.split(r"&&|\|\||;|\|", _normalise(cmd))]
     for pattern in patterns:
-        for segment in segments:
-            if not segment:
-                continue
+        for segment in _segments(cmd):
             try:
                 if re.match(pattern, segment, re.IGNORECASE):
                     return pattern
             except re.error:
                 if segment.startswith(pattern.lower()):
                     return pattern
+    return None
+
+
+# Starting the agent from inside itself loads a second model, a second brain and
+# a second audit writer, and can recurse. Observed twice in one session: the tool
+# ran `hauhau /config` to print a configuration it could have read as a file.
+SELF_SPAWN_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^(?:\S*/)?hauhau(?:\s|$)"),
+    re.compile(r"^(?:\S*/)?python[\d.]*\s+-m\s+hauhau(?:\s|$)"),
+    re.compile(r"^(?:\S*/)?uv\s+run\s+(?:\S*/)?hauhau(?:\s|$)"),
+)
+
+
+def _self_spawn(cmd: str) -> str | None:
+    """The statement that would launch another agent, if there is one."""
+    for segment in _segments(cmd):
+        for pattern in SELF_SPAWN_PATTERNS:
+            if pattern.match(segment):
+                return segment
+    return None
     return None
 
 
@@ -98,6 +120,14 @@ def build(
             audit.log("shell.denied", cmd=cmd, pattern=hit)
             return fail(
                 f"shell: NOT RUN - the command was blocked by denylist pattern {hit!r}."
+            )
+        spawned = _self_spawn(cmd)
+        if spawned:
+            audit.log("shell.denied", cmd=cmd, why="would start another agent")
+            return fail(
+                f"shell: NOT RUN - {spawned!r} starts a second copy of this agent, which "
+                "loads another model and can recurse. Read config.toml with read_file, or "
+                "ask for the slash command in the conversation instead."
             )
         if cfg.tools.shell_confirm:
             if confirm is None:
