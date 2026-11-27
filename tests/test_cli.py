@@ -84,6 +84,13 @@ class TestCommands(ReplTestCase):
         self.repl.handle("/help")
         self.assertIn("/mem", self.text())
         self.assertIn("/learn", self.text())
+        self.assertIn("/version", self.text())
+
+    def test_version_prints_package_version(self) -> None:
+        from hauhau import __version__
+
+        self.repl.handle("/version")
+        self.assertIn(f"hauhau {__version__}", self.text())
 
     def test_unknown_command_says_so(self) -> None:
         self.repl.handle("/nonsense")

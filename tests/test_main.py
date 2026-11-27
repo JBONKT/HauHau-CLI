@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -162,6 +163,26 @@ class TestStartup(MainTestCase):
         code, out = self.run_main(["--profile"])
         self.assertEqual(code, 0)
         self.assertIn("cores", out)
+
+    def test_version_flag_prints_and_exits_without_backend(self) -> None:
+        from hauhau import __version__
+
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "stdout", stdout):
+            code, _out = self.run_main(["--version"])
+        self.assertEqual(code, 0)
+        self.assertIn(f"hauhau {__version__}", stdout.getvalue())
+        self.assertEqual(self.stops, [], "--version must not start llama-server")
+
+    def test_version_short_flag(self) -> None:
+        from hauhau import __version__
+
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "stdout", stdout):
+            code, _out = self.run_main(["-V"])
+        self.assertEqual(code, 0)
+        self.assertIn(f"hauhau {__version__}", stdout.getvalue())
+        self.assertEqual(self.stops, [])
 
     def test_missing_config_is_an_error_not_a_traceback(self) -> None:
         code, out = self.run_main(["--config", str(self.root / "nope.toml")])

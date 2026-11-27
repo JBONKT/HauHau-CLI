@@ -215,6 +215,7 @@ hauhau "what is in my Downloads?"   # one-shot: one turn, then exit
 hauhau --resume last "continue"     # pick up the previous session
 hauhau --resume SESSION_ID          # named session under ~/.hauhau/sessions
 hauhau --plain --profile            # hardware profile + recommended flags
+hauhau --version                    # package version (also -V); no server
 hauhau --think "…"                  # show model reasoning / thinking stream
 hauhau --confirm "…"                # ask before every shell tool call
 hauhau --no-brain "…"               # no persistent memory for this run
@@ -246,6 +247,7 @@ Inside an interactive session, type `/help` for slash commands (`/model`,
 | `--data-dir` | Memory, logs, and sessions directory |
 | `--max-steps` | Max tool steps per turn |
 | `--profile` | Print hardware profile and exit |
+| `--version`, `-V` | Print package version and exit (no server) |
 | `--resume [id]` | Resume last or named session |
 | `--yolo` | Compatibility no-op; auto-run is already default |
 
