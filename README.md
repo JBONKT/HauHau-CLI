@@ -247,15 +247,55 @@ The tuner is model-aware too: `_ctx_options` subtracts the weight file from the
 RAM budget before choosing which context sizes are worth trying, so a 14 GB
 model on a 16 GB machine is no longer offered 32k.
 
-Measured on this machine (M1, 8 GB), one real turn each:
+Measured on this machine (M1 Air, 8 GB) with the [final 8 GB profile](#final-configuration-m1-air-8-gb) below (`n_ctx=8192`, full Metal, `-np 1`):
 
-| Model | Q4 size | tok/s | Notes |
-|---|---|---|---|
-| Gemma-4-E2B (Q4_K_P) | 3.2 GB | 41–45 | the previous default |
-| LFM3-1.7B (Q4_K_M) | 1.0 GB | 38–41 | 256k context with a 1.6 GB KV cache at 128k, so it can run at 32k here where Gemma cannot. Liquid's own model card says it is *not* recommended for agentic multi-step reasoning, and it thinks out loud in the answer — good for chat and journal questions, weaker as the multi-step agent brain. |
+| Model | Q4 size | gen tok/s | `/eval` | Notes |
+|---|---|---|---|---|
+| Gemma-4-E2B (Q4_K_P) | 3.2 GB | ~26 | 13/14 (93%) | **default agent brain** — multi-step tools hold under load |
+| LFM3-1.7B (Q4_K_M) | 1.0 GB | ~36 | 8/12 (67%) | faster chat; weaker tool routing. Liquid's card says it is *not* recommended for agentic multi-step reasoning |
 
 Judge a swap with `/eval`, not by feel: it scores tool choice, and a 2-point drop
 there is a regression no matter how pleasant the prose reads.
+
+## Final configuration (M1 Air, 8 GB)
+
+`config.toml` is tuned for this box. The profiler (`hauhau --plain --profile`)
+now recommends the same shape of settings for any ≤8 GB Apple Silicon machine:
+8k context, half the cores for threads, full Metal offload, one server slot,
+flash attention on, and SSD weight streaming when the GGUF is a large share of
+RAM.
+
+| Key | Value | Why |
+|---|---|---|
+| `model.n_ctx` | `8192` | 16k + 3.2 GB weights thrashed swap; 8k keeps KV small |
+| `model.n_threads` | `4` | 8 logical cores; leave headroom for the client/OS |
+| `model.n_gpu_layers` | `99` | full Metal is faster than partial (`-8`) here |
+| `model.extra_args` | `["-lm", "none", "-fa", "on", "-np", "1"]` | stream weights; FA prefill; **one slot** (auto parallel opened 4× KV) |
+| `generation.max_tokens` | `768` | shorter answers on a tight budget |
+| `agent.max_steps` | `10` | fewer thrashing tool loops |
+| `agent.context_budget_tokens` | `4000` | must stay ≤ `n_ctx/2` so `/tune`'s `ctx_floor` does not force 10k+ |
+| `agent.keep_recent_turns` | `4` | smaller rolling history |
+| `tools.max_output_chars` | `4000` | tool dumps must fit the 8k window |
+| `brain.inject_max_chars` | `1200` | faster prompt; `top_k` stays 5 |
+
+**Do not** enable KV-cache q8 (`-ctk q8_0 -ctv q8_0`) on this hardware: gen
+speed roughly halved in `/tune` trials. `--cache-reuse` is refused by the
+current `llama-server` build and is discarded by the tuner.
+
+Load integration (unit suite + live multi-turn, 2026-11-27) held **~26 tok/s**
+through a 6-turn agent session (max ~2.6 s/turn), `/eval` 13/14, long-context
+tool turn OK, and a clean server shutdown. Expect swap growth under the 3.2 GB
+model on 8 GB unified memory; that is normal if free RAM dips while wired stays
+around 3 GB.
+
+After editing `extra_args` or context size, restart so a leftover server does
+not keep old flags:
+
+```bash
+pkill -x llama-server
+hauhau --plain --profile   # confirm recommendations
+hauhau --plain             # then /status, /eval, /tune
+```
 
 ## The second-brain journal
 
@@ -796,7 +836,9 @@ signal. Tasks whose tools are missing (brain off → `rag_*`) are dropped.
 **`/tune [trials]` — the hill-climb.** Each key is climbed separately, with its
 own baseline and its own yardstick: `model.*` keys need a backend restart and
 are scored on generation tok/s, `brain.*` keys only change the prompt and are
-scored on prompt tok/s. What it can try, all hardware-aware:
+scored on prompt tok/s. Bare `/tune` (no argument) uses a **hardware-aware
+default trial budget**: 12 per key on ≤8 GB, 8 on ≤16 GB, otherwise 6 (the old
+fixed 4 never reached flag groups on this machine). Pass an integer to override.
 
 | key | candidates |
 |---|---|
@@ -808,21 +850,23 @@ scored on prompt tok/s. What it can try, all hardware-aware:
 
 The flag bundles are the llama.cpp knobs that change speed or memory without
 changing output, each verified against `llama-server --help`: `-fa on|off`
-(flash attention), `-lm none` / `-lm dio` (stream the model from SSD instead of
-mmap — offered when RAM is tight), `-ctk q8_0 -ctv q8_0` (quantized KV cache),
-`--cache-reuse 256` (reuse KV chunks across turns), `--context-shift`
-(auto-compact a full context instead of failing), `-cram` (KV cache cap, scaled
-by RAM) and `-ub 1024` (physical batch, big machines only). `set_value()` only
-accepts tokens from that registry plus whatever you put in `extra_args`
-yourself, so the tuner cannot smuggle in `--host` or a different model path.
+(flash attention), `-np 1` (single server slot — auto parallel multiplies KV;
+`-np 2` only offered on ≥16 GB), `-lm none` / `-lm dio` (stream the model from
+SSD instead of mmap — offered when RAM is tight), `-ctk q8_0 -ctv q8_0`
+(quantized KV cache), `--cache-reuse 256` (reuse KV chunks across turns),
+`--context-shift` (auto-compact a full context instead of failing), `-cram` (KV
+cache cap, scaled by RAM) and `-ub 1024` (physical batch, big machines only).
+`set_value()` only accepts tokens from that registry plus whatever you put in
+`extra_args` yourself, so the tuner cannot smuggle in `--host` or a different
+model path.
 
-A value is adopted only if it beats the best by 2 %. On this machine the honest
-answer was *nothing*: 29.5 and 29.9 tok/s against a 29.7 baseline is noise, so
-the config was left alone. Adopted values are snapshotted and written to
-`config.toml`, and every trial is appended to `evolve/tuning.jsonl`. Saving
-edits the file's values in place, so the comments that explain why each one is
-set the way it is survive an adoption — regenerating the file from the
-dataclasses silently deleted them once.
+A value is adopted only if it beats the best by 2 %. On this machine, after the
+8 GB profile above was applied by hand, further `/tune` trials were mostly
+noise around ~26 tok/s, so nothing else was adopted. Adopted values are
+snapshotted and written to `config.toml`, and every trial is appended to
+`evolve/tuning.jsonl`. Saving edits the file's values in place, so the comments
+that explain why each one is set the way it is survive an adoption —
+regenerating the file from the dataclasses silently deleted them once.
 
 **`/evolve` — the prompt rewrite, gated.** Seeds `v1` with the current prompt,
 scores it, then asks the model for up to three rewrites at rising temperature
