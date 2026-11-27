@@ -22,6 +22,26 @@ post-session self-learning, a behavioural eval suite, a bounded parameter
 hill-climb and gated prompt self-evolution. Soak testing is not built — see
 [Auto-tuning and self-evolution](#auto-tuning-and-self-evolution).
 
+### M1 Air 8 GB profile (2026-11-27) — complete
+
+Hardware-specific runtime work for this machine is **done and on `main`**
+([PR #1](https://github.com/JBONKT/HauHau-CLI/pull/1)):
+
+| Gate | Result |
+|---|---|
+| Unit suite | 810 tests OK |
+| Live load integration | 16/16 checks (multi-turn tools, long context, clean shutdown) |
+| Final perf benchmark | ~26 tok/s warm gen, burst σ ≈ 0.2, `/eval` ≥ 92%, `n_slots=1` |
+| Shipped config | 8k ctx · 4 threads · full Metal · `-lm none -fa on -np 1` |
+
+Gains vs the prior 16k / 8-thread / 4-slot setup are mainly **stability and RAM
+layout**, not a large decode-speed jump (still ~26 tok/s on a 3.2 GB GGUF in
+8 GB unified memory). Details: [Final configuration (M1 Air, 8 GB)](#final-configuration-m1-air-8-gb).
+
+Release snapshots of this tree (source only, no `.venv` / weights) live under
+`~/Documents/HauHau-archives/` when produced with the archive steps in
+[Development](#development).
+
 ### Verified end to end
 
 Exercised against the live model on this machine, not just unit-tested:
@@ -31,7 +51,9 @@ multi-step tool turns; cross-session recall; distillation, merging and
 next turn works); `/perf`; `--resume last` and an explicit session id; `--think`;
 `--no-brain`; `--no-server` and a missing model file (clear errors, no
 traceback); piped output (answer only on stdout); and the agent starting and
-stopping its own server.
+stopping its own server. Load integration and the final performance benchmark
+(2026-11-27) reconfirm gen stability and agent tool behaviour under sequential
+pressure.
 
 The full-screen interface is verified in a terminal emulator, not by eye:
 `scripts/screen_ui_check.py` starts a stub llama-server, runs the CLI in a pty,
@@ -284,9 +306,11 @@ current `llama-server` build and is discarded by the tuner.
 
 Load integration (unit suite + live multi-turn, 2026-11-27) held **~26 tok/s**
 through a 6-turn agent session (max ~2.6 s/turn), `/eval` 13/14, long-context
-tool turn OK, and a clean server shutdown. Expect swap growth under the 3.2 GB
-model on 8 GB unified memory; that is normal if free RAM dips while wired stays
-around 3 GB.
+tool turn OK, and a clean server shutdown. Final performance benchmark the same
+day: warm gen **26.2 tok/s**, burst median **26.1** (σ ≈ 0.2), `/eval` 11/12
+(92%), boot ~2.6 s, `n_slots=1`. Expect swap growth under the 3.2 GB model on
+8 GB unified memory; that is normal if free RAM dips while wired stays around
+3 GB.
 
 After editing `extra_args` or context size, restart so a leftover server does
 not keep old flags:
