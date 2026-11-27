@@ -355,17 +355,24 @@ def candidates(
 def _extra_arg_candidates(cfg, seen: list, ram_gb: float = 0.0, has_gpu: bool = False) -> list[Candidate]:
     """Flag bundles worth trying, on top of whatever the user already passes."""
     current = list(cfg.model.extra_args)
-    # The user's own tokens are never bundle tokens; keep them untouched.
-    base = [item for item in current if item not in _ALL_BUNDLE_TOKENS]
+    # The user's own tokens are never bundle tokens; keep them untouched. A
+    # bundle token is dropped together with its value, or "-ub 512" lost its flag
+    # and the candidate carried a bare "512" that set_value happily accepted.
+    base: list[str] = []
+    index = 0
+    while index < len(current):
+        token = current[index]
+        index += 1
+        if token not in _ALL_BUNDLE_TOKENS:
+            base.append(token)
+            continue
+        if index < len(current) and not current[index].startswith("-"):
+            index += 1  # the value of the token just dropped
     # Drop any bundle family already present so candidates are alternatives,
     # not stacks: `-fa on -fa off` would be a broken command line.
     present_families = {
         bundle.family for bundle in FLAG_BUNDLES if any(tok in current for tok in bundle.tokens)
     }
-    base = [
-        item for item in base
-        if not any(item in bundle.tokens and bundle.family in present_families for bundle in FLAG_BUNDLES)
-    ]
     out: list[Candidate] = []
     for bundle in FLAG_BUNDLES:
         if not bundle.when(ram_gb, has_gpu):

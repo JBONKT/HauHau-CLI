@@ -320,6 +320,56 @@ class TestEvolveCommands(ReplTestCase):
         self.assertIn("benchmark failed", self.text())
 
 
+class TestSkillsCommand(ReplTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        import hauhau.skills as skills_mod
+
+        self.skills_mod = skills_mod
+        self.skill = skills_mod.Skill(
+            "demo", "a demo skill", "# demo\n\nstep one", self.root / "skills" / "demo" / "SKILL.md"
+        )
+
+    def test_no_skills_says_where_to_put_them(self) -> None:
+        self.repl.handle("/skills")
+        self.assertIn("no skills installed", self.text())
+        self.assertIn("/skills reload", self.text())
+
+    def test_lists_names_and_descriptions(self) -> None:
+        self.repl.skills = [self.skill]
+        self.repl.handle("/skills")
+        self.assertIn("demo", self.text())
+        self.assertIn("a demo skill", self.text())
+
+    def test_one_skill_shows_the_body(self) -> None:
+        self.repl.skills = [self.skill]
+        self.repl.handle("/skills demo")
+        self.assertIn("step one", self.text())
+
+    def test_a_mistyped_name_is_guessed(self) -> None:
+        self.repl.skills = [self.skill]
+        self.repl.handle("/skills dem")
+        self.assertIn("did you mean /skills demo", self.text())
+
+    def test_reload_picks_up_a_new_folder(self) -> None:
+        folder = self.cfg.data_dir / "skills" / "fresh"
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(
+            "---\nname: fresh\ndescription: arrived while running\n---\nbody\n", encoding="utf-8"
+        )
+        self.repl.handle("/skills reload")
+        names = [s.name for s in self.repl.skills]
+        self.assertIn("fresh", names, "a folder added while running is picked up")
+        self.assertEqual([s.name for s in self.agent.skills], names, "the prompt sees it too")
+        self.assertRegex(self.text(), r"added .*\bfresh\b")
+
+    def test_reload_reports_removed_skills(self) -> None:
+        self.repl.skills = [self.skill]
+        self.repl.handle("/skills reload")
+        self.assertNotIn("demo", [s.name for s in self.repl.skills])
+        self.assertIn("removed demo", self.text())
+
+
 class TestInterfaceCommands(ReplTestCase):
     def test_status_shows_the_essentials_on_one_screen(self) -> None:
         self.repl.handle("/status")

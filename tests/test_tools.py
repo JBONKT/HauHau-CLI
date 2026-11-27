@@ -10,6 +10,7 @@ from hauhau.audit import Audit
 from hauhau.brain import Brain
 from hauhau.config import Config
 from hauhau.tools import build_registry
+from hauhau.tools.base import Registry, Tool, ok
 
 
 class ToolTestCase(unittest.TestCase):
@@ -139,6 +140,38 @@ class TestMemoryTools(unittest.TestCase):
         result = self.run_tool("rag_query", query="build", k=-1)
         self.assertFalse(result.ok)
         self.assertIn("'k'", result.content)
+
+
+class TestSchemaIsCompact(unittest.TestCase):
+    """Every tool schema is prompt: it is sent on each step of every turn."""
+
+    def test_empty_values_are_dropped(self) -> None:
+        tool = Tool(
+            "x",
+            "does x",
+            {
+                "type": "object",
+                "properties": {"a": {"type": "string", "description": ""}, "b": {"type": "string"}},
+                "required": [],
+            },
+            lambda args: ok("x"),
+        )
+        params = tool.schema()["function"]["parameters"]
+        self.assertEqual(params["properties"]["a"], {"type": "string"})
+        self.assertNotIn("required", params)
+
+    def test_a_multiline_description_is_one_line(self) -> None:
+        tool = Tool("x", "first line\n  second line", {"type": "object", "properties": {}}, lambda a: ok("x"))
+        self.assertEqual(tool.schema()["function"]["description"], "first line second line")
+
+    def test_the_real_registry_is_under_budget(self) -> None:
+        # A guard, not a style rule: the whole reason to trim descriptions is that
+        # prefill time on this machine is linear in these characters.
+        registry = Registry([
+            Tool(name, "d" * 40, {"type": "object", "properties": {}}, lambda a: ok("x"))
+            for name in ("a", "b")
+        ])
+        self.assertLess(len(str(registry.schemas())), 400)
 
 
 class TestShell(ToolTestCase):
@@ -313,6 +346,18 @@ class TestFiles(ToolTestCase):
         result = self.run_tool("read_file", path=str(path))
         self.assertTrue(result.ok)
         self.assertIn("two", result.content)
+
+    def test_a_relative_path_means_the_workspace(self) -> None:
+        # shell/grep run in the workspace and the prompt names it, so read_file
+        # with a bare name must not read from the process CWD.
+        (self.root / "notes.txt").write_text("workspace copy\n", encoding="utf-8")
+        result = self.run_tool("read_file", path="notes.txt")
+        self.assertTrue(result.ok, result.content)
+        self.assertIn("workspace copy", result.content)
+
+    def test_a_relative_write_lands_in_the_workspace(self) -> None:
+        self.assertTrue(self.run_tool("write_file", path="made.txt", content="x").ok)
+        self.assertTrue((self.root / "made.txt").exists())
 
     def test_write_creates_parents(self) -> None:
         path = self.root / "deep" / "nested" / "b.txt"
@@ -589,6 +634,41 @@ class TestRegistryShape(ToolTestCase):
         tool = self.registry.get("shell")
         with self.assertRaises(ValueError):
             self.registry.add(Tool(tool.name, "dup", {}, lambda a: None))
+
+
+class TestShellStatementSplitting(unittest.TestCase):
+    """A second line of a pasted script is a statement of its own."""
+
+    def test_a_newline_separates_statements(self) -> None:
+        from hauhau.tools.shell import _segments, _self_spawn
+
+        self.assertEqual(_segments("echo hi\nrm -rf /tmp/x"), ["echo hi", "rm -rf /tmp/x"])
+        self.assertIsNotNone(_self_spawn("echo hi\nhauhau /config"))
+
+    def test_a_denylisted_second_line_is_caught(self) -> None:
+        from hauhau.tools.shell import _denylist_hit
+
+        self.assertEqual(_denylist_hit("echo ok\nrm -rf /", [r"rm\s+-rf"]), r"rm\s+-rf")
+
+    def test_quoted_text_is_still_not_a_statement(self) -> None:
+        from hauhau.tools.shell import _denylist_hit
+
+        self.assertIsNone(_denylist_hit('echo "rm -rf / is what the docs warn about"', [r"rm\s+-rf"]))
+
+
+class TestIntegerArguments(unittest.TestCase):
+    def test_a_digit_looking_string_that_int_rejects_is_a_bad_argument(self) -> None:
+        from hauhau.tools.args import BadArgument, integer
+
+        for raw in ("--5", "\u00b2"):
+            with self.assertRaises(BadArgument) as caught:
+                integer({"n": raw}, "n", 1)
+            self.assertIn("integer", str(caught.exception))
+
+    def test_a_numeric_string_is_accepted(self) -> None:
+        from hauhau.tools.args import integer
+
+        self.assertEqual(integer({"n": " 7 "}, "n", 1), 7)
 
 
 if __name__ == "__main__":

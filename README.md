@@ -41,36 +41,85 @@ chrome pinned to the bottom, a long transcript scrolled inside a fixed frame,
 `SIGWINCH` resize to 14×50 re-wrapping the text. It needs `pyte`
 (`.venv/bin/pip install pyte`) and exits non-zero on a failure.
 
-## Setup (macOS)
+## Installation
 
-Prerequisites, both from Homebrew:
+Works on macOS and Linux. You need a local GGUF on disk; nothing is downloaded at
+install or runtime.
+
+### Prerequisites
+
+| Requirement | Notes |
+|---|---|
+| Python 3.11+ | `python3` on `PATH`. On macOS: `brew install python`. |
+| `llama-server` | From [llama.cpp](https://github.com/ggerganov/llama.cpp). On macOS: `brew install llama.cpp`. Or set `[model] llama_server` in `config.toml` to an absolute path. |
+| A `.gguf` model | Path in `config.toml` under `[model] gguf`, or override with `HAUHAU_GGUF` / `--model`. |
 
 ```bash
-brew install python llama.cpp      # python 3.11+, llama-server on PATH
+# macOS example
+brew install python llama.cpp
 ```
 
-Then one command, which is safe to re-run after a pull or a Python upgrade:
+### One-command setup
+
+From the repo root (safe to re-run after a pull or a Python upgrade):
 
 ```bash
 ./scripts/setup.sh
 ```
 
-It verifies Python and `llama-server`, checks the model file exists, builds
-`.venv`, installs the package, creates `~/.hauhau`, and drops a launcher at
-`~/.local/bin/hauhau` that works from any directory. It prints what it found and
-fails loudly rather than half-installing.
+What it does:
+
+1. Checks Python ≥ 3.11 and that `llama-server` is on `PATH`
+2. Confirms the GGUF path in `config.toml` exists (lists nearby candidates if not)
+3. Creates `.venv` if missing and upgrades `pip`
+4. Installs the package editable with extras: `pip install -e '.[dev,tui]'`
+5. Creates `~/.hauhau/{logs,brain,sessions}`
+6. Writes `~/.local/bin/hauhau` → `.venv/bin/python -m hauhau --config <repo>/config.toml`
+7. Smoke-tests that the launcher runs from another directory (`hauhau --profile`)
+
+Optional environment overrides for the script:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PYTHON` | `python3` | Interpreter used to build the venv |
+| `LAUNCHER_DIR` | `~/.local/bin` | Where the `hauhau` shim is written |
+
+If setup prints that `~/.local/bin` is not on `PATH`:
 
 ```bash
-hauhau                              # interactive
-hauhau "what is in my Downloads?"   # one-shot
-hauhau --resume last "continue"     # pick up the previous session
-hauhau --profile                    # what hardware the tuner sees
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+### Manual install (without the script)
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -U pip
+.venv/bin/pip install -e '.[dev,tui]'   # drop ,tui if you do not want Textual
+.venv/bin/python -m hauhau --help
+```
+
+Core dependencies are `rich` and `prompt_toolkit`. The dashboard needs the `tui`
+extra (`textual`). Dev linting uses the `dev` extra (`ruff`).
+
+### Verify the install
+
+```bash
+# Same check as setup.sh (exit 0 = launcher + import + config load OK)
+cd /tmp && hauhau --profile >/dev/null
+
+# Print hardware probe and recommended server flags (use --plain so tables
+# show in non-fullscreen / scripted terminals)
+hauhau --plain --profile
+
+# One-shot turn against the live model (starts llama-server, stops on exit)
+hauhau --plain "Reply with exactly: hauhau-ok"
 ```
 
 **The model.** `config.toml` points `[model] gguf` at a local GGUF (currently
-`~/modeller/gguf/Gemma-4-E2B-…-Q4_K_P.gguf`, 3.2 GB). Any Gemma-4-E2B GGUF works;
-put it anywhere, update that line, or set `HAUHAU_GGUF`. Nothing is downloaded at
-runtime.
+`~/modeller/gguf/Gemma-4-E2B-…-Q4_K_P.gguf`, ~3.2 GB). Any compatible GGUF works;
+put it anywhere, update that line, or set `HAUHAU_GGUF` / pass `--model`.
 
 Every value in `config.toml` is type-checked on load: a typo such as
 `extra_args = "not-a-list"` (which used to be spliced into the server command
@@ -91,7 +140,80 @@ handle is closed on every `stop()`; otherwise each attempt leaked a process or a
 descriptor.
 
 Runtime state — memory, audit log, sessions, snapshots, server log — lives in
-`~/.hauhau`, never in the repo.
+`~/.hauhau` by default (`--data-dir` to override), never in the repo.
+
+## Usage
+
+### Everyday commands
+
+```bash
+hauhau                              # interactive (full-screen UI on a real tty)
+hauhau --plain                      # streaming UI (also used when piped / TERM=dumb)
+hauhau --tui                        # Textual dashboard (needs hauhau[tui])
+hauhau "what is in my Downloads?"   # one-shot: one turn, then exit
+hauhau --resume last "continue"     # pick up the previous session
+hauhau --resume SESSION_ID          # named session under ~/.hauhau/sessions
+hauhau --plain --profile            # hardware profile + recommended flags
+hauhau --think "…"                  # show model reasoning / thinking stream
+hauhau --confirm "…"                # ask before every shell tool call
+hauhau --no-brain "…"               # no persistent memory for this run
+hauhau --model /path/to/model.gguf  # override GGUF for this run
+hauhau --config /path/config.toml   # alternate config
+hauhau --server-url http://127.0.0.1:8080   # attach to an existing llama-server
+hauhau --no-server                  # never spawn llama-server ourselves
+hauhau --data-dir ~/alt-hauhau      # alternate runtime directory
+hauhau --max-steps 12               # cap tool steps per turn
+```
+
+Inside an interactive session, type `/help` for slash commands (`/model`,
+`/status`, `/mem`, `/eval`, `/tune`, `/sync`, …). See [Slash commands](#slash-commands).
+
+### CLI reference
+
+| Flag | Purpose |
+|---|---|
+| `prompt …` | Positional: run a single turn and exit |
+| `--config` | Path to `config.toml` |
+| `--model` | Path to a `.gguf` (overrides config) |
+| `--server-url` | Reuse an existing `llama-server` |
+| `--no-server` | Never start `llama-server` |
+| `--plain` | Stream interface instead of full-screen |
+| `--tui` | Widget dashboard instead of full-screen frame |
+| `--no-brain` | Disable persistent memory |
+| `--confirm` | Confirm before every shell command |
+| `--think` | Enable the model’s reasoning output |
+| `--data-dir` | Memory, logs, and sessions directory |
+| `--max-steps` | Max tool steps per turn |
+| `--profile` | Print hardware profile and exit |
+| `--resume [id]` | Resume last or named session |
+| `--yolo` | Compatibility no-op; auto-run is already default |
+
+### Interfaces
+
+| Mode | When | Built with |
+|---|---|---|
+| Full screen (default) | Real tty, not `--plain`/`--tui` | `prompt_toolkit` fixed frame |
+| Stream (`--plain`) | Flag, pipe, or `TERM=dumb` | `rich` line-oriented |
+| Dashboard (`--tui`) | Explicit flag | `textual` (optional extra) |
+
+For scripts and CI, prefer `--plain` so output is ordinary stdout. Bare
+`--profile` can look empty when a full-screen console is selected without a live
+app loop; `hauhau --plain --profile` always prints the table.
+
+### Quick functional checks
+
+```bash
+# Core path: load model, answer, exit
+hauhau --plain "Reply with exactly: hauhau-ok"
+
+# Reasoning path
+hauhau --plain --think "A bat and a ball cost \$1.10. The bat costs \$1.00 more than the ball. How much is the ball?"
+
+# Tool path (needs shell tool allowed by config)
+hauhau --plain "how much free disk is on / ? Use the shell if needed."
+```
+
+The first real turn starts `llama-server`; it stops when the process exits.
 
 ## Choosing a model
 
@@ -402,7 +524,7 @@ and all.
 
 ```bash
 .venv/bin/ruff check hauhau tests scripts              # clean
-.venv/bin/python -m unittest discover -s tests -t .    # 735 tests
+.venv/bin/python -m unittest discover -s tests -t .    # 760 tests
 .venv/bin/python scripts/screen_ui_check.py            # 10 layout checks, real pty
 .venv/bin/python scripts/tui_check.py                  # 18 dashboard checks, real pty
 ```
@@ -557,10 +679,32 @@ first name wins, so dropping a folder into `~/.hauhau/skills/` overrides a
 built-in.
 
 Only each skill's name and description live in the system prompt (progressive
-disclosure, ~30 tokens per skill). The model pulls the full procedure on demand
-with the `skill` tool, and scripts bundled in the folder run through the ordinary
-`shell` tool so only their output enters the conversation. `/skills` lists what
-is installed; a broken `SKILL.md` is a warning at startup, never a failure.
+disclosure, ~30 tokens per skill; a description is clipped to one 180-character
+line and the list is capped, so fifty installed skills cannot crowd out the
+conversation). The model pulls the full procedure on demand with the `skill`
+tool, and scripts bundled in the folder run through the ordinary `shell` tool so
+only their output enters the conversation.
+
+Getting the model to actually *use* one is the hard part, so three things point
+at it:
+
+- the prompt block says so in the imperative — load the skill *before* acting,
+  because the written procedure beats improvising;
+- a tool that fails names the skill that documents it: `allowed-tools` in the
+  frontmatter is how a skill says which tool it is for, and `ui` failing on a
+  dialog now ends with "installed skill 'dialog-handler' has the procedure for
+  this — load it with the skill tool before retrying" (one live run went from
+  three blind `ui` attempts to loading the skill after the first failure);
+- a mistyped name gets the closest match, and a skill dropped into
+  `~/.hauhau/skills/` while the app is running is found on the next call: the
+  tool re-scans once on a miss, so no restart is needed.
+
+`/skills` lists what is installed (with each skill's tools and folder),
+`/skills <name>` shows one procedure, `/skills reload` re-scans the folders and
+reports what appeared or disappeared. A broken `SKILL.md` is a warning at
+startup, never a failure, and a frontmatter written for another agent still
+loads: `>`/`|` block scalars, CRLF, a BOM and `allowed-tools` in three spellings
+are all accepted.
 
 | skill | does |
 |---|---|

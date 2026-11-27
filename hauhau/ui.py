@@ -73,7 +73,7 @@ COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         [
             ("/tools", "tools the model can call"),
             ("/show", "the last tool output in full: /show, /show 2"),
-            ("/skills", "installed skills, and where each one lives"),
+            ("/skills", "installed skills: list, show one, or reload the folders"),
         ],
     ),
     (
@@ -489,7 +489,9 @@ def kv_table(console: Console, title: str, rows: list[tuple[str, str]]) -> None:
     table.add_column(style=MUTED, no_wrap=True)
     table.add_column(overflow="fold")
     for key, value in rows:
-        table.add_row(key, value)
+        # Plain strings go through Rich's markup parser, so a journal hit called
+        # "Re: [urgent] thing" rendered as "Re: thing".
+        table.add_row(Text(str(key)), Text(str(value)))
     console.print(table)
 
 
@@ -507,7 +509,7 @@ def data_table(
     for index, column in enumerate(columns):
         table.add_column(column, no_wrap=index < no_wrap, overflow="fold")
     for row in rows:
-        table.add_row(*row)
+        table.add_row(*[Text(str(cell)) for cell in row])
     console.print(table)
 
 

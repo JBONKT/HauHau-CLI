@@ -70,10 +70,9 @@ def build(cfg, audit, brain) -> list[Tool]:
         Tool(
             name="note_lesson",
             description=(
-                "Record a procedure the moment you work it out - the command that finally "
-                "succeeded, the file that held the answer, the order things must be done in. "
-                "Use it when you had to look something up or try twice; the next attempt then "
-                "costs one rag_query."
+                "Record a procedure the moment you work it out: the command that finally "
+                "succeeded, the file that held the answer. Use it after looking something up or "
+                "trying twice, so the next attempt costs one rag_query."
             ),
             parameters={
                 "type": "object",
@@ -91,8 +90,8 @@ def build(cfg, audit, brain) -> list[Tool]:
         Tool(
             name="rag_write",
             description=(
-                "Store something worth remembering permanently: a user preference, a fact about the "
-                "machine or project, or a procedure that worked. Deduplicated automatically."
+                "Store a durable fact: a user preference, something about this machine or project, "
+                "or a procedure that worked. Deduplicated automatically."
             ),
             parameters={
                 "type": "object",
@@ -112,7 +111,7 @@ def build(cfg, audit, brain) -> list[Tool]:
         ),
         Tool(
             name="rag_query",
-            description="Search your persistent memory for relevant past facts, preferences and procedures.",
+            description="Search your memory for past facts, preferences and procedures.",
             parameters={
                 "type": "object",
                 "properties": {

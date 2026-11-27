@@ -248,6 +248,10 @@ class _Router(io.TextIOBase):
         self.pending = ""
 
     def write(self, text: str) -> int:
+        if "\r" in text:
+            # A rich Live/Status frame (spinner redraw). Transient: each one used
+            # to become a line in the chat window.
+            return len(text)
         self.pending += text
         while "\n" in self.pending:
             line, self.pending = self.pending.split("\n", 1)
@@ -255,7 +259,7 @@ class _Router(io.TextIOBase):
         return len(text)
 
     def flush(self) -> None:
-        if self.pending:
+        if self.pending and "\r" not in self.pending:
             line, self.pending = self.pending, ""
             self.ui.append_ansi(line)
 

@@ -343,5 +343,18 @@ class TestExpandedTunables(unittest.TestCase):
 
 
 
+class TestExtraArgCandidates(unittest.TestCase):
+    def test_a_flag_keeps_its_value_out_of_the_candidate(self) -> None:
+        from hauhau.evolve.tune import _extra_arg_candidates
+
+        cfg = Config()
+        cfg.model.extra_args = ["-ub", "512", "--no-warmup"]
+        candidates = _extra_arg_candidates(cfg, seen=[list(cfg.model.extra_args)], ram_gb=8.0)
+        self.assertTrue(candidates, "there is something to try")
+        for candidate in candidates:
+            self.assertNotIn("512", candidate.value, "a bare value is not an argument")
+            self.assertIn("--no-warmup", candidate.value, "the user's own flags are kept")
+
+
 if __name__ == "__main__":
     unittest.main()

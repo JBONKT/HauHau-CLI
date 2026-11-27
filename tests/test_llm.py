@@ -189,6 +189,43 @@ class ToolCallArguments(unittest.TestCase):
         with self.assertRaises(LLMError):
             ToolCall("1", "shell", "[1,2]").parsed()
 
+class TestHostileStream(unittest.TestCase):
+    """A 200 that is not a stream must fail, not end the turn with no answer."""
+
+    def setUp(self) -> None:
+        self.client = LlamaClient("http://127.0.0.1:9")
+
+    def test_an_html_error_page_raises(self) -> None:
+        with self.assertRaises(LLMError) as caught:
+            self.client._parse_stream(FakeResponse([b"<html>proxy error</html>\n"]), None, None)
+        self.assertIn("no stream", str(caught.exception))
+
+    def test_a_json_error_body_raises(self) -> None:
+        with self.assertRaises(LLMError):
+            self.client._parse_stream(FakeResponse([b'{"error":"nope"}\n']), None, None)
+
+    def test_an_empty_stream_is_not_an_error(self) -> None:
+        self.assertEqual(self.client._parse_stream(FakeResponse([b"\n"]), None, None).content, "")
+
+    def test_a_null_usage_does_not_store_none(self) -> None:
+        result = self.client._parse_stream(
+            FakeResponse(sse({"choices": [], "usage": {"prompt_tokens": None, "completion_tokens": None}})),
+            None,
+            None,
+        )
+        self.assertEqual((result.usage.prompt_tokens, result.usage.completion_tokens), (0, 0))
+        self.assertIsInstance(result.usage.prompt_tokens, int)
+
+
+class TestBadServerUrl(unittest.TestCase):
+    def test_a_non_numeric_port_raises_llmerror_not_invalidurl(self) -> None:
+        client = LlamaClient("http://127.0.0.1:notaport")
+        with self.assertRaises(LLMError) as caught:
+            client.chat([{"role": "user", "content": "hej"}])
+        self.assertIn("server_url", str(caught.exception))
+        self.assertFalse(client.health(), "a broken URL is not a healthy backend")
+
+
 
 if __name__ == "__main__":
     unittest.main()

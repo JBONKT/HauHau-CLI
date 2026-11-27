@@ -569,6 +569,35 @@ class TestStoreHardening(StoreTestCase):
         finally:
             store.close()
         self.store = MemoryStore(self.db)
+    def test_a_table_from_before_the_extra_columns_is_repaired(self) -> None:
+        # The CREATE INDEX inside SCHEMA raised "no such column" on this shape and
+        # aborted the script before the migration could add the columns, so the
+        # store never recovered.
+        import sqlite3
+
+        legacy = Path(self._tmp.name) / "ancient.db"
+        db = sqlite3.connect(legacy)
+        db.executescript(
+            "CREATE TABLE memories (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,"
+            " text TEXT NOT NULL, created_at REAL NOT NULL, last_used_at REAL NOT NULL);"
+        )
+        db.execute(
+            "INSERT INTO memories (kind, text, created_at, last_used_at) VALUES ('semantic', 'ancient fact', ?, ?)",
+            (time.time(), time.time()),
+        )
+        db.commit()
+        db.close()
+
+        store = MemoryStore(legacy)
+        try:
+            self.assertEqual(store.stats()["total"], 1)
+            self.assertEqual([hit.text for hit in store.search("ancient fact")], ["ancient fact"])
+            row_id, created = store.write("semantic", "a brand new fact about disks", tags="disk")
+            self.assertTrue(created)
+            self.assertGreater(row_id, 0)
+        finally:
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

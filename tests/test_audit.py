@@ -73,8 +73,16 @@ class TestTail(AuditTestCase):
         self.assertEqual(len(self.audit.tail(50)), 2)
 
     def test_a_missing_file_is_empty(self) -> None:
+        with Audit(Path(self._tmp.name) / "none.jsonl", "s") as audit:
+            self.assertEqual(audit.tail(3), [])
 
-        self.assertEqual(Audit(Path(self._tmp.name) / "none.jsonl", "s").tail(3), [])
+    def test_the_context_manager_closes_the_handle(self) -> None:
+        path = Path(self._tmp.name) / "ctx.jsonl"
+        with Audit(path, "s") as audit:
+            audit.log("tool", name="shell")
+            self.assertFalse(audit.closed)
+        self.assertTrue(audit.closed, "the with-block must release the append handle")
+        self.assertEqual(len(audit.tail(5)), 1)
 
     def test_corrupt_lines_are_skipped(self) -> None:
         self._seed(2)

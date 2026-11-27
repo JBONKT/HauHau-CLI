@@ -25,6 +25,10 @@ from .base import Tool, ToolResult, fail, ok
 # pathological window cannot flood the context.
 _WALK = """
 const MAXE = %(cap)d;
+// One fixed walk depth for every action: an index printed by `read` must
+// address the same element in a later `press`/`set`, or a dialog agent can
+// click the button next to the one it meant.
+const WALK_DEPTH = 3;
 let count = 0;
 function describe(el) {
   let role = "", name = "", value = "";
@@ -57,8 +61,7 @@ function run() {
   const proc = se.processes.byName(%(app)s);
   let win;
   try {
-    const front = proc.windows.whose({ frontmost: true })();
-    win = front.length ? front[0] : proc.windows[0];
+    win = proc.windows[0];  // System Events lists a process's windows front first
   } catch (e) {
     throw new Error("no accessible window for process " + %(app)s + ": " + e.message);
   }
@@ -66,7 +69,7 @@ function run() {
   let title = "";
   try { title = win.name() || ""; } catch (e) {}
   const head = "window " + JSON.stringify(title);
-  walk(win, %(depth)d, out);
+  walk(win, WALK_DEPTH, out);
   const lines = out.map((e) => "[" + e.i + "] " + e.d);
   return JSON.stringify({ head: head, lines: lines, truncated: count >= MAXE });
 }
@@ -81,13 +84,12 @@ function run() {
   const proc = se.processes.byName(%(app)s);
   let win;
   try {
-    const front = proc.windows.whose({ frontmost: true })();
-    win = front.length ? front[0] : proc.windows[0];
+    win = proc.windows[0];  // System Events lists a process's windows front first
   } catch (e) {
     throw new Error("no accessible window for process " + %(app)s + ": " + e.message);
   }
   const out = [];
-  walk(win, %(depth)d, out);
+  walk(win, WALK_DEPTH, out);
   const target = out.filter((e) => e.i === %(index)d)[0];
   if (!target) throw new Error("index %(index)d not found; ui read again, the window changed");
   try {
@@ -108,13 +110,12 @@ function run() {
   const proc = se.processes.byName(%(app)s);
   let win;
   try {
-    const front = proc.windows.whose({ frontmost: true })();
-    win = front.length ? front[0] : proc.windows[0];
+    win = proc.windows[0];  // System Events lists a process's windows front first
   } catch (e) {
     throw new Error("no accessible window for process " + %(app)s + ": " + e.message);
   }
   const out = [];
-  walk(win, %(depth)d, out);
+  walk(win, WALK_DEPTH, out);
   const target = out.filter((e) => e.i === %(index)d)[0];
   if (!target) throw new Error("index %(index)d not found; ui read again, the window changed");
   try {
@@ -157,13 +158,25 @@ def _run_osascript(script: str, timeout: float) -> tuple[int, str]:
     return 0, out
 
 
-def build(cfg, audit) -> list[Tool]:
+def build(cfg, audit, skills=None) -> list[Tool]:
     timeout = cfg.tools.shell_timeout
+    # A failure here is usually a dialog the model is trying to click blind. The
+    # skill that documents the read-decide-act loop is one call away, so say so
+    # in the error rather than letting it improvise four more attempts.
+    documented = [skill.name for skill in (skills or []) if "ui" in skill.allowed_tools]
+    hint = (
+        f"\nInstalled skill {documented[0]!r} has the procedure for this - load it with the "
+        "skill tool before retrying."
+        if documented
+        else ""
+    )
 
-    def _script(action: str, app: str, depth: int, cap: int, index: int | None, value: str | None) -> str:
+    def _fail(message: str) -> ToolResult:
+        return fail(message + hint)
+
+    def _script(action: str, app: str, cap: int, index: int | None, value: str | None) -> str:
         params = {
             "app": json.dumps(app),
-            "depth": depth,
             "index": 0 if index is None else index,
             "value": json.dumps(value or ""),
             "cap": cap,
@@ -178,7 +191,6 @@ def build(cfg, audit) -> list[Tool]:
         app = text(args, "app", required=True).strip()
         if not app:
             return fail("ui: 'app' (the process name, as the menu bar shows) is required")
-        depth = integer(args, "depth", 2, minimum=0, maximum=4)
         cap = integer(args, "max", 150, minimum=10, maximum=300)
         index = None
         value = None
@@ -189,14 +201,14 @@ def build(cfg, audit) -> list[Tool]:
         if action == "set":
             value = text(args, "value", required=True)
         audit.log("ui", action=action, app=app, index=index)
-        code, out = _run_osascript(_script(action, app, depth, cap, index, value), timeout)
+        code, out = _run_osascript(_script(action, app, cap, index, value), timeout)
         if code != 0:
-            return fail(f"ui {action} on {app!r}: {out}")
+            return _fail(f"ui {action} on {app!r}: {out}")
         if action == "read":
             try:
                 data = json.loads(out)
             except json.JSONDecodeError:
-                return fail(f"ui read: unreadable reply: {out[:200]}")
+                return _fail(f"ui read: unreadable reply: {out[:200]}")
             lines = data.get("lines") or []
             if not lines:
                 return ok(f"{data.get('head', 'window')} has no readable UI elements")
@@ -210,12 +222,10 @@ def build(cfg, audit) -> list[Tool]:
         Tool(
             name="ui",
             description=(
-                "Read and control a macOS app's frontmost window through the "
-                "accessibility tree - no screenshots, no coordinates. First "
-                "action 'read' lists elements as [index] role \"name\" = value; "
-                "then 'press' clicks element at index, 'set' types value into "
-                "the element at index. 'app' is the process name (e.g. "
-                "'Safari', 'Finder'). Re-read after each action to verify."
+                "Read or drive a macOS app's frontmost window via the accessibility tree "
+                "(no screenshots, no coordinates). 'read' lists elements as [index] role "
+                "\"name\" = value; 'press' clicks element index; 'set' types value into it. "
+                "Re-read after each action to verify."
             ),
             parameters={
                 "type": "object",
@@ -224,7 +234,6 @@ def build(cfg, audit) -> list[Tool]:
                     "app": {"type": "string", "description": "process name shown in the menu bar"},
                     "index": {"type": "integer", "description": "element index from a previous read"},
                     "value": {"type": "string", "description": "new value, for set"},
-                    "depth": {"type": "integer", "description": "element nesting to walk, default 2"},
                     "max": {"type": "integer", "description": "element cap for read, default 150"},
                 },
                 "required": ["action", "app"],

@@ -11,6 +11,7 @@ from typing import Any
 
 from prompt_toolkit import prompt as pt_prompt
 from rich.box import ROUNDED
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 
@@ -46,6 +47,8 @@ from .models import switch as switch_model
 from .profiler import apply_recommendations, probe, recommend
 from .server import ServerManager
 from .skills import discover as discover_skills
+from .skills import index as skill_index
+from .skills import nearest as skill_nearest
 from .skills import skill_dirs
 from .tools import build_registry
 from .tui import ScreenApp, ScreenUI
@@ -230,17 +233,69 @@ class Repl:
             [[t.name, t.description.splitlines()[0]] for t in self.agent.registry.tools()],
         )
 
-    def cmd_skills(self, _arg: str) -> None:
+    def cmd_skills(self, arg: str) -> None:
+        """`/skills` lists, `/skills <name>` shows one, `/skills reload` re-scans."""
+        wanted = arg.strip().lstrip("/")
+        if wanted.lower() in ("reload", "scan", "rescan"):
+            self._reload_skills()
+            return
+        if wanted:
+            skill = skill_index(self.skills).get(wanted)
+            if skill is None:
+                close = skill_nearest(wanted, self.skills)
+                hint = f" - did you mean /skills {close}?" if close else ""
+                note(self.console, f"no skill named {wanted!r}{hint}", WARN)
+                return
+            tools = f" · needs {', '.join(skill.allowed_tools)}" if skill.allowed_tools else ""
+            self.console.print(
+                Panel(
+                    Markdown(skill.body or "(empty body)"),
+                    title=f"{skill.name}{tools}",
+                    subtitle=str(skill.folder),
+                    border_style=ACCENT,
+                    box=ROUNDED,
+                )
+            )
+            return
         if not self.skills:
             scanned = ", ".join(str(d) for d in skill_dirs(self.cfg))
             note(self.console, f"no skills installed - folders scanned: {scanned}")
+            note(self.console, "drop a folder with a SKILL.md there, then run /skills reload")
             return
         data_table(
             self.console,
             "Skills",
-            ["name", "description", "folder"],
-            [[s.name, s.description.splitlines()[0], str(s.path.parent)] for s in self.skills],
+            ["name", "description", "tools", "folder"],
+            [
+                [
+                    s.name,
+                    s.description.splitlines()[0],
+                    ", ".join(s.allowed_tools) or "-",
+                    str(s.folder),
+                ]
+                for s in self.skills
+            ],
         )
+        note(self.console, "/skills <name> shows one · /skills reload re-scans the folders")
+
+    def _reload_skills(self) -> None:
+        """Re-scan the skill folders: a skill added while the app runs is usable
+        on the next turn, because the prompt block and the tool both re-read."""
+        found, warnings = discover_skills(skill_dirs(self.cfg))
+        for warning in warnings:
+            note(self.console, f"skills: {warning}", WARN)
+        before = {s.name for s in self.skills}
+        after = {s.name for s in found}
+        self.skills = found
+        self.agent.skills = found
+        added, removed = sorted(after - before), sorted(before - after)
+        parts = []
+        if added:
+            parts.append(f"added {', '.join(added)}")
+        if removed:
+            parts.append(f"removed {', '.join(removed)}")
+        note(self.console, f"{len(found)} skills" + (f" ({'; '.join(parts)})" if parts else ""))
+
 
     def cmd_mem(self, arg: str) -> None:
         if self.brain is None:
@@ -1175,13 +1230,28 @@ class Runtime:
         return answer.strip().lower() in ("y", "yes")
 
     def revive_backend(self) -> bool:
-        """Make sure a backend exists after an interrupt or a failed turn."""
+        """Make sure a backend exists after a failed turn."""
         if not self.cfg.model.manage_server:
             return False
         try:
             self.manager.ensure()
             return True
         except LLMError:
+            return False
+
+    def restart_backend(self) -> bool:
+        """Abort the in-flight answer by restarting the backend Hauhau owns.
+
+        Only a restart drops the generation llama-server is busy with: ensure()
+        returns a healthy server untouched, so Ctrl-C reported "the backend was
+        restarted" while the answer kept streaming.
+        """
+        if not self.cfg.model.manage_server:
+            return False
+        try:
+            self.manager.restart()
+            return True
+        except (LLMError, OSError):
             return False
 
     def submit(self, text: str) -> None:
@@ -1414,7 +1484,7 @@ class Runtime:
         window = HauhauDashboard(
             self.ui,
             submit=self.submit,
-            restart_backend=self.revive_backend,
+            restart_backend=self.restart_backend,
             should_exit=lambda: not self.repl.running,
             stats=self.dashboard_stats,
             propose=propose,
@@ -1430,7 +1500,7 @@ class Runtime:
         screen = ScreenApp(
             self.ui,
             submit=self.submit,
-            restart_backend=self.revive_backend,
+            restart_backend=self.restart_backend,
             should_exit=lambda: not self.repl.running,
             stats=self.screen_stats,
         )
@@ -1458,7 +1528,14 @@ class Runtime:
                 text = line.strip()
                 if not text:
                     continue
-                self.submit(text)
+                try:
+                    # A slash command can run for minutes (/tune, /eval, /sync) and
+                    # Ctrl-C during one used to end the session, while the same key
+                    # only interrupts a chat turn.
+                    self.submit(text)
+                except KeyboardInterrupt:
+                    note(self.console, "interrupted", WARN)
+                    continue
         finally:
             self.finish()
             if self.console.is_terminal:

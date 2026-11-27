@@ -20,8 +20,18 @@ EDIT_MAX_BYTES = 32 * 1024 * 1024
 DEFAULT_READ_LINES = 2000
 
 
-def _resolve(path: str) -> Path:
-    return Path(os.path.expanduser(path)).expanduser()
+def _resolve(path: str, workspace: str | os.PathLike | None = None) -> Path:
+    """The absolute path a tool argument means.
+
+    Relative paths resolve against the workspace, not the process CWD: the
+    prompt names the workspace as the working directory and ``shell``/``grep``
+    run there, so ``read_file("notes.txt")`` used to read a different file than
+    the one ``cat notes.txt`` showed.
+    """
+    candidate = Path(os.path.expanduser(path))
+    if not candidate.is_absolute() and workspace:
+        candidate = Path(workspace).expanduser() / candidate
+    return candidate
 
 
 def _snapshot(cfg, audit, path: Path) -> None:
@@ -89,7 +99,7 @@ def build(cfg, audit) -> list[Tool]:
     max_chars = cfg.tools.max_output_chars
 
     def read_file(args: dict) -> ToolResult:
-        path = _resolve(text(args, "path", required=True))
+        path = _resolve(text(args, "path", required=True), cfg.workspace)
         if not path.is_file():
             return fail(f"read_file: not a file: {path}")
         offset = integer(args, "offset", 0, minimum=0)
@@ -116,7 +126,7 @@ def build(cfg, audit) -> list[Tool]:
         return ok(clip_text(body, max_chars))
 
     def write_file(args: dict) -> ToolResult:
-        path = _resolve(text(args, "path", required=True))
+        path = _resolve(text(args, "path", required=True), cfg.workspace)
         content = text(args, "content", required=True)
         existed = path.is_file()
         _snapshot(cfg, audit, path)
@@ -132,7 +142,7 @@ def build(cfg, audit) -> list[Tool]:
         return ok(f"wrote {written} bytes to {path}" + ("" if existed else " (new file)"))
 
     def edit_file(args: dict) -> ToolResult:
-        path = _resolve(text(args, "path", required=True))
+        path = _resolve(text(args, "path", required=True), cfg.workspace)
         old = text(args, "old" if "old" in args else "old_string", required=True)
         new = text(args, "new" if "new" in args else "new_string", required=True)
         if not old:
@@ -181,7 +191,7 @@ def build(cfg, audit) -> list[Tool]:
         return ok(f"replaced {count if replace_all else 1} occurrence(s) in {path}")
 
     def list_dir(args: dict) -> ToolResult:
-        path = _resolve(text(args, "path", "."))
+        path = _resolve(text(args, "path", "."), cfg.workspace)
         if not path.is_dir():
             return fail(f"list_dir: not a directory: {path}")
         show_all = flag(args, "all")

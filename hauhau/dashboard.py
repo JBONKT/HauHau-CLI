@@ -166,6 +166,12 @@ class _Sink(io.TextIOBase):
         self.pending = ""
 
     def write(self, text: str) -> int:
+        if "\r" in text:
+            # A rich Live/Status frame: the spinner redraws itself many times a
+            # second, and every repaint became its own chat widget (twelve for a
+            # 0.8 s spinner). It is transient by design, so it is dropped;
+            # Progress.step prints finished lines, and those carry a newline.
+            return len(text)
         self.pending += text
         while "\n" in self.pending:
             line, self.pending = self.pending.split("\n", 1)
@@ -173,7 +179,7 @@ class _Sink(io.TextIOBase):
         return len(text)
 
     def flush(self) -> None:
-        if self.pending:
+        if self.pending and "\r" not in self.pending:
             line, self.pending = self.pending, ""
             self.ui.append_ansi(line)
 
@@ -201,6 +207,7 @@ class DashboardUI:
         # for terminals that redraw on the CPU and cannot sync their repaints.
         self.stream_wait = STREAM_MAX_WAIT
         self._reasoning: list[str] = []
+        self._reasoning_text = ""
         self._reasoning_widget: Any = None
         # Widgets built before the app is mounted (config warnings land here).
         # Stored as widgets, not text: an unmounted widget can still be updated
@@ -231,7 +238,15 @@ class DashboardUI:
 
     def _chat(self) -> Any:
         app = self.app
-        return app.query_one("#chat", VerticalScroll) if app is not None else None
+        if app is None:
+            return None
+        try:
+            return app.query_one("#chat", VerticalScroll)
+        except NoMatches:
+            # During shutdown the dashboard screen (and #chat with it) is
+            # gone while the REPL still prints its /learn goodbyes; buffer
+            # them instead of crashing the exit path.
+            return None
 
     def _mount(self, widget: Any, *, scroll: bool = True) -> Any:
         chat = self._chat()
@@ -354,9 +369,11 @@ class DashboardUI:
             if chat is not None:
                 if self._reasoning_widget is None:
                     self._reasoning_widget = self._mount(Static("· thinking", markup=False, classes="reasoning"))
-                text = "".join(self._reasoning)
+                # Keep the whole block: showing only the newest chunk made the
+                # thinking widget read like the last tenth of a second.
+                self._reasoning_text += "".join(self._reasoning)
                 self._reasoning.clear()
-                self._reasoning_widget.update(Text(f"· thinking {text}", style=MUTED_HEX))
+                self._reasoning_widget.update(Text(f"· thinking {self._reasoning_text}", style=MUTED_HEX))
         if not self._answer:
             return
         chat = self._chat()
@@ -395,6 +412,7 @@ class DashboardUI:
         self._answer.clear()
         self._stream_widget = None
         self._reasoning_widget = None
+        self._reasoning_text = ""
 
 
 class TaskSuggester(Suggester):
@@ -461,6 +479,9 @@ class HauhauDashboard(App):
         self._ai_timer: Any = None
         self._panel_drawn: tuple | None = None
         self._speeds: deque[float] = deque(maxlen=SPARK_POINTS)
+        # The usage object the last sparkline sample came from: a repaint must
+        # not add the same reading again.
+        self._last_speed_usage: Any = None
         self.title = "Hauhau"
         ui.app = self
 
@@ -572,7 +593,10 @@ class HauhauDashboard(App):
             return
         stats = self._stats()
         usage = self.ui.last_usage
-        if usage is not None and usage.tok_per_second:
+        if usage is not None and usage.tok_per_second and usage is not self._last_speed_usage:
+            # Once per finished turn: appending on every repaint filled the
+            # sparkline with forty copies of the same reading.
+            self._last_speed_usage = usage
             self._speeds.append(float(usage.tok_per_second))
 
         speed = f"{usage.tok_per_second:.0f} tok/s" if usage and usage.tok_per_second else "-"
@@ -713,9 +737,14 @@ class HauhauDashboard(App):
     def action_interrupt(self) -> None:
         if self.ui.busy:
             # Restarting the backend aborts the in-flight request; it blocks, so
-            # it cannot run on the event loop.
-            threading.Thread(target=self.restart_backend, daemon=True).start()
-            self.ui.note("interrupted - the backend was restarted", error=False)
+            # it cannot run on the event loop. Only claim what actually happened.
+            def stop() -> None:
+                if self.restart_backend():
+                    self.ui.note("interrupted - the backend was restarted", error=False)
+                else:
+                    self.ui.note("interrupted - the answer may still be generating", error=False)
+
+            threading.Thread(target=stop, daemon=True).start()
             return
         field = self.query_one("#prompt", Input)
         if field.value:

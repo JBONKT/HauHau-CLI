@@ -290,20 +290,26 @@ class MemoryStore:
         self.db.row_factory = sqlite3.Row
         try:
             with self._lock:
+                # Columns first: on a database from before ``tags``/``norm_hash``
+                # existed, the CREATE INDEX inside SCHEMA raised "no such column",
+                # which aborted the script *and* skipped the migration that would
+                # have added them - so the store stayed broken for good.
+                self._add_columns()
                 self.db.executescript(SCHEMA)
-                # Rebuild the index *before* migrating: the cleanup UPDATEs below fire
-                # the FTS triggers, and a delete against an index that was never built
-                # for these rows made SQLite report "database disk image is malformed".
+                # Rebuild the index *before* repairing rows: the cleanup UPDATEs
+                # below fire the FTS triggers, and a delete against an index that
+                # was never built for these rows made SQLite report "database
+                # disk image is malformed".
                 self.db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
                 self.db.commit()
-                self._migrate()
+                self._repair_rows()
         except sqlite3.OperationalError:
             # A restored backup on a read-only mount can still be searched; the
             # old unconditional rebuild made memory impossible there.
             pass
 
-    def _migrate(self) -> None:
-        """Bring an older ``brain.db`` up to the current schema.
+    def _add_columns(self) -> None:
+        """Give an older ``brain.db`` the columns the current schema expects.
 
         ``CREATE TABLE IF NOT EXISTS`` is a no-op on a mismatch, so an existing
         file kept its old columns and the first query failed - outside the
@@ -324,6 +330,9 @@ class MemoryStore:
         for name, decl in wanted.items():
             if name not in cols:
                 self.db.execute(f"ALTER TABLE memories ADD COLUMN {name} {decl}")
+
+    def _repair_rows(self) -> None:
+        """Fill in values a legacy row left NULL or in the future."""
         now = time.time()
         # Five full-table UPDATEs on every open would rewrite a large brain.db
         # for nothing; one probe decides whether any row needs repair.

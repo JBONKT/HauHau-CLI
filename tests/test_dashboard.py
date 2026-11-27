@@ -82,6 +82,25 @@ async def wait_until(pilot, predicate, timeout: float = 5.0) -> bool:
 
 
 @unittest.skipUnless(available(), "textual is not installed")
+class DashboardShutdownTestCase(unittest.TestCase):
+    """The exit path: /learn prints its goodbyes while Textual is already
+    tearing down the screen that holds #chat - observed as NoMatches on quit."""
+
+    def test_printing_after_the_screen_is_gone_does_not_crash(self) -> None:
+        from textual.css.query import NoMatches
+
+        class DeadApp:
+            is_running = False  # so _call() runs the draw inline
+
+            def query_one(self, *args, **kwargs):
+                raise NoMatches("the dashboard screen is gone")
+
+        ui = DashboardUI()
+        ui.app = DeadApp()
+        ui.append_ansi("distilling this session into memory…\n")  # must not raise
+
+
+@unittest.skipUnless(available(), "textual is not installed")
 class DashboardTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         # The model half is debounced; a test should not wait 0.55 s per case.

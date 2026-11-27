@@ -47,17 +47,46 @@ class Audit:
         if self.enabled and not self._fh.closed:
             self._fh.close()
 
+    def __enter__(self) -> Audit:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    @property
+    def closed(self) -> bool:
+        return not self.enabled or self._fh.closed
+
     def tail(self, n: int = 10) -> list[dict]:
         if not self.path.exists():
             return []
         # lines[-0:] is the whole file and a negative n slices from the front,
         # so /audit 0 printed the entire log.
         n = max(1, int(n))
-        lines = self.path.read_text(encoding="utf-8").splitlines()[-n:]
         out = []
-        for line in lines:
+        for line in self._tail_lines(n):
             try:
                 out.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
         return out
+
+    def _tail_lines(self, n: int) -> list[str]:
+        """The last ``n`` lines, read backwards from the end of the file.
+
+        The log only grows, so reading it whole to show twenty lines made
+        ``/audit`` slower every week. A UTF-8 character can straddle the window
+        edge, which is why the chunk is decoded with ``replace``.
+        """
+        window = 4096
+        with self.path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            while True:
+                start = max(0, size - window)
+                handle.seek(start)
+                lines = handle.read(size - start).decode("utf-8", "replace").splitlines()
+                if start > 0 and lines:
+                    lines = lines[1:]  # the first line is probably cut in half
+                if start == 0 or len(lines) >= n or window >= size:
+                    return lines[-n:]
+                window *= 4

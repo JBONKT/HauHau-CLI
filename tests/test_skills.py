@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +10,7 @@ from pathlib import Path
 from hauhau.audit import Audit
 from hauhau.config import Config
 from hauhau.skills import (
+    MAX_LISTED,
     Skill,
     builtin_dir,
     discover,
@@ -70,6 +73,121 @@ class TestParse(unittest.TestCase):
     def test_no_frontmatter(self) -> None:
         with self.assertRaises(ValueError):
             parse_skill("just a body", Path("/x/test-skill/SKILL.md"))
+
+
+class TestFrontmatterVariants(unittest.TestCase):
+    """A skill written for another agent must load here unchanged."""
+
+    def test_folded_block_scalar_description(self) -> None:
+        text = (
+            "---\nname: fold\ndescription: >\n  Does one thing\n  when the task calls for it.\n---\n\nbody\n"
+        )
+        skill = parse_skill(text, Path("/x/fold/SKILL.md"))
+        self.assertEqual(skill.description, "Does one thing when the task calls for it.")
+
+    def test_literal_scalar_is_parsed_and_collapsed_for_the_prompt(self) -> None:
+        # A `|` block keeps its line breaks in the meta, but the prompt line is a
+        # single line by design, so the description arrives with spaces.
+        text = "---\nname: lit\ndescription: |\n  first\n  second\n---\nbody\n"
+        self.assertEqual(parse_skill(text, Path("/x/lit/SKILL.md")).description, "first second")
+
+    def test_crlf_and_bom_are_tolerated(self) -> None:
+        text = "\ufeff---\r\nname: win\r\ndescription: a windows copy\r\n---\r\nbody\r\n"
+        skill = parse_skill(text, Path("/x/win/SKILL.md"))
+        self.assertEqual(skill.name, "win")
+        self.assertIn("body", skill.body)
+
+    def test_allowed_tools_in_three_spellings(self) -> None:
+        for value, expected in (
+            ('["shell", "ui"]', ("shell", "ui")),
+            ("[shell, ui]", ("shell", "ui")),
+            ("shell ui", ("shell", "ui")),
+        ):
+            text = f"---\nname: t\ndescription: d\nallowed-tools: {value}\n---\nbody\n"
+            self.assertEqual(parse_skill(text, Path("/x/t/SKILL.md")).allowed_tools, expected, value)
+
+    def test_no_allowed_tools_means_none(self) -> None:
+        self.assertEqual(parse_skill(MD, Path("/skills/test-skill/SKILL.md")).allowed_tools, ("shell",))
+
+
+class TestAgentPrompt(unittest.TestCase):
+    """The bot has to know the skills exist before it can master them."""
+
+    def _agent(self, skills):
+        from hauhau.agent import Agent
+        from hauhau.tools.base import Registry
+
+        cfg = Config()
+        cfg.brain.enabled = False
+        return Agent(cfg, None, Registry([]), brain=None, skills=skills)
+
+    def test_the_system_prompt_lists_the_skills(self) -> None:
+        skill = parse_skill(MD, Path("/skills/test-skill/SKILL.md"))
+        prompt = self._agent([skill]).system_prompt("hi")
+        self.assertIn("Skills: procedures installed on this machine", prompt)
+        self.assertIn("- test-skill:", prompt)
+
+    def test_no_skills_means_no_block(self) -> None:
+        self.assertNotIn("Skills:", self._agent([]).system_prompt("hi"))
+
+
+class TestSkillToolRefinements(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.cfg = Config()
+        self.cfg.logging.data_dir = str(self.root / "data")
+        self.cfg.skills.dirs = []
+        self.audit = Audit(self.cfg.audit_path, "skills-test", True)
+        self.skill = load_skill(_write_skill(self.root / "installed", "demo", "a demo", "body text"))
+        self.registry = build_registry(self.cfg, self.audit, skills=[self.skill])
+
+    def tearDown(self) -> None:
+        self.audit.close()
+        self._tmp.cleanup()
+
+    def run_skill(self, **args):
+        return self.registry.get("skill").run(args)
+
+    def test_the_body_carries_a_header_with_its_tools(self) -> None:
+        result = self.run_skill(name="demo")
+        self.assertTrue(result.content.startswith("# skill: demo"))
+        self.assertIn("body text", result.content)
+
+    def test_a_mistyped_name_is_guessed(self) -> None:
+        result = self.run_skill(name="dem")
+        self.assertFalse(result.ok)
+        self.assertIn("Did you mean 'demo'", result.content)
+
+    def test_a_folder_is_listed_rather_than_read(self) -> None:
+        (self.skill.folder / "scripts").mkdir()
+        (self.skill.folder / "scripts" / "run.sh").write_text("echo hi\n", encoding="utf-8")
+        result = self.run_skill(name="demo", file="scripts")
+        self.assertTrue(result.ok, result.content)
+        self.assertIn("scripts/run.sh", result.content)
+
+    def test_a_binary_support_file_points_at_the_shell(self) -> None:
+        (self.skill.folder / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\xff")
+        result = self.run_skill(name="demo", file="logo.png")
+        self.assertFalse(result.ok)
+        self.assertIn("not text", result.content)
+        self.assertIn("shell", result.content)
+
+    def test_a_skill_added_after_startup_is_found(self) -> None:
+        # The user drops a skill into ~/.hauhau/skills while the app is running.
+        late = _write_skill(self.cfg.data_dir / "skills", "late", "arrived later", "late body")
+        self.assertTrue((late / "SKILL.md").is_file())
+        result = self.run_skill(name="late")
+        self.assertTrue(result.ok, result.content)
+        self.assertIn("late body", result.content)
+
+    def test_a_miss_is_audited(self) -> None:
+        self.run_skill(name="absent")
+        events = [e.get("event") for e in self.audit.tail(20)]
+        self.assertIn("skill.miss", events)
+
+    def test_a_leading_slash_is_tolerated(self) -> None:
+        self.assertTrue(self.run_skill(name="/demo").ok)
 
 
 class TestDiscover(unittest.TestCase):
@@ -236,6 +354,24 @@ class TestUiTool(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("macOS", result.content)
 
+    def test_a_failure_names_the_skill_that_documents_it(self) -> None:
+        from hauhau.skills import Skill
+
+        skill = Skill("dialog-handler", "answers dialogs", "body", self.root / "d" / "SKILL.md",
+                      allowed_tools=("ui",))
+        registry = build_registry(self.cfg, self.audit, skills=[skill])
+        ui_module._run_osascript = lambda script, timeout: (1, "not allowed assistive access")
+        result = registry.get("ui").run({"action": "read", "app": "Finder"})
+        self.assertFalse(result.ok)
+        self.assertIn("dialog-handler", result.content)
+        self.assertIn("load it with the skill tool", result.content)
+
+    def test_without_such_a_skill_there_is_no_hint(self) -> None:
+        ui_module._run_osascript = lambda script, timeout: (1, "not allowed assistive access")
+        result = self.run_tool(action="read", app="Finder")
+        self.assertFalse(result.ok)
+        self.assertNotIn("skill tool", result.content)
+
     def test_bad_action_rejected_before_any_subprocess(self) -> None:
         def fake(script, timeout):
             raise AssertionError("must not run")
@@ -258,6 +394,138 @@ class TestPromptBlock(unittest.TestCase):
 
     def test_empty_is_nothing(self) -> None:
         self.assertEqual(prompt_block([]), "")
+
+    def test_block_tells_the_model_to_load_before_acting(self) -> None:
+        block = prompt_block([Skill("a", "does a", "body", Path("/x/a/SKILL.md"))])
+        self.assertIn("before* acting", block)
+
+    def test_a_long_description_is_clipped_to_one_line(self) -> None:
+        skill = Skill("a", "word " * 200, "body", Path("/x/a/SKILL.md"))
+        line = [ln for ln in prompt_block([skill]).splitlines() if ln.startswith("- a:")]
+        self.assertEqual(len(line), 1)
+        self.assertLess(len(line[0]), 200)
+        self.assertTrue(line[0].endswith("…"))
+
+    def test_the_list_is_capped(self) -> None:
+        skills = [
+            Skill(f"s-{i:02d}", "d", "b", Path(f"/x/s-{i:02d}/SKILL.md"))
+            for i in range(MAX_LISTED + 5)
+        ]
+        self.assertIn("5 more installed", prompt_block(skills))
+
+
+class TestReviewFollowups(unittest.TestCase):
+    """The gaps the review of f9bc8a3 found: index stability, fence parsing,
+    the size of failure messages, and JXA that at least parses."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.cfg = Config()
+        self.cfg.logging.data_dir = str(self.root / "data")
+        self.audit = Audit(self.cfg.audit_path, "review-followups")
+        self.registry = build_registry(self.cfg, self.audit)
+        self._real = ui_module._run_osascript
+        self.captured: list[str] = []
+
+    def tearDown(self) -> None:
+        ui_module._run_osascript = self._real
+        self.audit.close()
+        self._tmp.cleanup()
+
+    def run_ui(self, **args):
+        tool = self.registry.get("ui")
+        assert tool is not None
+        return tool.run(args)
+
+    def _capture(self, reply: str) -> None:
+        def fake(script, timeout):
+            self.captured.append(script)
+            return 0, reply
+
+        ui_module._run_osascript = fake
+
+    def _scripts_for_every_action(self) -> list[str]:
+        self._capture('{"head": "w", "lines": ["[0] AXButton \\"OK\\""], "truncated": false}')
+        assert self.run_ui(action="read", app="Finder").ok
+        self._capture('{"pressed": "[3] AXButton"}')
+        assert self.run_ui(action="press", app="Finder", index=3).ok
+        self._capture('{"set": "[1] AXTextField"}')
+        assert self.run_ui(action="set", app="Finder", index=1, value="report.pdf").ok
+        return self.captured
+
+    def test_walk_is_identical_across_actions(self) -> None:
+        """An index from `read` must address the same element in `press`/`set`:
+        the walk (depth included) is a fixed constant, not a per-call setting."""
+        scripts = self._scripts_for_every_action()
+        for script in scripts:
+            self.assertIn("walk(win, WALK_DEPTH, out)", script)
+        # No per-call depth survives anywhere, and the schema does not offer one.
+        for script in scripts:
+            self.assertNotIn("%(depth)d", script)
+        schema = self.registry.get("ui").schema()["function"]["parameters"]["properties"]
+        self.assertNotIn("depth", schema)
+        # A depth argument from an old conversation is ignored, not an error.
+        self._capture('{"head": "w", "lines": [], "truncated": false}')
+        self.assertTrue(self.run_ui(action="read", app="Finder", depth=9).ok)
+
+    def test_no_whose_frontmost_filter(self) -> None:
+        """`frontmost` is a process property; the whose() call was dead code
+        that silently fell through to windows[0]."""
+        for script in self._scripts_for_every_action():
+            self.assertNotIn("whose", script)
+            self.assertIn("proc.windows[0]", script)
+
+    @unittest.skipUnless(shutil.which("osascript"), "JXA syntax check needs macOS")
+    def test_jxa_templates_parse_as_javascript(self) -> None:
+        for script in self._scripts_for_every_action():
+            wrapped = "(function(){\n" + script + "\n})"
+            proc = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e", wrapped],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, f"JXA does not parse: {proc.stderr}")
+
+    def test_frontmatter_survives_dashes_in_a_value(self) -> None:
+        text = (
+            "---\nname: dash-skill\ndescription: handles a---b and more\n---\n\n"
+            "body line\n---\nhorizontal rule\n"
+        )
+        skill = parse_skill(text, Path("/x/dash-skill/SKILL.md"))
+        self.assertEqual(skill.description, "handles a---b and more")
+        self.assertIn("horizontal rule", skill.body)
+
+    def test_unclosed_frontmatter_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_skill("---\nname: x\n", Path("/x/x/SKILL.md"))
+
+    def test_known_list_is_capped_in_the_error(self) -> None:
+        skills = [
+            Skill(f"s-{i:02d}", "d", "body", Path(f"/x/s-{i:02d}/SKILL.md")) for i in range(25)
+        ]
+        registry = build_registry(self.cfg, self.audit, skills=skills)
+        result = registry.get("skill").run({"name": "missing"})
+        self.assertFalse(result.ok)
+        # 25 fakes plus the bundled built-ins: the list shows a sample and a
+        # count, not every name.
+        self.assertRegex(result.content, r"and \d+ more")
+        self.assertLess(len(result.content), 400)
+
+
+class TestAllowedToolSpellings(unittest.TestCase):
+    def test_a_yaml_block_list_yields_names(self) -> None:
+        from hauhau.skills import _tool_list
+
+        self.assertEqual(_tool_list("\n  - read_file\n  - shell"), ("read_file", "shell"))
+
+    def test_other_spellings_still_work(self) -> None:
+        from hauhau.skills import _tool_list
+
+        self.assertEqual(_tool_list("[read_file, shell]"), ("read_file", "shell"))
+        self.assertEqual(_tool_list("read_file, shell"), ("read_file", "shell"))
+        self.assertEqual(_tool_list("read_file shell"), ("read_file", "shell"))
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from hauhau import ingest
 from hauhau.ingest import (
@@ -199,7 +200,8 @@ class TestEnsureApp(unittest.TestCase):
             calls.append(cmd)
 
             class Done:
-                returncode = 0
+                # pgrep reports "not running" so the launch path is taken.
+                returncode = 1 if cmd[0] == "pgrep" else 0
 
             return Done()
 
@@ -208,7 +210,29 @@ class TestEnsureApp(unittest.TestCase):
             ingest._ensure_app("Calendar")
         finally:
             ingest.subprocess.run = original
-        self.assertEqual(calls[0][:3], ["open", "-gja", "Calendar"])
+        self.assertEqual(calls[0][:2], ["pgrep", "-qx"])
+        self.assertEqual(calls[1][:3], ["open", "-gja", "Calendar"])
+
+    def test_a_running_app_is_not_launched_or_waited_for(self) -> None:
+        calls: list[list[str]] = []
+        original = ingest.subprocess.run
+
+        def fake(cmd, **kwargs):
+            calls.append(cmd)
+
+            class Done:
+                returncode = 0
+
+            return Done()
+
+        ingest.subprocess.run = fake
+        try:
+            with mock.patch.object(ingest.time, "sleep") as sleep:
+                ingest._ensure_app("Mail")
+        finally:
+            ingest.subprocess.run = original
+        self.assertEqual([call[0] for call in calls], ["pgrep"], "nothing to launch")
+        sleep.assert_not_called()
 
     def test_a_missing_open_command_is_not_fatal(self) -> None:
         original = ingest.subprocess.run

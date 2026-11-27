@@ -10,6 +10,7 @@ import math
 import os
 import re
 import tomllib
+import urllib.parse
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -187,8 +188,13 @@ def _type_ok(default: Any, value: Any) -> bool:
         return isinstance(value, bool)
     if isinstance(default, float) and isinstance(value, (int, float)) and not isinstance(value, bool):
         # nan < 0.1 is False, so a NaN half-life sailed past every range check
-        # and turned decay, scores and sorting into NaN.
-        return math.isfinite(float(value))
+        # and turned decay, scores and sorting into NaN. A huge TOML integer
+        # made float() raise OverflowError straight out of load().
+        try:
+            number = float(value)
+        except (OverflowError, ValueError):
+            return False
+        return math.isfinite(number)
     if isinstance(default, int):
         # bool is a subclass of int, but `max_steps = true` is always a mistake.
         return isinstance(value, int) and not isinstance(value, bool)
@@ -270,7 +276,32 @@ def _sanity(cfg: Config) -> list[str]:
             "using http://127.0.0.1:8080"
         )
         cfg.model.server_url = "http://127.0.0.1:8080"
+    problem = _url_problem(cfg.model.server_url)
+    if problem:
+        warnings.append(
+            f"model.server_url is not usable ({problem}): {cfg.model.server_url!r}; "
+            "using http://127.0.0.1:8080"
+        )
+        cfg.model.server_url = "http://127.0.0.1:8080"
     return warnings
+
+
+def _url_problem(url: str) -> str:
+    """Why ``url`` cannot be opened, or "" when it can.
+
+    ``http://127.0.0.1:notaport`` passed the scheme check and then raised
+    InvalidURL out of the very first health probe, killing startup with a
+    traceback instead of a warning.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        # Reading .port raises ValueError on a non-numeric or out-of-range port.
+        _ = parsed.port
+    except ValueError as exc:
+        return str(exc)
+    if not parsed.hostname:
+        return "no host"
+    return ""
 
 
 def load(path: str | os.PathLike[str] | None = None) -> tuple[Config, list[str]]:

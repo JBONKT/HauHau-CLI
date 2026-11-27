@@ -206,6 +206,38 @@ class TestStop(ServerTestCase):
         self.assertFalse(status["running"])
         self.assertEqual(status["url"], self.cfg.model.server_url)
 
+class TestRestart(ServerTestCase):
+    """A backend Hauhau did not start cannot be restarted - say so."""
+
+    def test_a_foreign_healthy_backend_makes_restart_fail_loudly(self) -> None:
+        manager = ServerManager(self.cfg)
+        with mock.patch.object(manager, "client", return_value=FakeClient(healthy=True)), \
+                self.assertRaises(LLMError) as caught:
+            manager.restart()
+        self.assertIn("did not start", str(caught.exception))
+        self.assertIn(self.cfg.model.server_url, str(caught.exception))
+
+    def test_nothing_running_still_starts_a_server(self) -> None:
+        manager = ServerManager(self.cfg)
+        started = FakeClient(healthy=True)
+        with mock.patch.object(manager, "client", return_value=FakeClient(healthy=False)), \
+                mock.patch.object(manager, "ensure", return_value=started) as ensure:
+            self.assertIs(manager.restart(), started)
+        ensure.assert_called_once_with()
+
+    def test_an_owned_child_is_stopped_and_replaced(self) -> None:
+        manager = ServerManager(self.cfg)
+        child = mock.Mock()
+        child.poll.return_value = None
+        manager._proc = child
+        started = FakeClient(healthy=True)
+        with mock.patch.object(manager, "client", return_value=started), \
+                mock.patch.object(manager, "ensure", return_value=started) as ensure:
+            self.assertIs(manager.restart(), started)
+        child.terminate.assert_called_once()
+        ensure.assert_called_once_with()
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -332,6 +332,102 @@ class TestCompression(AgentTestCase):
         self.assertEqual(agent.messages[3]["role"], "user")
 
 
+class TestRepeatedCall(unittest.TestCase):
+    """A repeat of a call that just failed costs a whole model step."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.cfg = Config()
+        self.cfg.logging.data_dir = str(self.root / "data")
+        self.cfg.brain.enabled = False
+        self.runs = 0
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _agent(self, completions, audit=None):
+        def fails(_args):
+            self.runs += 1
+            return fail("permission denied")
+
+        registry = Registry([
+            Tool("denied", "Always fails.", {"type": "object", "properties": {}}, fails),
+            Tool("echo", "Echoes.", {"type": "object", "properties": {"text": {"type": "string"}}},
+                 lambda args: ok(f"echoed {args.get('text')}")),
+        ])
+        return Agent(self.cfg, FakeClient(completions), registry, brain=None, audit=audit)
+
+    def test_the_same_failing_call_runs_once(self) -> None:
+        agent = self._agent([
+            tool_call(name="denied", args="{}", call_id="a"),
+            tool_call(name="denied", args="{}", call_id="b"),
+            reply("jag kommer inte åt filen"),
+        ])
+        text = agent.run_turn("läs filen")
+
+        self.assertEqual(self.runs, 1, "the second identical call must not run")
+        self.assertEqual(agent.skipped_repeats, 1)
+        self.assertEqual(text, "jag kommer inte åt filen")
+        skipped = [m for m in agent.messages if m.get("role") == "tool" and "NOT RUN" in m["content"]]
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("permission denied", skipped[0]["content"])
+        self.assertIn("load the matching skill", skipped[0]["content"])
+
+    def test_whitespace_differences_are_still_the_same_call(self) -> None:
+        agent = self._agent([
+            tool_call(name="denied", args='{"a": 1}', call_id="a"),
+            tool_call(name="denied", args='{ "a":  1 }', call_id="b"),
+            reply("klart"),
+        ])
+        agent.run_turn("go")
+        self.assertEqual(self.runs, 1)
+        self.assertEqual(agent.skipped_repeats, 1)
+
+    def test_a_different_call_after_a_failure_still_runs(self) -> None:
+        agent = self._agent([
+            tool_call(name="denied", args="{}", call_id="a"),
+            tool_call(name="echo", args='{"text":"hi"}', call_id="b"),
+            reply("klart"),
+        ])
+        agent.run_turn("go")
+        self.assertEqual(self.runs, 1)
+        self.assertEqual(agent.skipped_repeats, 0)
+
+    def test_a_repeat_after_success_is_allowed(self) -> None:
+        # A file can change between two identical reads, so only failures are
+        # remembered.
+        agent = self._agent([
+            tool_call(name="echo", args='{"text":"hi"}', call_id="a"),
+            tool_call(name="echo", args='{"text":"hi"}', call_id="b"),
+            reply("klart"),
+        ])
+        agent.run_turn("go")
+        self.assertEqual(agent.skipped_repeats, 0)
+
+    def test_the_skip_is_audited(self) -> None:
+        audit = FakeAudit()
+        agent = self._agent([
+            tool_call(name="denied", args="{}", call_id="a"),
+            tool_call(name="denied", args="{}", call_id="b"),
+            reply("klart"),
+        ], audit=audit)
+        agent.run_turn("go")
+        self.assertIn("tool.repeat_skipped", [e["event"] for e in audit.events])
+
+    def test_the_next_turn_starts_clean(self) -> None:
+        agent = self._agent([
+            tool_call(name="denied", args="{}", call_id="a"),
+            reply("turn one"),
+            tool_call(name="denied", args="{}", call_id="b"),
+            reply("turn two"),
+        ])
+        agent.run_turn("go")
+        agent.run_turn("go again")
+        self.assertEqual(self.runs, 2, "a new turn may retry what failed in the last one")
+        self.assertEqual(agent.skipped_repeats, 0)
+
+
 class TestPrompt(AgentTestCase):
     def test_system_prompt_has_workspace_and_date(self) -> None:
         agent = self.make_agent(FakeClient([]))
@@ -597,6 +693,60 @@ class TestTurnIntegrity(AgentTestCase):
         self.assertIsNone(agent._nudge)
 
 
+class TestPromptIsCacheable(unittest.TestCase):
+    """The prompt head must not change per turn: the server caches its prefill."""
+
+    class _Brain:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.total = 1
+
+        def context_block(self, query: str) -> str:
+            self.calls += 1
+            return f"Remembered for {query}"
+
+        def stats(self) -> dict:
+            return {"total": self.total}
+
+    def _agent(self):
+        cfg = Config()
+        cfg.brain.enabled = True
+        agent = Agent(cfg, None, Registry([]), brain=self._Brain())
+        return agent
+
+    def test_the_timestamp_has_no_clock(self) -> None:
+        prompt = self._agent().system_prompt("hi")
+        today = [line for line in prompt.splitlines() if line.startswith("Today:")]
+        self.assertEqual(len(today), 1)
+        self.assertRegex(today[0], r"^Today: \d{4}-\d{2}-\d{2} \S+$")
+
+    def test_the_memory_block_is_reused_within_a_session(self) -> None:
+        agent = self._agent()
+        first = agent.system_prompt("hur mycket disk")
+        agent.messages.append({"role": "user", "content": "hur mycket disk"})
+        agent.messages.append({"role": "assistant", "content": "svar"})
+        second = agent.system_prompt("något helt annat")
+        self.assertEqual(first, second, "an unchanged prompt is what the prefix cache needs")
+        self.assertEqual(agent.brain.calls, 1)
+
+    def test_a_new_memory_refreshes_the_block(self) -> None:
+        agent = self._agent()
+        agent.system_prompt("första")
+        agent.brain.total = 2  # the agent just learned something
+        agent.messages.append({"role": "user", "content": "igen"})
+        block = agent._memory_context("andra")
+        self.assertEqual(agent.brain.calls, 2)
+        self.assertIn("andra", block)
+
+    def test_the_block_refreshes_every_third_turn(self) -> None:
+        agent = self._agent()
+        for turn in range(5):
+            agent.messages.append({"role": "user", "content": f"fråga {turn}"})
+            agent._memory_context(f"fråga {turn}")
+        # turns 0 and 3 recompute (0 is the first) -> 2 calls, not 5
+        self.assertEqual(agent.brain.calls, 2)
+
+
 class TestPersistence(AgentTestCase):
     def test_persist_and_load_roundtrip(self) -> None:
         agent = self.make_agent(FakeClient([reply("hello")]))
@@ -619,6 +769,82 @@ class TestPersistence(AgentTestCase):
         agent.reset()
         self.assertEqual(agent.messages, [])
         self.assertEqual(agent.summary, "")
+
+class TestParallelInterrupt(AgentTestCase):
+    """Every announced call needs an answer, even when the turn is cut short."""
+
+    def test_calls_after_an_interrupted_one_are_answered_too(self) -> None:
+        client = FakeClient([
+            Completion(
+                tool_calls=[
+                    ToolCall(id="c1", name="echo", arguments='{"text":"ett"}'),
+                    ToolCall(id="c2", name="boom", arguments="{}"),
+                    ToolCall(id="c3", name="echo", arguments='{"text":"tre"}'),
+                ],
+                finish_reason="tool_calls",
+            )
+        ])
+        agent = self.make_agent(client)
+        agent.registry = Registry([
+            Tool("echo", "Echo text back.", {"type": "object", "properties": {}},
+                 lambda args: ok(f"echoed {args.get('text')}")),
+            Tool("boom", "Interrupts.", {"type": "object", "properties": {}},
+                 lambda args: (_ for _ in ()).throw(KeyboardInterrupt)),
+        ])
+
+        with self.assertRaises(KeyboardInterrupt):
+            agent.run_turn("kör de tre")
+
+        answered = [m["tool_call_id"] for m in agent.messages if m.get("role") == "tool"]
+        self.assertEqual(answered, ["c1", "c2", "c3"], "a missing tool reply invalidates the transcript")
+        self.assertIn("interrupted", agent.messages[-2]["content"])
+        self.assertIn("NOT RUN", agent.messages[-1]["content"])
+
+
+class TestMidTurnCompression(AgentTestCase):
+    """A single long tool loop must still be squeezed under the budget."""
+
+    def test_a_turn_with_no_user_boundary_shrinks_its_tool_results(self) -> None:
+        agent = self.make_agent(FakeClient([]), context_budget_tokens=200, keep_recent_turns=1)
+        agent.messages = [
+            {"role": "user", "content": "granska repot"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "a"}]},
+            {"role": "tool", "tool_call_id": "a", "name": "shell", "content": "x" * 4000},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "b"}]},
+            {"role": "tool", "tool_call_id": "b", "name": "shell", "content": "y" * 4000},
+        ]
+
+        self.assertTrue(agent.compress_if_needed())
+        self.assertEqual([m["role"] for m in agent.messages],
+                         ["user", "assistant", "tool", "assistant", "tool"],
+                         "the transcript shape must survive: ids and order unchanged")
+        self.assertEqual([m["tool_call_id"] for m in agent.messages if m["role"] == "tool"], ["a", "b"])
+        self.assertLess(len(agent.messages[2]["content"]), 400)
+        self.assertIn("dropped to fit the context", agent.messages[2]["content"])
+
+    def test_a_transcript_that_fits_is_left_alone(self) -> None:
+        agent = self.make_agent(FakeClient([]), context_budget_tokens=4000)
+        agent.messages = [
+            {"role": "user", "content": "hej"},
+            {"role": "tool", "tool_call_id": "a", "name": "shell", "content": "z" * 4000},
+        ]
+        self.assertFalse(agent.compress_if_needed())
+        self.assertEqual(len(agent.messages[1]["content"]), 4000)
+
+
+class TestTurnCounter(unittest.TestCase):
+    def test_compression_does_not_rewind_the_turn_count(self) -> None:
+        cfg = Config()
+        cfg.brain.enabled = False
+        agent = Agent(cfg, None, Registry([]))
+        for turn in range(4):
+            agent.messages.append({"role": "user", "content": f"fråga {turn}"})
+            self.assertEqual(agent.turn_count(), turn + 1)
+        seen = agent.turn_count()
+        agent.messages = agent.messages[-1:]  # what compression leaves behind
+        self.assertEqual(agent.turn_count(), seen, "the header must not show fewer turns later")
+        agent.reset()
+        self.assertEqual(agent.turn_count(), 0)
 
 
 if __name__ == "__main__":

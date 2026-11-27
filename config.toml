@@ -4,9 +4,9 @@ server_url = "http://127.0.0.1:8080"
 manage_server = true
 llama_server = "llama-server"
 n_ctx = 16384
-n_threads = 7
+n_threads = 4
 n_gpu_layers = -8
-extra_args = ["-lm", "dio"]
+extra_args = ["-fa", "off"]
 startup_timeout = 120.0
 
 [generation]
@@ -26,6 +26,7 @@ shell, a filesystem, and a persistent memory. Be direct and concrete: do the
 work with tools instead of describing what you would do. Never claim a command
 succeeded unless you ran it and saw the output. Prefer one decisive check over
 several speculative ones. Keep replies short - the user is watching a terminal."""
+autonomy = true
 
 [tools]
 shell_confirm = false
@@ -58,6 +59,7 @@ calendar_days_ahead = 14
 messages_limit = 500
 calls_limit = 300
 brief_lookahead_days = 2
+path = ""
 
 # Agent skills (SKILL.md folders, the open Agent Skills convention). Only the
 # name and description of each skill sit in the prompt; the model loads the
@@ -66,6 +68,7 @@ brief_lookahead_days = 2
 # so a copy in ~/.hauhau/skills overrides a built-in.
 [skills]
 enabled = true
+dirs = []
 # dirs = ["~/projects/my-skills"]
 
 [logging]

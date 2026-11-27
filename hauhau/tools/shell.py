@@ -41,10 +41,15 @@ def _normalise(cmd: str) -> str:
 
     A raw regex over the raw command missed ``RM -rf /``, ``rm \\<newline>-rf``
     and ``r''m -rf``. Quoting, line continuation, case and repeated spaces are
-    normalised before matching. Substitution (``X=rm; $X -rf``) still gets
-    through: this list is a speed bump, and ``shell_confirm`` is the real gate.
+    normalised before matching. A newline becomes ``;`` rather than a space, so
+    the second line of a pasted script is still a statement of its own:
+    ``echo hi\\nhauhau /config`` used to normalise to one segment, and the
+    self-spawn guard never saw the agent launch. Substitution (``X=rm; $X -rf``)
+    still gets through: this list is a speed bump, and ``shell_confirm`` is the
+    real gate.
     """
     flat = cmd.replace("\\\n", " ")
+    flat = re.sub(r"\r?\n", ";", flat)
     flat = re.sub(r"['\"]", "", flat)
     return re.sub(r"\s+", " ", flat).strip().lower()
 
@@ -274,8 +279,8 @@ def build(
         Tool(
             name="shell",
             description=(
-                "Run a bash command on the user's machine and return stdout+stderr with the exit code. "
-                "Use for inspecting files, running tests, git, package managers, and any CLI work."
+                "Run a bash command and return stdout+stderr with the exit code - files, tests, git, "
+                "package managers, any CLI."
             ),
             parameters={
                 "type": "object",

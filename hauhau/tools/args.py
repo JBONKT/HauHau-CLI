@@ -52,8 +52,13 @@ def integer(
             if not math.isfinite(raw):
                 raise BadArgument(f"'{key}' must be a finite integer")
             value = int(raw)
-        elif isinstance(raw, str) and raw.strip().lstrip("-").isdigit():
-            value = int(raw.strip())
+        elif isinstance(raw, str):
+            # isdigit() accepted strings int() rejects ("--5", "²") and the bare
+            # ValueError escaped as a tool crash instead of a usable message.
+            try:
+                value = int(raw.strip())
+            except ValueError:
+                raise BadArgument(f"'{key}' must be an integer, got {raw!r}") from None
         else:
             raise BadArgument(f"'{key}' must be an integer, got {type(raw).__name__}")
     if minimum is not None and value < minimum:

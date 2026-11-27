@@ -125,7 +125,23 @@ class ServerManager:
         )
 
     def restart(self) -> LlamaClient:
+        """Replace the running server, if this process started it.
+
+        A backend started elsewhere - by a previous run, by hand, or by another
+        window - cannot be restarted from here: ``stop()`` has nothing to kill
+        and ``ensure()`` returns the healthy old one. Reporting that as a
+        restart made ``/model`` and ``/tune`` claim the new settings were live
+        while the old server kept answering.
+        """
+        owned = self._proc is not None and self._proc.poll() is None
         self.stop()
+        if not owned and self.client().health():
+            raise LLMError(
+                f"a llama-server Hauhau did not start is answering at "
+                f"{self.cfg.model.server_url}, so it cannot be restarted from here. "
+                "Restart it yourself for this to take effect, or let Hauhau own it "
+                "by stopping it and running with --manage-server."
+            )
         return self.ensure()
 
     def stop(self) -> None:

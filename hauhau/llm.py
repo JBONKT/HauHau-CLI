@@ -14,6 +14,7 @@ unnecessary. Two model-specific quirks are handled here:
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import urllib.error
@@ -76,7 +77,14 @@ class LlamaClient:
     # --- plumbing ------------------------------------------------------
     def _request(self, path: str, payload: dict | None = None) -> urllib.request.Request:
         url = f"{self.base_url}{path}"
-        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        # Compact separators and no ASCII escaping: every separator is a token the
+        # server has to prefill on each step of every turn (the whole transcript is
+        # re-sent), and Swedish text doubles in size when escaped.
+        data = (
+            json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            if payload is not None
+            else None
+        )
         headers = {"Content-Type": "application/json"}
         return urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
 
@@ -100,6 +108,13 @@ class LlamaClient:
             ) from exc
         except TimeoutError as exc:
             raise LLMError(f"llama-server timed out after {self.timeout:.0f}s") from exc
+        except (http.client.HTTPException, ValueError) as exc:
+            # A malformed server_url ("http://127.0.0.1:notaport") raises
+            # InvalidURL, which used to escape as a traceback out of main().
+            raise LLMError(
+                f"cannot use the server URL {self.base_url!r}: {exc}. "
+                "Check server_url in config.toml."
+            ) from exc
 
     def health(self) -> bool:
         try:
@@ -218,6 +233,22 @@ class LlamaClient:
             for i, tc in enumerate(raw)
         ]
 
+    @staticmethod
+    def _tokens(source: Any, key: str, fallback: int = 0) -> int:
+        """A non-negative int, or ``fallback``.
+
+        Timings get this guard through :meth:`_rate`; usage needs the same one.
+        A server that omits the fields sends ``null``, and ``None`` stored in
+        ``Usage`` made the agent's running total raise TypeError mid-turn.
+        """
+        if not isinstance(source, dict):
+            return fallback
+        try:
+            number = int(source.get(key, fallback))
+        except (TypeError, ValueError):
+            return fallback
+        return max(0, number)
+
     def _stream_event(
         self,
         out: Completion,
@@ -232,8 +263,10 @@ class LlamaClient:
             out.usage.prompt_per_second = self._rate(event["timings"], "prompt_per_second")
         usage = event.get("usage")
         if isinstance(usage, dict) and usage:
-            out.usage.prompt_tokens = usage.get("prompt_tokens", out.usage.prompt_tokens)
-            out.usage.completion_tokens = usage.get("completion_tokens", out.usage.completion_tokens)
+            out.usage.prompt_tokens = self._tokens(usage, "prompt_tokens", out.usage.prompt_tokens)
+            out.usage.completion_tokens = self._tokens(
+                usage, "completion_tokens", out.usage.completion_tokens
+            )
         choices = event.get("choices") or []
         if not isinstance(choices, list):
             return
@@ -286,8 +319,8 @@ class LlamaClient:
             tool_calls=calls,
             finish_reason=choice.get("finish_reason") or "",
             usage=Usage(
-                prompt_tokens=usage.get("prompt_tokens", 0),
-                completion_tokens=usage.get("completion_tokens", 0),
+                prompt_tokens=self._tokens(usage, "prompt_tokens"),
+                completion_tokens=self._tokens(usage, "completion_tokens"),
                 tok_per_second=self._rate(timings, "predicted_per_second"),
                 prompt_per_second=self._rate(timings, "prompt_per_second"),
             ),
@@ -302,19 +335,34 @@ class LlamaClient:
     ) -> Completion:
         out = Completion()
         pending: dict[int, dict] = {}
+        seen_event = False
+        preview = ""
+        done = False
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
             if not line.startswith("data:"):
+                # A proxy error page or a JSON error body answers 200 with
+                # something that is not a stream. Returning an empty Completion
+                # there ended the turn with no answer and no error panel.
+                preview = preview or line
                 continue
             chunk = line[5:].strip()
             if chunk == "[DONE]":
+                done = True
                 break
             try:
                 event = json.loads(chunk)
             except json.JSONDecodeError:
                 continue
             if isinstance(event, dict):
+                seen_event = True
                 self._stream_event(out, event, pending, on_token, on_reasoning)
+        # Only markup counts as "not a stream": an SSE stream may still carry
+        # comments and malformed lines, and those are skipped silently.
+        if not seen_event and not done and preview[:1] in ("<", "{"):
+            raise LLMError(f"backend answered 200 but sent no stream: {preview[:200]!r}")
         out.tool_calls = [
             ToolCall(id=slot["id"] or f"call_{i}", name=slot["name"], arguments=slot["args"])
             for i, slot in sorted(pending.items())

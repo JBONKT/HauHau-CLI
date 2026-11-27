@@ -1,6 +1,7 @@
 ---
 name: app-actions
-description: Do things in Apple apps without touching their interface - create reminders and notes, open or draft mail, open Safari tabs, reveal files in Finder, play music. Use when the user wants an action in Mail, Notes, Reminders, Calendar, Safari, Music or Finder, and the task is not already covered by a dedicated tool.
+description: Do things in Apple apps without their interface - reminders, notes, mail, calendar events, Safari tabs, Finder, Music. Use when the user wants an action in one of those apps.
+allowed-tools: ["shell"]
 ---
 
 # app-actions

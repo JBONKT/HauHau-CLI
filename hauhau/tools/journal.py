@@ -41,7 +41,10 @@ def build(cfg, audit, journal) -> list[Tool]:
         due = journal.between(now - 30 * 86400, end, sources=["reminders"], limit=120)
         lines = [f"next {days} days:"]
         lines.extend([_line(r) for r in events] or ["  no calendar events"])
-        pending = [r for r in due if not r.meta.get("completed")]
+        # Only open reminders are ingested, so there is no "completed" flag to
+        # filter on here; a reminder ticked off in Reminders.app keeps showing
+        # until the next sync replaces the journal's copy.
+        pending = due
         if pending:
             lines.append("reminders:")
             lines += [_line(r) for r in pending]
@@ -70,9 +73,8 @@ def build(cfg, audit, journal) -> list[Tool]:
         Tool(
             name="journal_search",
             description=(
-                "Search the record of what actually happened - mails, messages, calls, calendar "
-                "events and reminders. Use it for what was said or sent; use rag_query for lessons "
-                "learned, and read_file for the contents of a file."
+                "Search what actually happened - mails, messages, calls, events and reminders. For "
+                "lessons use rag_query; for a file's contents use read_file."
             ),
             parameters={
                 "type": "object",

@@ -29,15 +29,12 @@ from .util import estimate_messages_tokens, estimate_tokens
 # "be autonomous" from one personality sentence.
 AUTONOMY_RULES = """\
 Work independently, and ask only as a last resort.
-- Missing a fact? Get it yourself: run the command, read `--help` or the man page,
-  grep the repo, find the file, or rag_query your own notes. Never ask for
-  something you can look up in one step.
-- Ambiguous request? Pick the most likely reading, do it, and state the assumption
-  in one short line ("assuming X"). Ask only when the action would destroy or
-  publish something.
-- Cannot do it? Do not stop at "I can't". Work out what is missing, learn it in
-  this turn - look it up, try it, read the error - and finish the job. Once it
-  works, record it with note_lesson so the next attempt is instant."""
+- Missing a fact? Get it yourself: run the command, read --help or the man page,
+  grep the repo, rag_query your notes.
+- Ambiguous? Pick the most likely reading, do it, state the assumption in one line;
+  ask only before destroying or publishing something.
+- Cannot do it? Do not stop at "I can't": work out what is missing, look it up, try
+  it, finish, then record it with note_lesson."""
 
 
 NUDGE_AMBIGUOUS = (
@@ -122,6 +119,11 @@ _COMMAND_WORDS = """
 
 _COMMANDS = frozenset(_COMMAND_WORDS.split())
 
+# How much of an oversized tool result survives when the transcript has no turn
+# boundary to cut at. Same order as the shell's own output cap, so one huge
+# result cannot fill the window on its own.
+_TOOL_CLIP_CHARS = 240
+
 
 def _looks_like_command(code: str) -> bool:
     for raw in code.splitlines():
@@ -205,18 +207,33 @@ class Agent:
         self._nudge: str | None = None
         self.nudges_this_turn = 0
         self._tool_failed = False
+        # A 2B model re-issues the call it just made, unchanged, when the result
+        # was disappointing. One such repeat costs a whole model step - about six
+        # seconds of prompt evaluation on this machine - so the failure is
+        # remembered and the repeat is answered instead of run.
+        self._failed_calls: dict[tuple[str, str], str] = {}
+        self.skipped_repeats = 0
+        # The memory block sits at the head of the prompt, so any change to it
+        # discards the server's cached prefix and re-prefills the whole transcript
+        # (about eight seconds here). Memories change only when the agent learns
+        # something, so the block is reused until the count moves.
+        self._memory_block = ""
+        self._memory_count: int | None = None
+        self._memory_turn = -99
+        self._turns = 0
 
     # --- prompt --------------------------------------------------------
     def system_prompt(self, query: str = "") -> str:
         a = self.cfg.agent
         parts = [self._personality(a.personality, a.name)]
         parts.append(f"Working directory: {self.cfg.workspace}")
-        parts.append(f"Today: {time.strftime('%Y-%m-%d %H:%M %Z')}")
+        # Date only: a clock in the prompt changes every minute, and with it the
+        # cached prefix - the first step of every turn then re-prefills the whole
+        # conversation for no benefit anyone asked for.
+        parts.append(f"Today: {time.strftime('%Y-%m-%d %Z')}")
         parts.append(
-            "You can call tools. Prefer acting over describing: if the user asks about files, "
-            "the system, or code, inspect it with a tool before answering. Tool results are "
-            "authoritative. If a command fails, read the error and adapt - do not repeat the same "
-            "call. Keep final answers to a few lines unless asked for detail."
+            "Tool results are authoritative: inspect before answering, read an error and adapt, "
+            "and keep final answers to a few lines unless asked for detail."
         )
         if getattr(a, "autonomy", True):
             parts.append(AUTONOMY_RULES)
@@ -225,7 +242,7 @@ class Agent:
             # rest of the conversation or into the session summary.
             parts.append(self._nudge)
         if self.brain is not None and self.cfg.brain.enabled:
-            block = self.brain.context_block(query or self._last_user_text())
+            block = self._memory_context(query)
             if block:
                 parts.append(block)
         if self.skills:
@@ -249,6 +266,31 @@ class Agent:
             return template.format(name=name)
         except (KeyError, IndexError, ValueError):
             return template.replace("{name}", name)
+
+    def _memory_context(self, query: str) -> str:
+        """The memory block, reused while it cannot have changed.
+
+        Recomputed when the number of stored memories moved (the agent learned
+        something) or every third turn, so a question is still answered with
+        memories that match it. Reusing it keeps the prompt byte-identical that
+        the server's prefix cache needs.
+        """
+        if self.brain is None:
+            return ""
+        try:
+            count = int(self.brain.stats()["total"])
+        except Exception:  # a broken brain.db must not break the turn
+            return self.brain.context_block(query or self._last_user_text())
+        due = (
+            self._memory_count is None
+            or count != self._memory_count
+            or self.turn_count() - self._memory_turn >= 3
+        )
+        if due:
+            self._memory_block = self.brain.context_block(query or self._last_user_text()) or ""
+            self._memory_count = count
+            self._memory_turn = self.turn_count()
+        return self._memory_block
 
     def _last_user_text(self) -> str:
         for msg in reversed(self.messages):
@@ -276,6 +318,8 @@ class Agent:
     def _run_steps(self, user_text: str) -> str:
         self.nudges_this_turn = 0
         self._tool_failed = False
+        self._failed_calls = {}
+        self.skipped_repeats = 0
         # A nudge left over from a turn that was interrupted would otherwise be
         # injected into the first request of the next one.
         self._nudge = None
@@ -290,8 +334,13 @@ class Agent:
                 # A call cut off at the token limit has incomplete arguments;
                 # running it would mean guessing the rest. Make the model redo it.
                 truncated = completion.finish_reason == "length"
-                for call in completion.tool_calls:
-                    self._execute(call, truncated=truncated)
+                calls = list(completion.tool_calls)
+                for position, call in enumerate(calls):
+                    # The calls after this one are handed over so an interrupt
+                    # can answer them too: the assistant message announced every
+                    # call in the batch, and a missing ``tool`` reply makes the
+                    # backend reject the transcript from then on.
+                    self._execute(call, truncated=truncated, remaining=calls[position + 1 :])
                 continue
             text = completion.content.strip()
             self.messages.append({"role": "assistant", "content": text})
@@ -396,20 +445,62 @@ class Agent:
             ]
         self.messages.append(message)
 
-    def _execute(self, call, truncated: bool = False) -> None:
+    def _execute(self, call, truncated: bool = False, remaining: list | tuple = ()) -> None:
         self.ui.tool_call(call.name, call.arguments)
+        repeat = self._repeat_result(call)
+        if repeat is not None:
+            self._append_tool_result(call, repeat)
+            return
         try:
             result = self._call_tool(call, truncated)
         except BaseException:
             # The assistant message that announced this call is already in the
             # history, so unwinding without a matching tool message leaves a
-            # transcript every later request rejects. Answer the call, then pass
-            # the interrupt on - Ctrl-C must still stop the turn.
+            # transcript every later request rejects. Answer the call - and the
+            # rest of the batch, which was never started - then pass the
+            # interrupt on: Ctrl-C must still stop the turn.
             self._append_tool_result(
                 call, fail(f"{call.name}: interrupted before it finished, nothing was reported")
             )
+            for other in remaining:
+                self._append_tool_result(
+                    other,
+                    fail(f"{other.name}: NOT RUN - the turn was interrupted while {call.name} ran"),
+                )
             raise
         self._append_tool_result(call, result)
+
+    @staticmethod
+    def _call_key(call) -> tuple[str, str]:
+        """Identity of a call: the tool, and its arguments however they arrived.
+
+        The model re-sends the same arguments with different spacing, so they are
+        canonicalised as JSON when they parse and as collapsed text when they do
+        not.
+        """
+        raw = call.arguments
+        if not isinstance(raw, str):
+            return call.name, json.dumps(raw, sort_keys=True, ensure_ascii=False)
+        try:
+            return call.name, json.dumps(json.loads(raw), sort_keys=True, ensure_ascii=False)
+        except (ValueError, TypeError):
+            return call.name, " ".join(raw.split())
+
+    def _repeat_result(self, call) -> ToolResult | None:
+        """The earlier failure, if this is the same call made again."""
+        key = self._call_key(call)
+        previous = self._failed_calls.get(key)
+        if previous is None:
+            return None
+        self.skipped_repeats += 1
+        if self.audit:
+            self.audit.log("tool.repeat_skipped", name=call.name, args=str(call.arguments)[:400])
+        self.ui.status(f"{call.name}: same call again - telling the model to change approach")
+        return fail(
+            f"{call.name}: NOT RUN - this exact call (same arguments) was already made in this "
+            f"turn and failed with: {previous[:200]}\nRepeating it returns the same error. "
+            "Change something: different arguments, another tool, or load the matching skill."
+        )
 
     def _call_tool(self, call, truncated: bool) -> ToolResult:
         tool = self.registry.get(call.name)
@@ -436,6 +527,7 @@ class Agent:
     def _append_tool_result(self, call, result: ToolResult) -> None:
         if not result.ok:
             self._tool_failed = True
+            self._failed_calls.setdefault(self._call_key(call), result.content)
         self.messages.append(
             {
                 "role": "tool",
@@ -471,11 +563,39 @@ class Agent:
             return folded
         cut = self._safe_split(a.keep_recent_turns * 2)
         if cut <= 0:
-            return folded
+            # One long tool loop lives entirely inside the current turn: there is
+            # no user message to split on, and dropping any message would orphan
+            # a tool_calls group. Shortening the oldest results still frees the
+            # window, and that is what keeps the backend from answering 400.
+            return self._shrink_tool_results(budget) or folded
         dropped, self.messages = self.messages[:cut], self.messages[cut:]
         self.summary = self._summarise(dropped) or self.summary
         self._cap_summary()
         return True
+
+    def _shrink_tool_results(self, budget: int) -> bool:
+        """Clip the oldest tool results until the prompt fits, keeping their ids.
+
+        Used only when the transcript cannot be cut at a turn boundary. Every
+        ``tool`` message keeps its ``tool_call_id``, so the transcript stays
+        valid for the backend; only the body is shortened, with a marker saying
+        how much went.
+        """
+        changed = False
+        for message in self.messages:
+            if estimate_messages_tokens(self.messages) + estimate_tokens(self.summary) <= budget:
+                break
+            if message.get("role") != "tool":
+                continue
+            text = str(message.get("content") or "")
+            if len(text) <= _TOOL_CLIP_CHARS:
+                continue
+            dropped = len(text) - _TOOL_CLIP_CHARS
+            message["content"] = (
+                f"{text[:_TOOL_CLIP_CHARS]} … [{dropped} chars dropped to fit the context]"
+            )
+            changed = True
+        return changed
 
     def _cap_summary(self) -> bool:
         """Compress the summary into itself when it exceeds the cap."""
@@ -567,6 +687,7 @@ class Agent:
     def reset(self) -> None:
         self.messages.clear()
         self.summary = ""
+        self._turns = 0
 
     def persist(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -597,4 +718,13 @@ class Agent:
         return True
 
     def turn_count(self) -> int:
-        return sum(1 for m in self.messages if m.get("role") == "user")
+        """Turns so far, never going backwards.
+
+        Derived from the ``user`` messages in the transcript, but remembering the
+        highest count seen: compression trims old turns, and a shrinking number
+        both mislabelled the header and stopped the memory block from ever being
+        refreshed again (its "every third turn" check could no longer fire).
+        """
+        seen = sum(1 for m in self.messages if m.get("role") == "user")
+        self._turns = max(self._turns, seen)
+        return self._turns

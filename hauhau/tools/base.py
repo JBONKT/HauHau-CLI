@@ -32,6 +32,16 @@ def fail(content: str, **meta: Any) -> ToolResult:
     return ToolResult(False, content, dict(meta))
 
 
+def _compact(value: Any) -> Any:
+    """Drop empty strings, lists and dicts from a schema, recursively."""
+    if isinstance(value, dict):
+        cleaned = {key: _compact(item) for key, item in value.items()}
+        return {key: item for key, item in cleaned.items() if item not in ("", [], {})}
+    if isinstance(value, list):
+        return [_compact(item) for item in value]
+    return value
+
+
 @dataclass
 class Tool:
     name: str
@@ -40,12 +50,19 @@ class Tool:
     fn: Callable[[dict[str, Any]], ToolResult]
 
     def schema(self) -> dict[str, Any]:
+        """The JSON-schema definition sent to the model on every request.
+
+        Every tool schema is prompt: on this machine a step costs milliseconds of
+        prefill per token, and `"description": ""` on a property that has none is
+        pure waste. Empty values are dropped and the text is collapsed to one
+        space-separated line, which is what the model reads anyway.
+        """
         return {
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
+                "description": " ".join(self.description.split()),
+                "parameters": _compact(self.parameters),
             },
         }
 

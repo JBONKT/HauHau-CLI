@@ -1,6 +1,7 @@
 ---
 name: dialog-handler
-description: Answer or dismiss a dialog, sheet, popup or prompt that is blocking a running macOS app - save dialogs, permission prompts, "are you sure" boxes. Use when an app is stuck waiting for a click and the shell cannot reach the decision.
+description: Answer or dismiss a dialog, sheet or popup blocking a running macOS app - save dialogs, permission prompts, "are you sure" boxes. Use when an app waits for a click the shell cannot reach.
+allowed-tools: ["ui"]
 ---
 
 # dialog-handler
@@ -47,5 +48,5 @@ For a "save as" name or a text prompt, set the field first, then press:
   explicit go-ahead first. Everything else is safe to click.
 - If `read` fails with a permission error, report which grant macOS asks for
   (Accessibility or Automation, for the python binary running the agent).
-- A depth of 2 is enough for most dialogs; add `"depth": 3` only if the list
-  looks cut short.
+- The walk is fixed: indices stay valid between `read` and `press`. If the
+  list was truncated, re-read with a higher `"max"` before pressing anything.

@@ -44,6 +44,29 @@ class Fetch:
 
 
 # --- AppleScript plumbing ---------------------------------------------
+# Tab and newline are the row separators, so a free-text field containing one
+# (a mail subject with a pasted table, a reminder name with a line break) shifted
+# every later column: the ISO date landed in the sender's slot, iso_to_epoch fell
+# back to "now" and the entry got a wrong timestamp. Every text field is passed
+# through this handler first. It is written without braces so the scripts that
+# use str.format can include it unchanged.
+ONELINE_HANDLER = (
+    "on oneLine(t)",
+    '    if t is missing value then return ""',
+    "    set t to t as text",
+    "    set d to AppleScript's text item delimiters",
+    "    set AppleScript's text item delimiters to tab",
+    "    set parts to text items of t",
+    "    set AppleScript's text item delimiters to space",
+    "    set t to parts as text",
+    "    set AppleScript's text item delimiters to space",
+    "    set t to paragraphs of t as text",
+    "    set AppleScript's text item delimiters to d",
+    "    return t",
+    "end oneLine",
+)
+
+
 def run_applescript(script: str, timeout: float = 60.0) -> str:
     """Run AppleScript and return its stdout, raising :class:`SourceError`."""
     try:
@@ -51,6 +74,9 @@ def run_applescript(script: str, timeout: float = 60.0) -> str:
             ["osascript", "-e", script],
             capture_output=True,
             text=True,
+            # osascript echoes user text (subjects, names) that is not always
+            # valid UTF-8; text=True alone raised UnicodeDecodeError out of a sync.
+            errors="replace",
             timeout=timeout,
             check=False,
         )
@@ -72,11 +98,26 @@ def _ensure_app(name: str) -> None:
     so the app is opened hidden with ``open -gja`` instead: no window takes
     focus, which matters for a sync that runs every 15 minutes.
     """
+    if _is_running(name):
+        return
     try:
         subprocess.run(["open", "-gja", name], capture_output=True, timeout=30, check=False)
         time.sleep(1.0)
     except (OSError, subprocess.SubprocessError):
         pass
+
+
+def _is_running(name: str) -> bool:
+    """Whether an app with this process name is already up.
+
+    ``open -gja`` succeeds whether or not the app was running, so the wait that
+    follows it is only needed on a cold start. Sleeping anyway cost a second per
+    source on every one of the 15-minute syncs.
+    """
+    try:
+        return subprocess.run(["pgrep", "-qx", name], capture_output=True, check=False).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def rows_of(output: str, fields: int) -> list[list[str]]:
@@ -128,6 +169,7 @@ def _script(*lines: str) -> str:
 
 
 MAIL_SCRIPT = _script(
+    *ONELINE_HANDLER,
     "set daysBack to {days}",
     "set cutoff to (current date) - daysBack * days",
     'tell application "Mail"',
@@ -135,8 +177,8 @@ MAIL_SCRIPT = _script(
     "    set n to 0",
     "    repeat with m in (messages of inbox whose date received >= cutoff)",
     "        if n >= {limit} then exit repeat",
-    "        set theRow to (id of m as string) & tab & (sender of m) & tab"
-    ' & (subject of m) & tab & ((date received of m) as \u00abclass isot\u00bb as string)',
+    "        set theRow to (id of m as string) & tab & my oneLine(sender of m) & tab"
+    ' & my oneLine(subject of m) & tab & ((date received of m) as \u00abclass isot\u00bb as string)',
     "        set end of out to theRow",
     "        set n to n + 1",
     "    end repeat",
@@ -175,6 +217,7 @@ def fetch_mail(days: int = 7, limit: int = 300) -> Fetch:
 
 
 CALENDAR_SCRIPT = _script(
+    *ONELINE_HANDLER,
     "set startDate to (current date) - {back} * days",
     "set endDate to (current date) + {ahead} * days",
     'tell application "Calendar"',
@@ -182,9 +225,9 @@ CALENDAR_SCRIPT = _script(
     "    repeat with cal in calendars",
     "        repeat with ev in (every event of cal whose start date >= startDate"
     " and start date <= endDate)",
-    "            set theRow to (summary of ev) & tab"
+    "            set theRow to my oneLine(summary of ev) & tab"
     ' & ((start date of ev) as \u00abclass isot\u00bb as string)'
-    " & tab & (name of cal) & tab & (uid of ev)",
+    " & tab & my oneLine(name of cal) & tab & (uid of ev)",
     "            set end of out to theRow",
     "        end repeat",
     "    end repeat",
@@ -219,6 +262,7 @@ def fetch_calendar(days_back: int = 1, days_ahead: int = 14) -> Fetch:
 
 
 REMINDERS_SCRIPT = _script(
+    *ONELINE_HANDLER,
     'tell application "Reminders"',
     "    set out to {}",
     "    repeat with l in lists",
@@ -230,8 +274,8 @@ REMINDERS_SCRIPT = _script(
     "            end try",
     # A reminder reached through "every reminder of every list" does not know its
     # own list, so the list name is carried in from the outer loop.
-    "            set theRow to (name of r) & tab & dueText & tab"
-    " & listName & tab & (id of r)",
+    "            set theRow to my oneLine(name of r) & tab & dueText & tab"
+    " & my oneLine(listName) & tab & (id of r)",
     "            set end of out to theRow",
     "        end repeat",
     "    end repeat",
@@ -263,20 +307,31 @@ def fetch_reminders() -> Fetch:
     return Fetch(entries, None)
 
 
+def _permission_help(path: Path, detail: str) -> SourceError:
+    """The message that tells the user which switch to flip."""
+    return SourceError(
+        f"cannot read {path}: {detail}. Grant Full Disk Access to the Python "
+        f"interpreter that runs Hauhau (System Settings > Privacy & Security > "
+        f"Full Disk Access), then sync again."
+    )
+
+
 def _open_ro(path: Path) -> sqlite3.Connection:
     """Open a system database read-only, with the reason when macOS refuses."""
-    if not path.exists():
-        raise SourceError(f"not found: {path}")
+    try:
+        path.stat()
+    except FileNotFoundError as exc:
+        raise SourceError(f"not found: {path}") from exc
+    except PermissionError as exc:
+        # Path.exists() swallows this and reported a Full Disk Access denial as
+        # "not found", so the message that says how to fix it never appeared.
+        raise _permission_help(path, exc.strerror or "permission denied") from exc
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10.0)
         conn.execute("SELECT 1")
         return conn
     except sqlite3.Error as exc:
-        raise SourceError(
-            f"cannot read {path}: {exc}. Grant Full Disk Access to the Python "
-            f"interpreter that runs Hauhau (System Settings > Privacy & Security > "
-            f"Full Disk Access), then sync again."
-        ) from exc
+        raise _permission_help(path, str(exc)) from exc
 
 
 MESSAGES_SQL = """

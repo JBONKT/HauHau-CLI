@@ -156,6 +156,20 @@ class TestValidation(ConfigTestCase):
         self.assertTrue(cfg.model.server_url.startswith("http://"))
         self.assertTrue(any("server_url" in w for w in warnings), warnings)
 
+
+    def test_a_huge_integer_for_a_float_setting_is_rejected_not_fatal(self) -> None:
+        # float(10**400) raises OverflowError; load() must warn instead of crashing.
+        path = self.write("[brain]\nhalf_life_days = " + "9" * 400 + "\n")
+        cfg, warnings = config_mod.load(path)
+        self.assertTrue(any("half_life_days" in w for w in warnings), warnings)
+        self.assertLess(cfg.brain.half_life_days, 1000, "the default must be kept")
+
+    def test_a_non_numeric_port_in_the_url_falls_back(self) -> None:
+        path = self.write('[model]\nserver_url = "http://127.0.0.1:notaport"\n')
+        cfg, warnings = config_mod.load(path)
+        self.assertEqual(cfg.model.server_url, "http://127.0.0.1:8080")
+        self.assertTrue(any("not usable" in w for w in warnings), warnings)
+
     def test_valid_values_do_not_warn(self) -> None:
         path = self.write('[model]\nn_ctx = 4096\n[generation]\ntemperature = 0.2\n')
         _, warnings = config_mod.load(path)
