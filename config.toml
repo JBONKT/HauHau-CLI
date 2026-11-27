@@ -3,23 +3,28 @@ gguf = "/Users/johan/modeller/gguf/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q4
 server_url = "http://127.0.0.1:8080"
 manage_server = true
 llama_server = "llama-server"
-n_ctx = 16384
+# M1 Air 8 GB: profiler wants 8k ctx / 4 threads / full Metal.
+# 16k + 3.2 GB weights was thrashing (heavy swap) and ~26 tok/s.
+n_ctx = 8192
 n_threads = 4
-n_gpu_layers = -8
-extra_args = ["-fa", "off"]
+n_gpu_layers = 99
+# Profiler for 3.2 GB model on 8 GB: stream weights + FA + single slot.
+# Skip KV q8 (-ctk): measured ~half gen speed on this box.
+extra_args = ["-lm", "none", "-fa", "on", "-np", "1"]
 startup_timeout = 120.0
 
 [generation]
 temperature = 0.7
 top_p = 0.95
-max_tokens = 1024
+max_tokens = 768
 think = false
 
 [agent]
 name = "Hauhau"
-max_steps = 12
-context_budget_tokens = 5000
-keep_recent_turns = 6
+max_steps = 10
+# Must stay <= n_ctx/2 so /tune ctx_floor does not force 10k+ again.
+context_budget_tokens = 4000
+keep_recent_turns = 4
 personality = """
 You are {name}, a CLI agent running locally on the user's machine. You have a
 shell, a filesystem, and a persistent memory. Be direct and concrete: do the
@@ -32,7 +37,7 @@ autonomy = true
 shell_confirm = false
 shell_timeout = 120.0
 denylist = []
-max_output_chars = 8000
+max_output_chars = 4000
 workspace = "/Users/johan"
 
 [brain]
@@ -41,7 +46,8 @@ top_k = 5
 half_life_days = 30.0
 dedupe_jaccard = 0.9
 dedupe_containment = 0.8
-inject_max_chars = 1500
+# Smaller inject = faster prompt on 8 GB; top_k still 5 for second-brain use.
+inject_max_chars = 1200
 embeddings_url = ""
 embeddings_model = "embeddinggemma-300m"
 

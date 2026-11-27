@@ -154,12 +154,62 @@ def recommend(profile: HardwareProfile, model_bytes: int = 0) -> dict:
     else:
         rec["n_ctx"] = (32768, f"{profile.ram_gb:g} GB RAM fits a 32k KV cache")
 
+    # Single-user agent: llama-server's auto parallel often opens 4 slots and
+    # multiplies the KV cache. One slot is enough and is critical on 8 GB.
+    flags: list[str] = ["-np", "1"]
+    reasons = ["one server slot (auto parallel multiplies KV cache)"]
+    if profile.metal:
+        flags.extend(["-fa", "on"])
+        reasons.append("flash attention on Metal")
+    if profile.ram_gb and profile.ram_gb <= 8:
+        # Stream weights when the model is a large share of unified memory.
+        if model_bytes and model_bytes / 1024**3 > profile.ram_gb * 0.35:
+            flags = ["-lm", "none", *flags]
+            reasons.append("stream weights from SSD to leave RAM for the OS")
+    rec["extra_args"] = (flags, "; ".join(reasons))
+
     if model_bytes and profile.ram_gb and model_bytes / 1024**3 > profile.ram_gb * 0.5:
         rec["warn_quant"] = (
             True,
             f"model is {model_bytes / 1024**3:.1f} GB on {profile.ram_gb:g} GB RAM (>50%): expect swap pressure",
         )
     return rec
+
+
+def merge_extra_args(current: list[str] | None, recommended: list[str]) -> list[str]:
+    """Keep user tokens; ensure recommended flag families are present.
+
+    Families are flag + optional value (``-np 1``, ``-fa on``, ``-lm none``).
+    A family already set by the user is left alone; missing families are appended.
+    """
+    current = list(current or [])
+    present: set[str] = set()
+    index = 0
+    while index < len(current):
+        token = current[index]
+        present.add(token)
+        index += 1
+        if index < len(current) and not current[index].startswith("-"):
+            index += 1
+    out = list(current)
+    index = 0
+    while index < len(recommended):
+        flag = recommended[index]
+        index += 1
+        value: str | None = None
+        if index < len(recommended) and not recommended[index].startswith("-"):
+            value = recommended[index]
+            index += 1
+        if flag in present:
+            continue
+        # -ctk bundles usually ship with -ctv; if either is present, skip both adds.
+        if flag in ("-ctk", "-ctv") and ("-ctk" in present or "-ctv" in present):
+            continue
+        out.append(flag)
+        present.add(flag)
+        if value is not None:
+            out.append(value)
+    return out
 
 
 def apply_recommendations(cfg, profile: HardwareProfile | None = None) -> list[str]:
@@ -173,7 +223,28 @@ def apply_recommendations(cfg, profile: HardwareProfile | None = None) -> list[s
         if name.startswith("warn_"):
             changes.append(f"warning: {reason}")
             continue
+        if name == "extra_args":
+            merged = merge_extra_args(cfg.model.extra_args, list(value))
+            if merged != list(cfg.model.extra_args or []):
+                cfg.model.extra_args = merged
+                changes.append(f"extra_args = {merged} ({reason})")
+            continue
         if getattr(cfg.model, name, None) != value:
             setattr(cfg.model, name, value)
             changes.append(f"{name} = {value} ({reason})")
     return changes
+
+
+def default_tune_trials(profile: HardwareProfile | None = None) -> int:
+    """Trials per tunable key when the user runs bare ``/tune``.
+
+    8 GB class machines need a larger budget: threads, GPU layers, flags and
+    brain.top_k each take several candidates, and the old default of 4 never
+    reached past the first groups.
+    """
+    profile = profile or probe()
+    if profile.ram_gb and profile.ram_gb <= 8:
+        return 12
+    if profile.ram_gb and profile.ram_gb <= 16:
+        return 8
+    return 6

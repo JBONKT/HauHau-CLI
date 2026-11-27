@@ -3,7 +3,13 @@ from __future__ import annotations
 import unittest
 
 from hauhau.config import Config
-from hauhau.profiler import HardwareProfile, apply_recommendations, recommend
+from hauhau.profiler import (
+    HardwareProfile,
+    apply_recommendations,
+    default_tune_trials,
+    merge_extra_args,
+    recommend,
+)
 
 
 def profile(**kwargs) -> HardwareProfile:
@@ -30,6 +36,13 @@ class TestRecommend(unittest.TestCase):
         self.assertEqual(rec["n_gpu_layers"][0], 99)
         self.assertEqual(rec["n_ctx"][0], 8192)
         self.assertLessEqual(rec["n_threads"][0], 6)
+        self.assertEqual(rec["extra_args"][0][:2], ["-np", "1"])
+        self.assertIn("-fa", rec["extra_args"][0])
+
+    def test_large_model_on_8gb_streams_weights(self) -> None:
+        rec = recommend(profile(ram_gb=8.0), model_bytes=int(3.2 * 1024**3))
+        self.assertEqual(rec["extra_args"][0][:2], ["-lm", "none"])
+        self.assertIn("-np", rec["extra_args"][0])
 
     def test_small_ram_keeps_context_small(self) -> None:
         self.assertEqual(recommend(profile(ram_gb=8.0))["n_ctx"][0], 8192)
@@ -75,7 +88,21 @@ class TestApply(unittest.TestCase):
         cfg.model.n_ctx = 8192
         cfg.model.n_threads = 4
         cfg.model.n_gpu_layers = 99
+        cfg.model.extra_args = ["-np", "1", "-fa", "on"]
         self.assertEqual(apply_recommendations(cfg, profile()), [])
+
+    def test_merge_extra_args_keeps_user_tokens(self) -> None:
+        merged = merge_extra_args(["-lm", "none", "--host", "127.0.0.1"], ["-np", "1", "-fa", "on"])
+        self.assertEqual(merged[:2], ["-lm", "none"])
+        self.assertIn("-np", merged)
+        self.assertIn("1", merged)
+        self.assertIn("-fa", merged)
+        self.assertIn("--host", merged)
+
+    def test_default_tune_trials_scale_with_ram(self) -> None:
+        self.assertEqual(default_tune_trials(profile(ram_gb=8.0)), 12)
+        self.assertEqual(default_tune_trials(profile(ram_gb=16.0)), 8)
+        self.assertEqual(default_tune_trials(profile(ram_gb=32.0)), 6)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,15 @@ FLAG_BUNDLES: tuple[FlagBundle, ...] = (
     FlagBundle("flash-attn-on", "-fa", ("-fa", "on"), "flash attention on: faster prompt processing"),
     FlagBundle("flash-attn-off", "-fa", ("-fa", "off"), "flash attention off: this build defaults to auto"),
     FlagBundle(
+        "single-slot", "-np", ("-np", "1"),
+        "one server slot: auto parallel multiplies the KV cache for no agent gain",
+    ),
+    FlagBundle(
+        "two-slots", "-np", ("-np", "2"),
+        "two server slots: only useful if two requests run at once",
+        lambda ram_gb, has_gpu: ram_gb >= 16,
+    ),
+    FlagBundle(
         "ssd-stream", "-lm", ("-lm", "none"),
         "stream the model from SSD instead of memory-mapping it: less RAM pressure, slower load",
         lambda ram_gb, has_gpu: 0 < ram_gb <= 16,

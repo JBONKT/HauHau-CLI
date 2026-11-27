@@ -462,8 +462,11 @@ class Repl:
             return
         try:
             # Trials *per key*, not in total: with several keys tunable, a single
-            # shared budget would only ever reach the first one.
-            budget = int(arg) if arg.strip() else 4
+            # shared budget would only ever reach the first one. Bare /tune uses
+            # a hardware-aware default (12 on 8 GB) so flag groups are reachable.
+            from .profiler import default_tune_trials
+
+            budget = int(arg) if arg.strip() else default_tune_trials(self.profile)
         except ValueError:
             note(self.console, "usage: /tune [trials-per-key]", WARN)
             return
