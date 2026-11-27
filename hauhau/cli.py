@@ -15,6 +15,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 
+from . import __version__
 from . import config as config_mod
 from .agent import Agent
 from .audit import Audit
@@ -131,6 +132,7 @@ class Repl:
         handler = {
             "/help": self.cmd_help,
             "/status": self.cmd_status,
+            "/version": self.cmd_version,
             "/show": self.cmd_show,
             "/?": self.cmd_help,
             "/tools": self.cmd_tools,
@@ -167,6 +169,10 @@ class Repl:
 
     def cmd_help(self, arg: str) -> None:
         help_panel(self.console, arg)
+
+    def cmd_version(self, _arg: str) -> None:
+        """Package version (same string as ``hauhau --version``)."""
+        note(self.console, f"hauhau {__version__}")
 
     def cmd_status(self, _arg: str) -> None:
         """One screen, so a user does not have to ask four questions."""
@@ -966,6 +972,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", help="where memory, logs and sessions live")
     parser.add_argument("--max-steps", type=int, help="max tool steps per turn")
     parser.add_argument("--profile", action="store_true", help="print hardware profile and exit")
+    parser.add_argument(
+        "--version",
+        "-V",
+        action="store_true",
+        help="print the hauhau package version and exit",
+    )
     parser.add_argument("--resume", nargs="?", const="last", help="resume the last (or named) session")
     parser.add_argument(
         "--yolo", action="store_true", help="accepted for compatibility; auto-run is already the default"
@@ -1548,6 +1560,10 @@ class Runtime:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.version:
+        # Before config / server: version must work with a missing GGUF or config.
+        print(f"hauhau {__version__}")
+        return 0
     interface = None
     try:
         interface = _pick_interface(args)

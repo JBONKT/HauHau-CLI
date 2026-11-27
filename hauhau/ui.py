@@ -60,6 +60,7 @@ COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         [
             ("/help", "commands, or details for one: /help tune"),
             ("/status", "one screen: model, memory, prompt, session"),
+            ("/version", "print the hauhau package version"),
             ("/config", "effective configuration and where it came from"),
             ("/context", "token usage of this conversation"),
             ("/clear", "forget the conversation, keep memory"),
