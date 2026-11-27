@@ -68,6 +68,9 @@ chrome pinned to the bottom, a long transcript scrolled inside a fixed frame,
 Works on macOS and Linux. You need a local GGUF on disk; nothing is downloaded at
 install or runtime.
 
+Do **not** run macOS/BSD `install https://github.com/…` — that is a file-copy
+utility, not a package installer. Clone the repo, then run setup as below.
+
 ### Prerequisites
 
 | Requirement | Notes |
@@ -81,15 +84,19 @@ install or runtime.
 brew install python llama.cpp
 ```
 
-### One-command setup
-
-From the repo root (safe to re-run after a pull or a Python upgrade):
+### Clone and one-command setup
 
 ```bash
-./scripts/setup.sh
+git clone https://github.com/JBONKT/HauHau-CLI.git
+cd HauHau-CLI
+
+# Point config.toml [model] gguf at your local .gguf first if the default path
+# does not exist on this machine (setup lists nearby candidates on failure).
+
+./scripts/setup.sh   # safe to re-run after a pull or a Python upgrade
 ```
 
-What it does:
+What `./scripts/setup.sh` does:
 
 1. Checks Python ≥ 3.11 and that `llama-server` is on `PATH`
 2. Confirms the GGUF path in `config.toml` exists (lists nearby candidates if not)
@@ -98,6 +105,9 @@ What it does:
 5. Creates `~/.hauhau/{logs,brain,sessions}`
 6. Writes `~/.local/bin/hauhau` → `.venv/bin/python -m hauhau --config <repo>/config.toml`
 7. Smoke-tests that the launcher runs from another directory (`hauhau --profile`)
+
+Successful setup ends with something like `ready. run: hauhau "…"` and
+`launcher: ~/.local/bin/hauhau`.
 
 Optional environment overrides for the script:
 
@@ -127,17 +137,46 @@ extra (`textual`). Dev linting uses the `dev` extra (`ruff`).
 
 ### Verify the install
 
-```bash
-# Same check as setup.sh (exit 0 = launcher + import + config load OK)
-cd /tmp && hauhau --profile >/dev/null
+Run these in order after setup. Steps 1–2 need no model load; 3–4 start
+`llama-server` (first load can take a minute on cold Metal).
 
-# Print hardware probe and recommended server flags (use --plain so tables
-# show in non-fullscreen / scripted terminals)
+```bash
+# 1) Launcher on PATH + CLI parses (exit 0)
+which hauhau
+hauhau --help
+
+# 2) Same smoke check as setup.sh (exit 0 = launcher + import + config load OK).
+# --profile may print little or nothing on success; only the exit code matters here.
+cd /tmp && hauhau --profile
+echo "profile exit=$?"
+
+# Optional: print hardware probe and recommended server flags
 hauhau --plain --profile
 
-# One-shot turn against the live model (starts llama-server, stops on exit)
+# 3) One-shot turn against the live model (starts llama-server, stops on exit)
 hauhau --plain "Reply with exactly: hauhau-ok"
+# Expect a short answer containing hauhau-ok and a timing line (tok / tok/s).
+
+# 4) Interactive multi-turn (conversational flow + clean shutdown)
+hauhau --plain
+# At the prompt, try:
+#   What is 2+2? Answer with just the number.
+#   What did I just ask you?
+#   /help
+#   /quit
+# Expect: numeric answer; a recall of the prior question; distill on quit; "bye".
 ```
+
+| Check | Pass criteria |
+|---|---|
+| `which hauhau` | Resolves to `~/.local/bin/hauhau` (or your `LAUNCHER_DIR`) |
+| `hauhau --profile` | Exit code 0 from any working directory |
+| One-shot `--plain` | Banner shows GGUF + ctx/threads; model reply; process exits |
+| Interactive `--plain` | Multi-turn context holds; `/quit` distills session and exits cleanly |
+
+If step 3 fails, confirm `llama-server` works, the GGUF path exists, and nothing
+else is bound to the configured port (default `http://127.0.0.1:8080`). Inspect
+`~/.hauhau/logs/server.log` after a failed start.
 
 **The model.** `config.toml` points `[model] gguf` at a local GGUF (currently
 `~/modeller/gguf/Gemma-4-E2B-…-Q4_K_P.gguf`, ~3.2 GB). Any compatible GGUF works;
