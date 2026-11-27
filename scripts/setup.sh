@@ -47,8 +47,8 @@ if [ ! -x "$REPO/.venv/bin/python" ]; then
     "$PYTHON" -m venv "$REPO/.venv"
 fi
 "$REPO/.venv/bin/python" -m pip install -q --upgrade pip
-say "  installing hauhau (editable, with dev extras)"
-"$REPO/.venv/bin/python" -m pip install -q -e "$REPO[dev]"
+say "  installing hauhau (editable, with dev and tui extras)"
+"$REPO/.venv/bin/python" -m pip install -q -e "$REPO[dev,tui]"
 
 # --- 5. runtime dirs -------------------------------------------------------
 mkdir -p "$DATA_DIR/logs" "$DATA_DIR/brain" "$DATA_DIR/sessions"

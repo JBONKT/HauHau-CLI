@@ -78,6 +78,33 @@ class TestMemoryTools(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("text", result.content)
 
+    def test_note_lesson_stores_a_procedure(self) -> None:
+        result = self.run_tool(
+            "note_lesson", lesson="Kör `llama-server --help` för att lista flaggorna."
+        )
+        self.assertTrue(result.ok, result.content)
+        self.assertIn("learned", result.content)
+        hits = self.brain.recall("llama-server flaggor", k=3)
+        self.assertTrue(any("--help" in hit.text for hit in hits), [h.text for h in hits])
+        self.assertEqual(
+            next(hit.kind for hit in hits if "--help" in hit.text), "procedural"
+        )
+
+    def test_note_lesson_is_deduplicated(self) -> None:
+        first = self.run_tool("note_lesson", lesson="Starta om backend med /model.")
+        second = self.run_tool("note_lesson", lesson="Starta om backend med /model.")
+        self.assertIn("learned", first.content)
+        self.assertIn("already knew", second.content)
+        self.assertEqual(self.brain.stats()["total"], 1)
+
+    def test_note_lesson_rejects_an_empty_lesson(self) -> None:
+        self.assertFalse(self.run_tool("note_lesson", lesson="  ").ok)
+
+    def test_note_lesson_is_audited(self) -> None:
+        self.run_tool("note_lesson", lesson="Sätt n_ctx till 8192 på 8 GB.")
+        entries = self.audit.tail(20)
+        self.assertTrue(any(e.get("event") == "note_lesson" for e in entries), entries)
+
     def test_rag_query_finds_what_was_written(self) -> None:
         self.run_tool("rag_write", text="The model lives at ~/modeller/gguf in this project.")
         result = self.run_tool("rag_query", query="where does the model live")
@@ -158,6 +185,39 @@ class TestShell(ToolTestCase):
         import time as _time
 
         _time.sleep(0.5)
+        pid = int(pidfile.read_text().strip())
+        with self.assertRaises(ProcessLookupError):
+            _os.kill(pid, 0)
+
+    def test_huge_output_is_bounded_while_reading(self) -> None:
+        # The read loop buffered every byte and clipped only after exit, so
+        # `yes` or a verbose build could allocate gigabytes before returning.
+        self.cfg.tools.max_output_chars = 2000
+        result = self.run_tool("shell", cmd="yes 'flood' | head -n 400000")
+        self.assertTrue(result.ok, result.content[:200])
+        self.assertIn("more bytes; the rest was not kept", result.content)
+        self.assertLess(len(result.content), 2000 * 4 + 1000)
+
+    def test_interrupt_kills_the_command(self) -> None:
+        # The child runs in its own session, so Ctrl-C never reaches it: the
+        # interrupt used to leave the whole process group running.
+        import os as _os
+        import signal
+        import threading
+        import time as _time
+
+        pidfile = self.root / "interrupted.pid"
+        tool = self.registry.get("shell")
+
+        def arm() -> None:
+            _time.sleep(0.7)
+            signal.raise_signal(signal.SIGINT)
+
+        threading.Thread(target=arm, daemon=True).start()
+        with self.assertRaises(KeyboardInterrupt):
+            tool.run({"cmd": f"sleep 30 & echo $! > {pidfile}; sleep 30"})
+        self.assertTrue(pidfile.is_file(), "the command never started")
+        _time.sleep(0.7)
         pid = int(pidfile.read_text().strip())
         with self.assertRaises(ProcessLookupError):
             _os.kill(pid, 0)

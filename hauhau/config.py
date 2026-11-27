@@ -49,6 +49,9 @@ class GenerationConfig:
 class AgentConfig:
     name: str = "Hauhau"
     max_steps: int = 12
+    # Work out what was meant and learn what is missing instead of handing the
+    # turn back with a question. Off means the model's answer is final.
+    autonomy: bool = True
     context_budget_tokens: int = 5000
     keep_recent_turns: int = 6
     personality: str = DEFAULT_PERSONALITY
@@ -78,15 +81,26 @@ class BrainConfig:
 @dataclass
 class JournalConfig:
     """The second-brain journal: mails, messages, calls, events, reminders."""
-
     enabled: bool = True
-    path: str = ""  # empty = <data_dir>/journal.db
+    path: str = ""  # empty = <data_dir>/journal/journal.db
     mail_days: int = 7
     calendar_days_back: int = 1
     calendar_days_ahead: int = 14
     messages_limit: int = 500
     calls_limit: int = 300
     brief_lookahead_days: int = 2
+
+
+@dataclass
+class SkillsConfig:
+    """Agent skills: SKILL.md folders loaded on demand (progressive disclosure).
+
+    ``dirs`` adds lookups before the default ones; the first folder with a
+    given name wins, so a user copy overrides a bundled skill.
+    """
+
+    enabled: bool = True
+    dirs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -103,6 +117,7 @@ class Config:
     tools: ToolConfig = field(default_factory=ToolConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
     journal: JournalConfig = field(default_factory=JournalConfig)
+    skills: SkillsConfig = field(default_factory=SkillsConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     source: Path | None = None
 
@@ -213,9 +228,7 @@ def _apply(obj: Any, table: dict[str, Any], origin: str) -> list[str]:
                 f"{origin}{key} must be {_describe(default)}; ignoring {value!r}"
             )
             continue
-        if isinstance(default, float) and isinstance(value, int):
-            value = float(value)
-        setattr(obj, key, value)
+        setattr(obj, key, float(value) if isinstance(default, float) and isinstance(value, int) else value)
     return warnings
 
 
@@ -324,8 +337,7 @@ def dumps(cfg: Config) -> str:
             continue
         section = getattr(cfg, f.name)
         lines.append(f"[{f.name}]")
-        for sf in fields(section):
-            lines.append(f"{sf.name} = {_fmt(getattr(section, sf.name))}")
+        lines.extend(f"{sf.name} = {_fmt(getattr(section, sf.name))}" for sf in fields(section))
         lines.append("")
     return "\n".join(lines)
 

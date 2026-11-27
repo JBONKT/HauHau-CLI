@@ -137,6 +137,20 @@ class TestContextFloor(unittest.TestCase):
         self.assertTrue(all(value >= ctx_floor(cfg) for value in offered), offered)
         self.assertNotIn(4096, offered)
 
+    def test_a_big_model_leaves_less_room_for_the_kv_cache(self) -> None:
+        from hauhau.evolve.tune import _ctx_options
+
+        small = [value for value, _why in _ctx_options(16, 1.0)]
+        large = [value for value, _why in _ctx_options(16, 14.0)]
+        self.assertTrue(max(small) > max(large), (small, large))
+
+    def test_the_model_size_comes_from_the_configured_file(self) -> None:
+        from hauhau.evolve.tune import _model_gb
+
+        cfg = Config()
+        cfg.model.gguf = "/nonexistent/model.gguf"
+        self.assertEqual(_model_gb(cfg), 0.0)
+
     def test_adopting_below_the_floor_is_refused(self) -> None:
         cfg = Config()
         with self.assertRaises(ValueError) as caught:

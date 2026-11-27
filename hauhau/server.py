@@ -33,7 +33,11 @@ class ServerManager:
 
     def _host_port(self) -> tuple[str, int]:
         parsed = urllib.parse.urlparse(self.cfg.model.server_url)
-        return parsed.hostname or "127.0.0.1", parsed.port or 8080
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise LLMError(f"invalid port in [model] server_url {self.cfg.model.server_url!r}") from exc
+        return parsed.hostname or "127.0.0.1", port or 8080
 
     def _spawn_args(self) -> list[str]:
         m = self.cfg.model
@@ -65,6 +69,10 @@ class ServerManager:
         if not os.path.isfile(os.path.expanduser(self.cfg.model.gguf)):
             raise LLMError(f"model file not found: {self.cfg.model.gguf}")
 
+        # A previous managed process (e.g. after a failed revive) must not be
+        # orphaned: stop() terminates it and closes its log handle first.
+        if self._proc is not None:
+            self.stop()
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         args = self._spawn_args()
         if self.audit:
@@ -73,7 +81,17 @@ class ServerManager:
         log.write(f"\n=== {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} starting ===\n")
         log.flush()
         self._log = log
-        self._proc = self._popen(args, log)
+        try:
+            self._proc = self._popen(args, log)
+        except OSError as exc:
+            # A missing llama-server binary must not leak the log fd or escape
+            # as a raw FileNotFoundError the CLI does not catch.
+            log.close()
+            self._log = None
+            raise LLMError(
+                f"could not start {args[0]!r}: {exc}. Install llama.cpp or set "
+                f"[model] llama_server to an absolute path."
+            ) from exc
 
         deadline = time.monotonic() + self.cfg.model.startup_timeout
         while time.monotonic() < deadline:

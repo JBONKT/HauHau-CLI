@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import time
 import unittest
 
 from hauhau.llm import Usage
 from hauhau.tools.base import ToolResult
-from hauhau.tui import ScreenApp, ScreenUI, _Wrapper
+from hauhau.tui import RIGHT, ScreenApp, ScreenUI, _Wrapper
 
 
 def text_of(fragments: list[tuple[str, str]]) -> str:
@@ -52,6 +53,24 @@ class TestWrapper(unittest.TestCase):
         self.assertEqual(len(wrapper.wrap(fragments, 40)), 1)
         self.assertEqual(len(wrapper.wrap(fragments, 6)), 3)
 
+    def test_a_user_bubble_is_right_aligned(self):
+        wrapped = _Wrapper().wrap([(RIGHT + "bold", "hello world")], 20)
+        self.assertEqual(len(wrapped), 1)
+        line = text_of(wrapped[0])
+        self.assertEqual(len(line), 20)
+        self.assertTrue(line.endswith("hello world "))
+        self.assertGreater(len(line) - len(line.lstrip()), 0)
+        # The alignment marker must never reach the renderer.
+        self.assertFalse(any(style.startswith(RIGHT) for style, _text in wrapped[0]))
+
+    def test_a_bubble_wraps_below_the_full_width(self):
+        wrapped = _Wrapper().wrap([(RIGHT + "", "alpha beta gamma delta epsilon zeta")], 40)
+        self.assertGreater(len(wrapped), 1)
+        for line in wrapped:
+            self.assertLessEqual(len(text_of(line)), 40)
+        # At most 78% of the window, plus the bubble's own padding.
+        self.assertLessEqual(len(text_of(wrapped[0]).strip()), 40)
+
     def test_shrinking_history_resets(self):
         wrapper = _Wrapper()
         wrapper.wrap([("", "a"), ("", "\nb"), ("", "\nc")], 20)
@@ -64,13 +83,17 @@ class TestScreenUI(unittest.TestCase):
 
     def test_echo_opens_and_closes_its_line(self):
         self.ui.echo("hello")
-        self.assertEqual(text_of(self.ui.fragments), "\n❯ hello\n")  # noqa: RUF001 - prompt glyph
+        self.assertEqual(text_of(self.ui.fragments), "hello\n\n")
+        # The message is a bubble: the wrapper right-aligns it, so it carries the
+        # alignment marker and its own background.
+        self.assertTrue(self.ui.fragments[-2][0].startswith(RIGHT))
+        self.assertIn("bg:", self.ui.fragments[-2][0])
 
     def test_tokens_do_not_add_a_blank_line_after_the_echo(self):
         self.ui.echo("hello")
         self.ui.token("an ")
         self.ui.token("answer")
-        self.assertEqual(text_of(self.ui.fragments), "\n❯ hello\nan answer")  # noqa: RUF001
+        self.assertEqual(text_of(self.ui.fragments), "hello\n\nan answer")
 
     def test_turn_start_and_end_clear_the_busy_state(self):
         self.ui.turn_start()
@@ -122,8 +145,9 @@ class TestScreenApp(unittest.TestCase):
         return app, ui
 
     def test_chat_rows_leave_the_chrome_alone(self):
+        # header, status, input: three rows, and the frame lives inside the rest.
         app, _ui = self.make(rows=12)
-        self.assertEqual(app._chat_rows(), 8)
+        self.assertEqual(app._chat_rows(), 9)
 
     def test_chat_rows_never_collapse(self):
         app, _ui = self.make(rows=3)
@@ -133,9 +157,9 @@ class TestScreenApp(unittest.TestCase):
         app, ui = self.make(columns=20, rows=8)
         ui.fragments = [("", "\n".join(f"line {i}" for i in range(1, 31)))]
         view = lines_of(app._chat_view())
-        self.assertEqual(len(view), 4)
+        self.assertEqual(len(view), 5)
         self.assertEqual(view[-1], "line 30")
-        self.assertEqual(view[0], "line 27")
+        self.assertEqual(view[0], "line 26")
 
     def test_view_starts_at_the_top_when_the_history_is_short(self):
         app, ui = self.make(columns=20, rows=8)
@@ -149,7 +173,7 @@ class TestScreenApp(unittest.TestCase):
         app._scroll_page(direction=1)
         self.assertFalse(ui.follow)
         view = lines_of(app._chat_view())
-        self.assertEqual((view[0], view[-1]), ("line 25", "line 28"))
+        self.assertEqual((view[0], view[-1]), ("line 23", "line 27"))
 
     def test_scrolling_back_down_resumes_following(self):
         app, ui = self.make(columns=20, rows=8)
@@ -169,6 +193,51 @@ class TestScreenApp(unittest.TestCase):
         app._on_typed(app.input_buffer)
         self.assertTrue(ui.follow)
         self.assertEqual(lines_of(app._chat_view())[-1], "line 30")
+
+    def test_a_wide_window_draws_the_chat_frame(self):
+        app, ui = self.make(columns=80, rows=10)
+        ui.fragments = [("", "hello")]
+        view = lines_of(app._chat_view())
+        self.assertEqual(len(view), 7)  # rows - header/status/input
+        self.assertTrue(view[0].startswith("╭") and view[0].endswith("╮"))
+        self.assertTrue(view[-1].startswith("╰") and view[-1].endswith("╯"))
+        self.assertIn("hauhau", view[0])
+        self.assertIn("1-1 of 1", view[-1])
+        self.assertTrue(all(len(line) == 80 for line in view))
+        self.assertIn("hello", view[1])
+
+    def test_a_narrow_window_drops_the_frame(self):
+        app, ui = self.make(columns=40, rows=10)
+        ui.fragments = [("", "hello")]
+        view = lines_of(app._chat_view())
+        self.assertFalse(any(line.startswith(("╭", "│")) for line in view))
+        self.assertEqual(view[0], "hello")
+
+    def test_the_header_bar_fills_the_row(self):
+        app, _ui = self.make(columns=60, rows=10)
+        app.stats = lambda: {"name": "Hauhau", "model": "lfm3", "ctx": "16k"}  # type: ignore
+        bar = text_of(app._header())
+        self.assertEqual(len(bar), 60)
+        self.assertIn("Hauhau", bar)
+        self.assertIn("ctx 16k", bar)
+
+    def test_the_status_bar_shows_a_spinner_while_busy(self):
+        app, ui = self.make(columns=60, rows=10)
+        ui.turn_start("thinking…")
+        first = text_of(app._status())
+        self.assertIn("thinking…", first)
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertNotEqual(first, text_of(app._status()))
+
+    def test_the_status_bar_shows_the_last_turn_speed(self):
+        app, ui = self.make(columns=60, rows=10)
+        ui.last_usage = Usage(prompt_tokens=120, completion_tokens=40, tok_per_second=41.0)
+        ui.last_elapsed = 2.5
+        status = text_of(app._status())
+        for fragment in ("2.5s", "40 tok", "41 tok/s", "prompt 120"):
+            self.assertIn(fragment, status)
 
     def test_the_input_buffer_accepts_enter(self):
         """prompt_toolkit 3.0.53 defaults Buffer to multiline, where Enter only

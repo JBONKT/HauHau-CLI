@@ -65,6 +65,12 @@ CREATE TABLE IF NOT EXISTS cursors (
     cursor     TEXT NOT NULL,
     updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS source_state (
+    source     TEXT PRIMARY KEY,
+    ok         INTEGER NOT NULL,
+    detail     TEXT NOT NULL DEFAULT '',
+    checked_at REAL NOT NULL
+);
 """
 
 
@@ -182,6 +188,33 @@ class Journal:
         )
         self.conn.commit()
 
+    @_locked
+    def set_state(self, source: str, ok: bool, detail: str = "") -> None:
+        """Remember how a source behaved, so a status check need not re-read it.
+
+        Probing by syncing is expensive (Mail takes a minute) and leaves the
+        permissions untested exactly when nobody is watching; recording the
+        outcome of the real run keeps ``--status`` instant and honest.
+        """
+        self.conn.execute(
+            "INSERT INTO source_state (source, ok, detail, checked_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(source) DO UPDATE SET ok = excluded.ok,"
+            " detail = excluded.detail, checked_at = excluded.checked_at",
+            (source, 1 if ok else 0, detail, time.time()),
+        )
+        self.conn.commit()
+
+    @_locked
+    def states(self) -> dict[str, dict]:
+        return {
+            row["source"]: {
+                "ok": bool(row["ok"]),
+                "detail": row["detail"],
+                "checked_at": row["checked_at"],
+            }
+            for row in self.conn.execute("SELECT * FROM source_state")
+        }
+
     # --- reads ---------------------------------------------------------
     @_locked
     def search(
@@ -216,6 +249,7 @@ class Journal:
                 pass
         return self._like(query, k, sources, since)
 
+    @_locked
     def _like(self, query: str, k: int, sources: list[str] | None, since: float | None) -> list[Row]:
         needle = f"%{query.strip()}%"
         sql = "SELECT * FROM events WHERE (title LIKE ? OR body LIKE ? OR people LIKE ?)"

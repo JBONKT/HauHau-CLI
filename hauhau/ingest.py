@@ -64,6 +64,21 @@ def run_applescript(script: str, timeout: float = 60.0) -> str:
     return done.stdout
 
 
+def _ensure_app(name: str) -> None:
+    """Start an app in the background, so AppleScript can talk to it.
+
+    A quit app answers -600 ("the application isn't running"), and
+    ``tell application X to launch`` failed with the same -600 on this machine,
+    so the app is opened hidden with ``open -gja`` instead: no window takes
+    focus, which matters for a sync that runs every 15 minutes.
+    """
+    try:
+        subprocess.run(["open", "-gja", name], capture_output=True, timeout=30, check=False)
+        time.sleep(1.0)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def rows_of(output: str, fields: int) -> list[list[str]]:
     """Parse ``field TAB field … NEWLINE`` rows, dropping malformed ones.
 
@@ -83,8 +98,21 @@ def rows_of(output: str, fields: int) -> list[list[str]]:
 
 
 def iso_to_epoch(text: str) -> float:
-    """AppleScript's ``«class isot»`` string to epoch seconds."""
-    cleaned = text.strip().replace("Z", "")
+    """AppleScript's ``«class isot»`` string to epoch seconds.
+
+    A trailing ``Z`` or a numeric offset means the value is absolute, so it is
+    parsed timezone-aware; a naive value is local time (AppleScript's default).
+    """
+    from datetime import datetime
+
+    cleaned = text.strip()
+    if not cleaned:
+        return time.time()
+    try:
+        # Python 3.11+ fromisoformat accepts both "Z" and "+02:00"/"+0200".
+        return datetime.fromisoformat(cleaned).timestamp()
+    except ValueError:
+        pass
     for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
             return time.mktime(time.strptime(cleaned, fmt))
@@ -125,6 +153,7 @@ def fetch_mail(days: int = 7, limit: int = 300) -> Fetch:
     The timeout is generous because the first call of the day also has to launch
     Mail.app, which took longer than a minute on a cold start.
     """
+    _ensure_app("Mail")
     output = run_applescript(MAIL_SCRIPT.format(days=int(days), limit=int(limit)), timeout=180.0)
     entries: list[Entry] = []
     for uid, sender, subject, when in rows_of(output, 4):
@@ -166,6 +195,7 @@ CALENDAR_SCRIPT = _script(
 
 
 def fetch_calendar(days_back: int = 1, days_ahead: int = 14) -> Fetch:
+    _ensure_app("Calendar")
     output = run_applescript(
         CALENDAR_SCRIPT.format(back=int(days_back), ahead=int(days_ahead)), timeout=120.0
     )
@@ -212,6 +242,7 @@ REMINDERS_SCRIPT = _script(
 
 
 def fetch_reminders() -> Fetch:
+    _ensure_app("Reminders")
     output = run_applescript(REMINDERS_SCRIPT, timeout=120.0)
     entries: list[Entry] = []
     now = time.time()
@@ -253,20 +284,24 @@ SELECT m.ROWID, m.date, m.is_from_me, m.text, h.id
 FROM message m
 LEFT JOIN handle h ON m.handle_id = h.ROWID
 WHERE m.date > ?
-ORDER BY m.date
+ORDER BY m.date DESC
 LIMIT ?
 """
 
 
 def fetch_messages(since: float | None = None, limit: int = 500) -> Fetch:
-    """iMessage and SMS, from a read-only handle on chat.db."""
+    """iMessage and SMS, from a read-only handle on chat.db.
+
+    The newest ``limit`` rows are read (DESC) and then reversed, so the first
+    sync after a cursor wipe gets the latest messages, not the oldest ones
+    from years back.
+    """
     conn = _open_ro(MESSAGES_DB.expanduser())
     try:
         cutoff = 0 if since is None else int((since - APPLE_EPOCH) * 1_000_000_000)
         entries: list[Entry] = []
-        for rowid, date, is_from_me, text, handle in conn.execute(
-            MESSAGES_SQL, (cutoff, limit)
-        ).fetchall():
+        rows = conn.execute(MESSAGES_SQL, (cutoff, limit)).fetchall()
+        for rowid, date, is_from_me, text, handle in reversed(rows):
             ts = (date or 0) / 1_000_000_000 + APPLE_EPOCH
             body = (text or "").strip()
             if not body:
@@ -295,7 +330,7 @@ CALLS_SQL = """
 SELECT Z_PK, ZDATE, ZDURATION, ZADDRESS, ZORIGINATED, ZCALLTYPE
 FROM Z_CALLRECORD
 WHERE ZDATE > ?
-ORDER BY ZDATE
+ORDER BY ZDATE DESC
 LIMIT ?
 """
 
@@ -305,9 +340,8 @@ def fetch_calls(since: float | None = None, limit: int = 300) -> Fetch:
     try:
         cutoff = 0.0 if since is None else (since - APPLE_EPOCH)
         entries: list[Entry] = []
-        for pk, date, duration, address, originated, call_type in conn.execute(
-            CALLS_SQL, (cutoff, limit)
-        ).fetchall():
+        rows = conn.execute(CALLS_SQL, (cutoff, limit)).fetchall()
+        for pk, date, duration, address, originated, call_type in reversed(rows):
             ts = (date or 0) + APPLE_EPOCH
             outgoing = bool(originated)
             entries.append(
@@ -342,15 +376,23 @@ def sync(
     journal,
     sources: list[str] | None = None,
     *,
+    journal_cfg=None,
     progress=None,
 ) -> dict[str, object]:
     """Refresh every source. Returns per-source counts and any error text.
 
-    Cursor handling is per source: mail, calendar and messages take the newest
-    timestamp they have seen so the next run only asks for the delta. A source
+    Cursor handling is per source: messages and calls take the newest timestamp
+    they have seen so the next run only asks for the delta; mail and calendar
+    re-read their whole window (their fetchers take a day range, not a cursor)
+    and stay correct because inserts are idempotent. ``journal_cfg`` is the
+    ``[journal]`` config section; its limits and windows apply here. A source
     that raises is recorded and skipped - one missing permission must not stop
     the other four.
     """
+
+    def cfg_value(key: str, default: int) -> int:
+        return int(getattr(journal_cfg, key, default)) if journal_cfg is not None else default
+
     report: dict[str, object] = {}
     for name in sources or list(FETCHERS):
         if progress is not None:
@@ -359,19 +401,31 @@ def sync(
             fetcher = FETCHERS[name]
             cursor = journal.cursor(name)
             since = _cursor_epoch(cursor)
-            if name in ("messages", "calls") and since is not None:
-                fetched = fetcher(since=since)
+            kwargs: dict[str, object] = {}
+            if name == "messages":
+                kwargs["limit"] = cfg_value("messages_limit", 500)
+                if since is not None:
+                    kwargs["since"] = since
+            elif name == "calls":
+                kwargs["limit"] = cfg_value("calls_limit", 300)
+                if since is not None:
+                    kwargs["since"] = since
+            elif name == "mail":
+                kwargs["days"] = cfg_value("mail_days", 7)
             elif name == "calendar":
-                fetched = fetcher()
-            else:
-                fetched = fetcher()
+                kwargs["days_back"] = cfg_value("calendar_days_back", 1)
+                kwargs["days_ahead"] = cfg_value("calendar_days_ahead", 14)
+            fetched = fetcher(**kwargs)
             added = journal.add(fetched.entries)
             if fetched.cursor:
                 journal.set_cursor(name, fetched.cursor)
+            journal.set_state(name, True)
             report[name] = {"fetched": len(fetched.entries), "added": added}
         except SourceError as exc:
+            journal.set_state(name, False, str(exc))
             report[name] = {"error": str(exc)}
         except Exception as exc:  # a broken source must not stop the sync
+            journal.set_state(name, False, f"{exc.__class__.__name__}: {exc}")
             report[name] = {"error": f"{exc.__class__.__name__}: {exc}"}
     return report
 

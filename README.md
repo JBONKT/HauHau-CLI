@@ -93,6 +93,48 @@ descriptor.
 Runtime state — memory, audit log, sessions, snapshots, server log — lives in
 `~/.hauhau`, never in the repo.
 
+## Choosing a model
+
+Any `.gguf` in `~/modeller/gguf` (or the directories in `config.py`'s
+`GGUF_SEARCH_DIRS`) is a candidate. Drop a file there and it appears:
+
+```
+you › /model
+│ # │ name                   │ size   │ in use   │
+│ 1 │ Gemma-4-E2B-Uncensored │ 3.2 GB │ ✓ active │
+│ 2 │ LFM3-1.7B              │ 1.0 GB │          │
+you › /model lfm3          (also: /model 2, or a path)
+· loading LFM3-1.7B (1.0 GB, ctx 16384)…
+· LFM3-1.7B is live · ctx 16384 · 41.2 tok/s · saved to config.toml
+```
+
+Switching restarts `llama-server` and only then writes `config.toml`: a model
+that fails to load leaves both the running session and the file untouched, and
+the old server is started again. Each switch is in `audit.jsonl` as
+`model.switch`, and the config is snapshotted before the write like every other
+automated edit.
+
+Two things travel with a model, remembered in `<data_dir>/models.json`:
+
+| Setting | Why it is per model |
+|---|---|
+| `n_ctx` | A 1.7B with a small KV cache can afford 32k where a 3.2B cannot; carrying one context length across models either wastes RAM or makes llama-server reject the prompt. Whatever the tuner last adopted for a file is restored with it, clamped to the agent's context floor. |
+| `extra_args` | Server flags that helped one model (`-ctk q8_0`, a rope setting) are usually wrong for another. |
+
+The tuner is model-aware too: `_ctx_options` subtracts the weight file from the
+RAM budget before choosing which context sizes are worth trying, so a 14 GB
+model on a 16 GB machine is no longer offered 32k.
+
+Measured on this machine (M1, 8 GB), one real turn each:
+
+| Model | Q4 size | tok/s | Notes |
+|---|---|---|---|
+| Gemma-4-E2B (Q4_K_P) | 3.2 GB | 41–45 | the previous default |
+| LFM3-1.7B (Q4_K_M) | 1.0 GB | 38–41 | 256k context with a 1.6 GB KV cache at 128k, so it can run at 32k here where Gemma cannot. Liquid's own model card says it is *not* recommended for agentic multi-step reasoning, and it thinks out loud in the answer — good for chat and journal questions, weaker as the multi-step agent brain. |
+
+Judge a swap with `/eval`, not by feel: it scores tool choice, and a 2-point drop
+there is a regression no matter how pleasant the prose reads.
+
 ## The second-brain journal
 
 The memory brain holds lessons; the journal holds the record. Every mail,
@@ -133,28 +175,155 @@ switch.
 
 ## The interface
 
+Three front ends share one agent, and `--plain` / `--tui` choose between them:
+
+| | Stream (`--plain`, pipes, `TERM=dumb`) | Full screen (default on a tty) | Dashboard (`--tui`) |
+|---|---|---|---|
+| Built with | `rich` | `prompt_toolkit` | `textual` (optional: `pip install 'hauhau[tui]'`) |
+| Layout | prints, terminal scrolls | fixed frame, scrolls inside it | two columns, real scrollback |
+| Live stats | toolbar | header bar + stats row | side panel: tokens/s sparkline, memory, journal, tuner |
+| For | scripts, `jq`, editors | normal use | watching a long task work |
+
+```
+ ⭘                                  Hauhau                                  02:05:51
+                                    hur mycket disk ar det kvar egentligen? │ Hauhau
+ ⚙ shell  df -h / && du -sh ~/* | sort -rh | head -3                        │ LFM3-1.7B
+   ✓ Filesystem  Size  Used  Avail Capacity iused ifree %iused  M…          │ context   16k
+   Disken är 11% full.                                                      │ threads   7t
+                                                                            │ state     ready
+   • 109 GB ledigt                                                          │ last turn 3.3s · 38 tok/s
+   • störst: modeller 3.4 GB                                                │
+                                                                            │ speed · tok/s history
+                                                                            │ ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+                                                                            │ memories  41 mem
+                                                                            │ journal   47 events
+▊▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▎
+▊  write a message…  (/help lists commands)                                                 ▎
+ ^q quit  f2 prompt                                                        ^p palette
+```
+
+### What the dashboard costs
+
+A terminal UI is drawn by the terminal, so "graphics acceleration" is not a
+switch inside the app - but the app decides how much it asks the terminal to
+draw. Measured on this machine (M1 Air, 8 GB) with `top -l 2` against a stub
+server streaming 120 chunks/s:
+
+| | idle | while an answer streams |
+|---|---|---|
+| before | 6.0% | 5.8% |
+| after | 0.4% | 2.5% |
+
+Three things changed:
+
+* **The panel only repaints when a number changes.** `_panel_signature` is a tuple
+  of every value on screen; the 8 Hz tick compares it and returns. Before, six
+  widget updates plus a screen layout ran eight times a second for numbers that
+  change between turns.
+* **One batched, layout-free update.** `batch_update()` plus
+  `Static.update(..., layout=False)`: the column has a fixed width, so only the
+  characters change, and six separate updates each triggered a full layout.
+* **Streaming is rate-limited** to one Markdown re-parse every 0.2 s (0.4 s on a
+  CPU-rendered terminal). `Markdown` re-parses the *whole* answer, so a parse per
+  token is quadratic.
+
+The rest is the terminal. Textual asks for DEC 2026 (synchronized output) and
+skips Apple Terminal, which answers neither the query nor the protocol - every
+repaint lands as separate diffs that Terminal.app renders on the CPU. That is
+what still feels sticky, and the app now says so on startup:
+
+> Apple Terminal cannot synchronise repaints - Ghostty, kitty or WezTerm will
+> scroll and stream noticeably smoother.
+
+Warp (already installed here), Ghostty, kitty and WezTerm render on the GPU and
+honour the sync protocol; `scripts/tui_check.py` prints whether sync output was
+offered, which is the quickest way to tell what a given terminal is doing.
+
+### Keys in the dashboard
+
+| Key | What it does |
+|---|---|
+| `Enter` | send the line |
+| `Tab` or `→` | accept the ghost suggestion |
+| `Ctrl-Y` | copy the selection, or the last answer if nothing is selected |
+| `Ctrl-V` | paste the system clipboard at the caret, flattened to one line |
+| `Ctrl-C` | interrupt the turn (restarts the backend) / clear the line |
+| `Ctrl-Q` | quit |
+| `F2` | focus the prompt |
+| `PgUp`/`PgDn` | scroll the conversation |
+
+Copy is both: `App.copy_to_clipboard` speaks OSC 52 (iTerm2, WezTerm, Ghostty,
+kitty) and the text also goes through `pbcopy`, because Terminal.app ignores OSC
+52 and `pbcopy` is the only thing that works there. Paste reads `pbpaste` rather
+than Textual's internal clipboard for the same reason; the binding is
+`priority=True` so the focused `Input` does not swallow it with its own paste.
+
+### Task suggestions while you type
+
+The prompt line completes what you are typing, in two layers, cheapest first:
+
+1. **Deterministic** (`hauhau/suggest.py`) - a table of the tasks this agent is
+   actually good at, keyed by the word that introduces them, plus the slash
+   commands. Typing `hur mycket disk` ghosts `är det kvar och vad tar mest
+   plats?` with no model call at all.
+2. **The local model** - for anything the table does not recognise, the model is
+   asked to finish the sentence in at most twelve words (`max_tokens=48`,
+   `temperature=0.3`), on a worker thread so the prompt keeps drawing. It is
+   gated and throttled: never under 10 characters, never for a `/command`, never
+   for a sentence that already ends in punctuation, at most one call every
+   0.9 s and never two at once. A 2B model answers in about a second; a
+   completion that arrives after you have typed past it is worse than none.
+
+Only the *completion* is returned, never a rewritten prompt: ghost text renders
+after the caret, so a suggestion that does not literally extend the line could
+not be shown - and would fight the user's own wording. The side panel says which
+layer produced the current ghost (`suggest  keyword|command|ai`), and
+`suggest.propose` is in `audit.jsonl`, so you can tell what the model was asked.
+
+The dashboard runs every turn on a worker thread and marshals widget updates
+back to Textual's event loop; the answer streams into one `Markdown` widget that
+is re-parsed at ~8 fps, the tool rows are clipped with an ellipsis instead of
+reflowing, and the side panel repaints on a 0.12 s timer with the two aggregate
+queries cached for two seconds. `scripts/tui_check.py` runs it in a pty against
+a stub server and asserts the layout (18 checks: both columns, the ghost text and
+Tab accepting it, the right-aligned user message, a one-line tool result, the
+Markdown answer, no traceback).
+
+
 On a terminal on both ends this is a **fixed, full-screen layout**: nothing
 ever scrolls the terminal itself, the frame is redrawn in place.
 
 ```
- Hauhau · model Gemma-4-E2B…Q4_K_P.gguf · ctx 8192 · threads 4 · ram 8 GB   <- header
- 11.0s · 53 tok · 27 tok/s · /help for commands · Ctrl-D exits · PgUp/PgDn  <- stats
-────────────────────────────────── chat (scrolls inside this frame) ───────
-❯ how much disk is left?
-  ⚙ shell  df -h /
-    ✓ /dev/disk3s3s1  228Gi  13Gi  109Gi  11%  /  +1 lines · /show
-
-The volume is 11% full (109 GB free).
-────────────────────────────────────────────────────────────────────────────
- ready · write a message and press Enter                                   <- hint
-❯ _                                                                        <- input
+ Hauhau · model Gemma-4-E2B · ctx 16k · threads 7t · ram 8 GB        <- header bar
+╭ hauhau ─────────────────────────────────────────────────────────────╮
+│                      how much disk is left and what is eating it?    │  <- your message,
+│                                                                      │     a right-aligned
+│   ⚙ shell  df -h / && du -sh ~/* | sort -rh | head -5                │     bubble
+│     ✓ /dev/disk3s3s1  228Gi  13Gi  109Gi  11%  /  +4 lines · /show  │
+│                                                                      │
+│ The volume is 11% full with 109 GB free. The largest thing in your    │
+│ home directory is `modeller` at 3.4 GB.                              │
+╰ 1-9 of 9 ───────────────────────────────────────────────────────────╯
+ 11.0s · 53 tok · 27 tok/s                   /help · PgUp scrolls · Ctrl-D quits
+❯ _                                                                     <- input
 ```
 
-- **One screen, four fixed rows of chrome**: header, stats, hint, input. The
-  transcript gets whatever is left, is wrapped to the terminal width, and is
-  sliced to fit — the newest lines stay visible while a turn streams. `PgUp`/
-  `PgDn` (also `Ctrl-B`/`Ctrl-F`, arrows) scroll *inside that frame*; the hint
-  row says so and typing jumps back to the newest line.
+- **A chat window, not a log**: the transcript is drawn inside a rounded frame
+  whose bottom edge carries the scroll position (`12-34 of 140`), the header is
+  a full-width bar with model, context, threads and RAM, and your own messages
+  are right-aligned bubbles with their own background so "said" and "answered"
+  are separable at a glance. The frame is dropped below 56 columns, where two
+  border columns cost more than they explain.
+- **Three fixed rows of chrome**: header, stats, input. The transcript gets
+  whatever is left, is wrapped to the terminal width, and is sliced to fit — the
+  newest lines stay visible while a turn streams. `PgUp`/`PgDn` (also
+  `Ctrl-B`/`Ctrl-F`, arrows) scroll *inside that frame*; the stats row says so
+  and typing jumps back to the newest line.
+- **A spinner only costs CPU when it spins**: the earlier build repainted 8
+  times a second whether or not anything was happening, which measured 3.9% CPU
+  on an idle M1 Air. Now a repaint clock runs only while a turn is in flight
+  (0.0% idle), and the memory count in the header is refreshed at most every two
+  seconds instead of being queried from sqlite on every frame.
 - **Everything rich lands in the chat window**: `/status` panels, `/mem` tables
   and help boxes are captured through a `rich` console routed into the
   transcript, so no command can paint over the layout.
@@ -192,14 +361,55 @@ Colour and the bottom status bar are plain `prompt_toolkit`/`rich`, so they
 follow `TERM`/`NO_COLOR`. In a `TERM=dumb` environment both degrade silently to
 plain text.
 
+## Working it out instead of asking
+
+A 2B model hands the turn back: *"vill du att jag listar diskarna?"* or *"det kan
+jag inte"*. Both are answerable inside the turn, so the agent does not return
+them. `AUTONOMY_RULES` in `hauhau/agent.py` states the three rules plainly -
+look it up yourself, pick the most likely reading and say the assumption, never
+stop at "I can't" - and the loop enforces them mechanically:
+
+- a reply that says it cannot (`det kan jag inte`, matched by shape so Swedish
+  word order works) is nudged to work out what is missing, try it, and record the
+  result with `note_lesson`. Only the agent's own voice counts: a quoted error
+  (`the build said unable to find crate`) or advice (`du kan köra make om den inte
+  är installerad`) is not a refusal;
+- a reply whose every sentence is a question is nudged, and the model continues in
+  the *same* turn with a tool call. A finished answer with a closing offer
+  (`Klart. Vill du att jag rensar?`) is an answer and is returned;
+- a reply that pastes a command - in a fence with or without a language tag, or
+  inline in backticks - is nudged to run it itself, and told to stop and ask only
+  if the command would install, delete or overwrite;
+- at most two nudges per turn, so a model that keeps asking cannot loop, and none
+  at all after the step budget is spent or once a tool has *failed*: then the
+  question is about a real obstacle and it is yours to see;
+- the nudge text lives for exactly one request: it never enters the history, the
+  session file or the next turn's prompt.
+
+Each nudge is a `nudge` event in `audit.jsonl` with its kind (`stuck`, `act`,
+`ambiguous`) and the sentence that triggered it, so "is it thinking for itself?"
+has an answer.
+
+`note_lesson(lesson, tags)` writes the distilled procedure to the procedural
+memory, deduplicated, so the next time the step is instant instead of learned
+again. It is offered only when a brain is enabled.
+
+Turn the whole thing off with `autonomy = false` under `[agent]` in
+`~/.hauhau/config.toml` and the bot answers exactly what it was given, question
+and all.
+
 ## Development
 
 ```bash
-.venv/bin/ruff check hauhau tests                      # clean
-.venv/bin/python -m unittest discover -s tests -t .    # 507 tests
+.venv/bin/ruff check hauhau tests scripts              # clean
+.venv/bin/python -m unittest discover -s tests -t .    # 735 tests
+.venv/bin/python scripts/screen_ui_check.py            # 10 layout checks, real pty
+.venv/bin/python scripts/tui_check.py                  # 18 dashboard checks, real pty
 ```
 
-### Keeping a session goingHauhau answers, then waits. `scripts/nudge.py` types one line into the terminal
+### Keeping a session going
+
+Hauhau answers, then waits. `scripts/nudge.py` types one line into the terminal
 tab the app owns when the session has produced nothing for a while, so a
 run left alone keeps working instead of sitting at the prompt:
 
@@ -310,6 +520,63 @@ a tool call cut off at the cap is **not executed** — its arguments are
 incomplete, so the model is told to retry in smaller pieces rather than the
 agent guessing the rest.
 
+## The journal
+
+Separate from the memory brain on purpose: the brain holds a few dozen distilled
+lessons that decay; the journal holds *every* mail, message, call, event and
+reminder, keyed by `(source, external_id)` so a repeated `/sync` is idempotent,
+and it never decays — "what did Dana say in March" is a record question, not a
+lesson. It lives in `~/.hauhau/journal/journal.db` (FTS5, keyword search) and
+the model reaches it through the `journal_search`, `agenda`, `person` and
+`brief` tools, so it can answer "what was said" without confusing records with
+memories.
+
+`/sync` reads the Mac's own records — nothing leaves the machine, no account
+passwords are involved:
+
+- **Mail, Calendar, Reminders** via AppleScript (the apps must be installed;
+  macOS asks for Automation permission once per app pair).
+- **iMessage/SMS** (`~/Library/Messages/chat.db`) and **call history**
+  (`CallHistoryDB`) via read-only sqlite handles; both need **Full Disk Access**
+  for the interpreter that runs Hauhau (System Settings > Privacy & Security).
+  Without it the source reports a permission error instead of pretending there
+  was nothing to read, and the other sources still sync.
+
+Windows and limits are set in `[journal]` in `config.toml` (`mail_days`,
+`calendar_days_back/ahead`, `messages_limit`, `calls_limit`,
+`brief_lookahead_days`); `enabled = false` turns the journal and its tools off.
+`scripts/journal_sync.py --status` reports which sources currently work.
+
+## Skills
+
+A skill is a folder with a `SKILL.md` (open [Agent Skills][agent-skills]
+convention: YAML frontmatter with `name` and `description`, then a markdown
+procedure), and optional support files. HauHau ships two, and scans in order:
+`skills.dirs` from `config.toml`, then `~/.hauhau/skills/`, then the built-ins —
+first name wins, so dropping a folder into `~/.hauhau/skills/` overrides a
+built-in.
+
+Only each skill's name and description live in the system prompt (progressive
+disclosure, ~30 tokens per skill). The model pulls the full procedure on demand
+with the `skill` tool, and scripts bundled in the folder run through the ordinary
+`shell` tool so only their output enters the conversation. `/skills` lists what
+is installed; a broken `SKILL.md` is a warning at startup, never a failure.
+
+| skill | does |
+|---|---|
+| `app-actions` | acts in Apple apps without their interface: reminders, notes, mail drafts, calendar events, Safari, Finder — `osascript` one-liners the model fills in |
+| `dialog-handler` | answers a dialog, sheet or popup blocking a running app |
+
+`dialog-handler` and the window work underneath it use the `ui` tool: it reads
+an app's frontmost window through the **accessibility tree** — no screenshots,
+no coordinates — as an indexed outline, and `press`/`set` address an element by
+that index. The model picks; macOS supplies the geometry. Both need the
+interpreter binary (`.venv/bin/python`) granted **Accessibility** plus
+Automation of System Events under System Settings → Privacy & Security; when a
+grant is missing the tool fails with the osascript error naming it.
+
+[agent-skills]: https://agentskills.io
+
 ## Safety
 
 The default policy is **auto-run everything** — `shell_confirm = false` and an
@@ -352,6 +619,13 @@ real gate. `read_file` pages at 2000 lines by default; ask for more with
 `/help [command]` `/status` `/show [n]` `/tools` `/mem [query]` `/compact`
 `/prune` `/remember` `/forget` `/learn` `/eval` `/tune` `/evolve` `/prompt`
 `/model` `/perf` `/config` `/audit` `/context` `/clear` `/save` `/quit`
+`/sync [source…]` `/journal [query]` `/brief` `/skills`
+
+`/sync` pulls mail, iMessage/SMS, call history, calendar and reminders into the
+journal (see below); `/journal` with no argument shows what it holds, with a
+query it searches it; `/brief` prints today's digest — what arrived since
+midnight, what is due, what is next. `scripts/journal_sync.py --install` sets
+up launchd agents that sync every 15 minutes and push the brief at 07:30.
 
 `/compact` merges memories that say the same thing. `/prune` is the forgetting
 half of the decay model: it drops memories that are stale *and* were never

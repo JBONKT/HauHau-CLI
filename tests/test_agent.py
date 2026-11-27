@@ -5,7 +5,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from hauhau.agent import UI, Agent
+from hauhau.agent import (
+    UI,
+    Agent,
+    asks_instead_of_acting,
+    commands_to_run,
+    says_it_cannot,
+)
 from hauhau.config import Config
 from hauhau.llm import Completion, ToolCall, Usage
 from hauhau.tools.base import Registry, Tool, fail, ok
@@ -60,6 +66,14 @@ class SpyUI(UI):
 
     def token(self, text: str) -> None:
         self.tokens.append(text)
+
+
+class FakeAudit:
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def log(self, event: str, **fields) -> None:
+        self.events.append({"event": event, **fields})
 
 
 class AgentTestCase(unittest.TestCase):
@@ -259,6 +273,28 @@ class TestCompression(AgentTestCase):
         ]
         self.assertEqual(agent._safe_split(2), 0, "trimming here would orphan the tool result")
 
+    def test_keeps_the_requested_turns(self) -> None:
+        # Regression: the first boundary at or after the target was taken, which
+        # kept one message where `keep` promised several.
+        agent = self.make_agent(FakeClient([]))
+        agent.messages = [
+            {"role": "user", "content": "turn 1"},
+            {"role": "assistant", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "assistant", "content": "c"},
+            {"role": "assistant", "content": "d"},
+            {"role": "user", "content": "turn 2"},
+            {"role": "assistant", "content": "e"},
+            {"role": "assistant", "content": "f"},
+            {"role": "assistant", "content": "g"},
+            {"role": "assistant", "content": "h"},
+            {"role": "assistant", "content": "i"},
+        ]
+        keep = 4
+        cut = agent._safe_split(keep)
+        self.assertEqual(cut, 5)
+        self.assertGreaterEqual(len(agent.messages) - cut, keep)
+
     def test_makes_progress_when_no_late_boundary_exists(self) -> None:
         # Regression: with a small budget the tail can be one tool-loop turn, so
         # no user message sits at the split point. Returning 0 there meant the
@@ -314,6 +350,251 @@ class TestPrompt(AgentTestCase):
         agent.brain = FakeBrain()
         self.cfg.brain.enabled = True
         self.assertIn("runs macOS", agent.system_prompt("what os"))
+
+
+class TestDetectors(unittest.TestCase):
+    def test_questions_are_detected(self) -> None:
+        for text in ("Vill du att jag listar diskarna?", "  Ska jag köra den?  "):
+            self.assertTrue(asks_instead_of_acting(text), text)
+
+    def test_answers_are_not_questions(self) -> None:
+        self.assertFalse(asks_instead_of_acting("Klart, diskarna är listade."))
+        self.assertFalse(asks_instead_of_acting(""))
+        long_answer = "Här är en lång förklaring. " * 10 + "Visst?"
+        self.assertFalse(asks_instead_of_acting(long_answer), "a real answer that ends in ?")
+
+    def test_swedish_modal_word_order_is_recognised(self) -> None:
+        for text in ("Det kan jag inte.", "Det kan jag tyvärr inte just nu.",
+                     "Jag kan inte hitta filen.", "Jag vet inte hur man gör.",
+                     "Jag har inte tillgång till den mappen."):
+            self.assertTrue(says_it_cannot(text), text)
+
+    def test_pasted_commands_are_detected(self) -> None:
+        for text in ("Kör det här:\n```bash\ndu -sh * | sort -rh\n```",
+                     "```sh\nls -la\n```",
+                     "```zsh\ndf -h\n```"):
+            self.assertTrue(commands_to_run(text), text)
+
+    def test_prose_and_other_fences_are_not_commands(self) -> None:
+        for text in ("Klart, disken är full.", "```python\nprint(1)\n```",
+                     "```\nplain fence\n```", ""):
+            self.assertFalse(commands_to_run(text), text)
+
+    def test_ordinary_answers_are_not_refusals(self) -> None:
+        for text in ("Klart, jag hittade filen.", "jag kan det här nu", ""):
+            self.assertFalse(says_it_cannot(text), text)
+
+
+class TestAutonomy(AgentTestCase):
+    """The bot must act, not hand the question back."""
+
+    def test_rules_are_in_the_prompt_by_default(self) -> None:
+        agent = self.make_agent(FakeClient([]))
+        prompt = agent.system_prompt("hi")
+        self.assertIn("ask only as a last resort", prompt)
+        self.assertIn("note_lesson", prompt)
+
+    def test_rules_can_be_turned_off(self) -> None:
+        agent = self.make_agent(FakeClient([]), autonomy=False)
+        self.assertNotIn("ask only as a last resort", agent.system_prompt("hi"))
+
+    def test_a_question_is_answered_by_acting(self) -> None:
+        client = FakeClient([
+            reply("Vill du att jag listar diskarna?"),
+            tool_call(name="echo", args='{"text":"df -h"}'),
+            reply("Klart: diskarna är listade."),
+        ])
+        ui = SpyUI()
+        agent = self.make_agent(client, ui=ui)
+        text = agent.run_turn("kolla diskarna")
+
+        self.assertEqual(text, "Klart: diskarna är listade.")
+        self.assertEqual(agent.nudges_this_turn, 1)
+        self.assertEqual(len(client.calls), 3, "one extra step, not a new turn")
+        self.assertIn("instead of acting", client.calls[1]["messages"][0]["content"])
+        self.assertEqual(self.log, ["df -h"], "the nudge made it use a tool")
+        self.assertIn("working out what was meant", " ".join(ui.statuses))
+
+    def test_the_nudge_is_audited(self) -> None:
+        audit = FakeAudit()
+        client = FakeClient([reply("Vill du att jag kollar?"), reply("Klart.")])
+        agent = Agent(self.cfg, client, make_registry(self.log), brain=None, audit=audit)
+        agent.run_turn("kolla läget")
+
+        self.assertEqual([e["event"] for e in audit.events], ["nudge"])
+        self.assertEqual(audit.events[0]["kind"], "ambiguous")
+        self.assertEqual(audit.events[0]["count"], 1)
+
+    def test_saying_it_cannot_triggers_the_stuck_nudge(self) -> None:
+        client = FakeClient([
+            reply("Det kan jag inte."),
+            reply("Nu löste jag det: paketet heter ripgrep."),
+        ])
+        agent = self.make_agent(client)
+        text = agent.run_turn("hitta ripgrep i hemkatalogen")
+
+        self.assertEqual(text, "Nu löste jag det: paketet heter ripgrep.")
+        self.assertEqual(agent.nudges_this_turn, 1)
+        self.assertIn("You said you cannot do this", client.calls[1]["messages"][0]["content"])
+
+    def test_a_pasted_command_is_nudged_into_running_it(self) -> None:
+        audit = FakeAudit()
+        client = FakeClient([
+            reply("Låt oss kolla.\n```bash\ndu -sh /Users/johan/* | sort -rh | head\n```"),
+            tool_call(name="echo", args='{"text":"du -sh"}'),
+            reply("Största mappen är ~/Documents."),
+        ])
+        agent = Agent(self.cfg, client, make_registry(self.log), brain=None, audit=audit)
+        text = agent.run_turn("vad tar upp disken")
+
+        self.assertEqual(text, "Största mappen är ~/Documents.")
+        self.assertEqual(self.log, ["du -sh"])
+        self.assertEqual(audit.events[0]["kind"], "act")
+        self.assertIn("instead of running it", client.calls[1]["messages"][0]["content"])
+
+    def test_a_question_after_a_failed_tool_call_is_kept(self) -> None:
+        client = FakeClient([
+            tool_call(name="denied", args="{}"),
+            reply("Filen gick inte att läsa - ska jag försöka med sudo?"),
+        ])
+        agent = self.make_agent(client)
+        text = agent.run_turn("läs filen")
+
+        self.assertEqual(text, "Filen gick inte att läsa - ska jag försöka med sudo?")
+        self.assertEqual(agent.nudges_this_turn, 0)
+        self.assertEqual(len(client.calls), 2, "a real obstacle must reach the user")
+
+    def test_a_question_after_a_successful_tool_call_is_nudged(self) -> None:
+        client = FakeClient([
+            tool_call(name="echo", args='{"text":"a"}'),
+            reply("Vilken katalog vill du att jag tittar i?"),
+            reply("Klart: /Users/johan/Documents är störst."),
+        ])
+        agent = self.make_agent(client)
+        text = agent.run_turn("vad tar upp disken")
+
+        self.assertEqual(text, "Klart: /Users/johan/Documents är störst.")
+        self.assertEqual(agent.nudges_this_turn, 1)
+
+    def test_nudges_are_capped_at_two(self) -> None:
+        client = FakeClient([reply("Vill du att jag gör det?"), reply("Vill du att jag gör det?"),
+                             reply("Vill du att jag gör det?")])
+        agent = self.make_agent(client)
+        text = agent.run_turn("gör det")
+
+        self.assertEqual(agent.nudges_this_turn, 2)
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(text, "Vill du att jag gör det?")
+
+    def test_autonomy_off_returns_the_question_at_once(self) -> None:
+        client = FakeClient([reply("Vill du att jag listar diskarna?")])
+        agent = self.make_agent(client, autonomy=False)
+        text = agent.run_turn("kolla diskarna")
+
+        self.assertEqual(text, "Vill du att jag listar diskarna?")
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(agent.nudges_this_turn, 0)
+
+    def test_the_nudge_does_not_leak_into_history_or_the_next_turn(self) -> None:
+        client = FakeClient([reply("Vill du att jag kollar?"),
+                             reply("Klart."),
+                             reply("Klart igen.")])
+        agent = self.make_agent(client)
+        agent.run_turn("kolla läget")
+        agent.run_turn("igen")
+
+        for msg in agent.messages:
+            self.assertNotIn("instead of acting", str(msg.get("content") or ""))
+        self.assertNotIn("instead of acting", client.calls[2]["messages"][0]["content"])
+
+
+class TestDetectorFalsePositives(unittest.TestCase):
+    """A detector that fires on ordinary prose costs a step and misleads."""
+
+    def test_an_answer_with_a_closing_offer_is_not_a_question(self) -> None:
+        for text in ("Klart, filen är borta. Vill du att jag återställer den?",
+                     "Disken är full. Ska jag rensa cachen?",
+                     "Jag hittade 3 filer. Vilken vill du se?"):
+            self.assertFalse(asks_instead_of_acting(text), text)
+
+    def test_only_question_sentences_are_a_hand_back(self) -> None:
+        self.assertTrue(asks_instead_of_acting("Vill du att jag listar diskarna?"))
+        self.assertTrue(asks_instead_of_acting("Vill du att jag kollar? Eller ska jag hoppa över?"))
+
+    def test_a_quoted_error_is_not_the_agent_saying_it_cannot(self) -> None:
+        for text in ("Felet var 'unable to resolve host'; jag rättade DNS-posten.",
+                     "The build said unable to find crate, then I added it to Cargo.toml.",
+                     "`unable to` betyder att den inte hittade värden."):
+            self.assertFalse(says_it_cannot(text), text)
+
+    def test_advice_containing_kan_inte_is_not_a_refusal(self) -> None:
+        text = "Klart. Du kan köra `make` om den inte redan är installerad."
+        self.assertFalse(says_it_cannot(text))
+
+    def test_untagged_fences_and_inline_spans_count_as_commands(self) -> None:
+        for text in ("```\ndu -sh *\n```", "Kör bara `du -sh *` så ser du det.", "`pmset -g`"):
+            self.assertTrue(commands_to_run(text), text)
+
+    def test_names_in_backticks_are_not_commands(self) -> None:
+        for text in ("`note_lesson` skriver till minnet.", "se `config.toml`"):
+            self.assertFalse(commands_to_run(text), text)
+
+
+class TestTurnIntegrity(AgentTestCase):
+    """A turn must never leave the transcript in a shape the backend rejects."""
+
+    def test_an_interrupted_tool_call_still_answers_the_call(self) -> None:
+        def interrupted(_args):
+            raise KeyboardInterrupt
+
+        agent = self.make_agent(FakeClient([]))
+        agent.registry = Registry(
+            [Tool("boom", "Interrupts.", {"type": "object", "properties": {}}, interrupted)]
+        )
+        agent.messages.append({"role": "user", "content": "go"})
+        agent._record_assistant(
+            Completion(
+                tool_calls=[ToolCall(id="c1", name="boom", arguments="{}")], finish_reason="tool_calls"
+            )
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            agent._execute(ToolCall(id="c1", name="boom", arguments="{}"))
+
+        self.assertEqual(agent.messages[-1]["role"], "tool", "the announced call must be answered")
+        self.assertEqual(agent.messages[-1]["tool_call_id"], "c1")
+        self.assertIn("interrupted", agent.messages[-1]["content"])
+
+    def test_auditing_non_string_arguments_does_not_raise(self) -> None:
+        audit = FakeAudit()
+        client = FakeClient([
+            Completion(tool_calls=[ToolCall(id="c1", name="echo", arguments={"text": "hi"})],
+                       finish_reason="tool_calls"),
+            reply("done"),
+        ])
+        agent = Agent(self.cfg, client, make_registry(self.log), brain=None, audit=audit)
+        self.assertEqual(agent.run_turn("go"), "done")
+        self.assertEqual([e["event"] for e in audit.events], ["tool"])
+
+    def test_a_failed_tool_stops_every_nudge(self) -> None:
+        client = FakeClient([
+            tool_call(name="denied", args="{}"),
+            reply("Jag kan inte läsa filen - den kräver root."),
+        ])
+        agent = self.make_agent(client)
+        text = agent.run_turn("läs filen")
+
+        self.assertEqual(text, "Jag kan inte läsa filen - den kräver root.")
+        self.assertEqual(agent.nudges_this_turn, 0, "the obstacle is real: show it")
+
+    def test_the_budget_answer_gets_no_nudge_it_cannot_obey(self) -> None:
+        client = FakeClient([reply("Vill du att jag kollar?"), reply("Ingen aning.")])
+        agent = self.make_agent(client, max_steps=1)
+        text = agent.run_turn("kolla")
+
+        self.assertEqual(text, "Ingen aning.")
+        self.assertNotIn("instead of acting", client.calls[1]["messages"][0]["content"])
+        self.assertIsNone(agent._nudge)
 
 
 class TestPersistence(AgentTestCase):

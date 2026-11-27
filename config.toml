@@ -1,26 +1,18 @@
-# Hauhau configuration.
-# Edit freely; `hauhau /config` shows the effective values.
-
 [model]
 gguf = "/Users/johan/modeller/gguf/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
 server_url = "http://127.0.0.1:8080"
 manage_server = true
 llama_server = "llama-server"
 n_ctx = 16384
-n_threads = 4
-n_gpu_layers = 99
+n_threads = 7
+n_gpu_layers = -8
 extra_args = ["-lm", "dio"]
 startup_timeout = 120.0
 
 [generation]
 temperature = 0.7
 top_p = 0.95
-# Applies to every call, tool turns included. Measured on this machine: a
-# 600-word answer needs ~750 tokens, so anything below that silently truncates
-# mid-sentence. The agent warns instead of pretending a cut answer is complete.
 max_tokens = 1024
-# This build emits reasoning_content that can eat the entire budget. Off by
-# default; raise max_tokens well above 500 before turning it on.
 think = false
 
 [agent]
@@ -28,17 +20,16 @@ name = "Hauhau"
 max_steps = 12
 context_budget_tokens = 5000
 keep_recent_turns = 6
-personality = """You are {name}, a CLI agent running locally on the user's machine. You have a
+personality = """
+You are {name}, a CLI agent running locally on the user's machine. You have a
 shell, a filesystem, and a persistent memory. Be direct and concrete: do the
 work with tools instead of describing what you would do. Never claim a command
 succeeded unless you ran it and saw the output. Prefer one decisive check over
 several speculative ones. Keep replies short - the user is watching a terminal."""
 
 [tools]
-# false = auto-run everything (the project owner's choice). Set true to confirm.
 shell_confirm = false
 shell_timeout = 120.0
-# Empty = everything is allowed. Entries are regexes matched against the command.
 denylist = []
 max_output_chars = 8000
 workspace = "/Users/johan"
@@ -48,13 +39,34 @@ enabled = true
 top_k = 5
 half_life_days = 30.0
 dedupe_jaccard = 0.9
-# Token-overlap containment: catches the same fact with an extra clause.
 dedupe_containment = 0.8
 inject_max_chars = 1500
-# The generation model cannot embed. Point this at a second llama-server started
-# with --embeddings to enable vector recall; empty means keyword-only (FTS5).
 embeddings_url = ""
 embeddings_model = "embeddinggemma-300m"
+
+# The journal: the record of what happened (mails, messages, calls, events,
+# reminders). Separate from the memory brain - records never decay. Off = no
+# journal database and no journal_* tools for the model.
+# Reading iMessage/call history needs Full Disk Access for the Python
+# interpreter; Mail/Calendar/Reminders need Automation permission (osascript).
+[journal]
+enabled = true
+# path = ""            # empty = <data_dir>/journal/journal.db
+mail_days = 7
+calendar_days_back = 1
+calendar_days_ahead = 14
+messages_limit = 500
+calls_limit = 300
+brief_lookahead_days = 2
+
+# Agent skills (SKILL.md folders, the open Agent Skills convention). Only the
+# name and description of each skill sit in the prompt; the model loads the
+# body on demand with the skill tool. Scanned in order: dirs below, then
+# <data_dir>/skills, then the built-ins shipped with hauhau - first name wins,
+# so a copy in ~/.hauhau/skills overrides a built-in.
+[skills]
+enabled = true
+# dirs = ["~/projects/my-skills"]
 
 [logging]
 data_dir = "~/.hauhau"

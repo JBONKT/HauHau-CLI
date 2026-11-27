@@ -163,5 +163,25 @@ class TestCursors(JournalTestCase):
         self.assertEqual(self.journal.stats()["cursors"], {"mail": "mail:200"})
 
 
+class TestSourceState(JournalTestCase):
+    """A permission problem must stay visible without re-reading anything."""
+
+    def test_an_untried_source_has_no_state(self) -> None:
+        self.assertEqual(self.journal.states(), {})
+
+    def test_a_failure_is_remembered_with_its_reason(self) -> None:
+        self.journal.set_state("messages", False, "grant Full Disk Access")
+        state = self.journal.states()["messages"]
+        self.assertFalse(state["ok"])
+        self.assertIn("Full Disk Access", state["detail"])
+
+    def test_a_later_success_clears_the_failure(self) -> None:
+        self.journal.set_state("messages", False, "denied")
+        self.journal.set_state("messages", True)
+        state = self.journal.states()["messages"]
+        self.assertTrue(state["ok"])
+        self.assertEqual(state["detail"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

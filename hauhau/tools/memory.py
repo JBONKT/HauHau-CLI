@@ -45,7 +45,49 @@ def build(cfg, audit, brain) -> list[Tool]:
         audit.log("rag_query", query=query, hits=len(hits))
         return ok(clip_text("\n".join(lines), cfg.tools.max_output_chars))
 
+    def note_lesson(args: dict) -> ToolResult:
+        """Write a how-to the moment it is learned, not at the end of the session.
+
+        The distiller runs on exit and summarises a whole conversation; this is the
+        in-turn half. When the model works out something it did not know - the flag
+        that made the command work, where the config lives - recording it now means
+        the next occurrence is a rag_query away instead of a second investigation.
+        """
+        if brain is None:
+            return fail("note_lesson: persistent memory is off (--no-brain or [brain] enabled = false)")
+        body = text(args, "lesson", required=True).strip()
+        if not body:
+            return fail("note_lesson: 'lesson' must not be empty")
+        tags = text({"tags": args.get("tags") or "lesson"}, "tags").strip()
+        try:
+            row_id, created = brain.remember("procedural", body, tags, 0.75)
+        except ValueError as exc:
+            return fail(f"note_lesson: {exc}")
+        audit.log("note_lesson", id=row_id, created=created, text=body[:200])
+        return ok(f"{'learned' if created else 'already knew'} #{row_id}: {body[:80]}")
+
     return [
+        Tool(
+            name="note_lesson",
+            description=(
+                "Record a procedure the moment you work it out - the command that finally "
+                "succeeded, the file that held the answer, the order things must be done in. "
+                "Use it when you had to look something up or try twice; the next attempt then "
+                "costs one rag_query."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "lesson": {
+                        "type": "string",
+                        "description": "one self-contained sentence, imperative: how to do it",
+                    },
+                    "tags": {"type": "string", "description": "comma-separated tags"},
+                },
+                "required": ["lesson"],
+            },
+            fn=note_lesson,
+        ),
         Tool(
             name="rag_write",
             description=(

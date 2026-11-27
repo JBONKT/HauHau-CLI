@@ -53,7 +53,7 @@ TOOLBAR_BG = "#26263a"
 PROMPT_GLYPH = "❯"  # noqa: RUF001 - the prompt glyph is deliberate
 STREAM_MIN_INTERVAL = 1 / 8  # seconds between markdown re-renders
 
-# Grouped so that /help answers "what can I do here", not "here are 21 strings".
+# Grouped so that /help answers "what can I do here", not "here are N strings".
 COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     (
         "this session",
@@ -73,6 +73,7 @@ COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         [
             ("/tools", "tools the model can call"),
             ("/show", "the last tool output in full: /show, /show 2"),
+            ("/skills", "installed skills, and where each one lives"),
         ],
     ),
     (
@@ -89,7 +90,8 @@ COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     (
         "model",
         [
-            ("/model", "backend and model status"),
+            ("/model", "list local .gguf files, or switch: /model 2"),
+
             ("/perf", "measure real tokens/second"),
         ],
     ),
@@ -100,6 +102,14 @@ COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
             ("/tune", "hill-climb threads/context for speed"),
             ("/evolve", "rewrite the system prompt, gated by /eval"),
             ("/prompt", "list prompt versions, or activate one"),
+        ],
+    ),
+    (
+        "journal",
+        [
+            ("/sync", "pull mails, messages, calls, events, reminders into the journal"),
+            ("/journal", "journal stats, or search it: /journal Dana"),
+            ("/brief", "today's digest: what arrived, what is due, what is next"),
         ],
     ),
 ]
@@ -134,6 +144,12 @@ COMMAND_USAGE: dict[str, str] = {
         "/prompt          list versions with their scores\n"
         "/prompt v2       activate a version (that is the rollback)"
     ),
+    "/sync": (
+        "/sync            pull every source into the journal\n"
+        "/sync mail calls only those two (mail, messages, calls, calendar, reminders)"
+    ),
+    "/journal": "/journal         what the journal holds\n/journal Dana    search it for 'Dana'",
+    "/brief": "/brief           today's digest: arrivals, due reminders, upcoming events",
     "/audit": "/audit           tail the last 10 audit entries\n/audit 40        the last 40",
 }
 
@@ -223,8 +239,7 @@ class StreamRenderer:
         text = self.buffer
         if not text.strip():
             return Text("", style=MUTED)
-        rendered = Markdown(text, style="none" if not self.style else self.style)
-        return rendered
+        return Markdown(text, style="none" if not self.style else self.style)
 
     def feed(self, chunk: str) -> None:
         self.buffer += chunk

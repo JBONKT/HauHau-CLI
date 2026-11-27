@@ -45,8 +45,17 @@ class TestIsoToEpoch(unittest.TestCase):
         stamp = iso_to_epoch("2026-11-26T10:30:00")
         self.assertEqual(time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp)), "2026-11-26 10:30")
 
-    def test_a_trailing_z_is_tolerated(self) -> None:
-        self.assertAlmostEqual(iso_to_epoch("2026-11-26T10:30:00Z"), iso_to_epoch("2026-11-26T10:30:00"))
+    def test_a_trailing_z_means_utc_not_local_time(self) -> None:
+        from datetime import UTC, datetime
+
+        expected = datetime(2026, 11, 26, 10, 30, tzinfo=UTC).timestamp()
+        self.assertEqual(iso_to_epoch("2026-11-26T10:30:00Z"), expected)
+
+    def test_a_numeric_offset_is_honored(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        expected = datetime(2026, 11, 26, 10, 30, tzinfo=timezone(timedelta(hours=2))).timestamp()
+        self.assertEqual(iso_to_epoch("2026-11-26T10:30:00+02:00"), expected)
 
     def test_unparseable_text_falls_back_to_now(self) -> None:
         self.assertAlmostEqual(iso_to_epoch("not a date"), time.time(), delta=5)
@@ -179,6 +188,41 @@ class TestCursorEpoch(unittest.TestCase):
             self.assertIsNone(_cursor_epoch(value))
 
 
+class TestEnsureApp(unittest.TestCase):
+    """A quit app must be started hidden instead of answering -600."""
+
+    def test_it_calls_open_with_the_background_flags(self) -> None:
+        calls: list[list[str]] = []
+        original = ingest.subprocess.run
+
+        def fake(cmd, **kwargs):
+            calls.append(cmd)
+
+            class Done:
+                returncode = 0
+
+            return Done()
+
+        ingest.subprocess.run = fake
+        try:
+            ingest._ensure_app("Calendar")
+        finally:
+            ingest.subprocess.run = original
+        self.assertEqual(calls[0][:3], ["open", "-gja", "Calendar"])
+
+    def test_a_missing_open_command_is_not_fatal(self) -> None:
+        original = ingest.subprocess.run
+
+        def boom(*_args, **_kwargs):
+            raise OSError("no open here")
+
+        ingest.subprocess.run = boom
+        try:
+            ingest._ensure_app("Mail")  # must not raise
+        finally:
+            ingest.subprocess.run = original
+
+
 class TestSyncLoop(unittest.TestCase):
     """A broken source must be reported, not crash the other four."""
 
@@ -207,10 +251,10 @@ class TestSyncLoop(unittest.TestCase):
         self.assertEqual(self.journal.cursor("mail"), "mail:1795700000")
 
     def test_one_failing_source_does_not_stop_the_others(self) -> None:
-        def broken():
+        def broken(**kwargs):
             raise SourceError("grant Full Disk Access")
 
-        def fine():
+        def fine(**kwargs):
             return Fetch([Entry("calendar", "cal:1", "event", time.time(), "Standup")], None)
 
         ingest.FETCHERS.clear()
@@ -221,7 +265,7 @@ class TestSyncLoop(unittest.TestCase):
         self.assertEqual(report["calendar"]["added"], 1)
 
     def test_an_unexpected_exception_is_reported_too(self) -> None:
-        def explode():
+        def explode(**kwargs):
             raise KeyError("boom")
 
         ingest.FETCHERS.clear()
@@ -230,7 +274,7 @@ class TestSyncLoop(unittest.TestCase):
         self.assertIn("KeyError", report["calls"]["error"])
 
     def test_a_second_sync_adds_nothing(self) -> None:
-        def fake():
+        def fake(**kwargs):
             return Fetch([Entry("mail", "mail:1", "email", time.time(), "Hello")], "mail:1")
 
         ingest.FETCHERS.clear()
@@ -240,11 +284,29 @@ class TestSyncLoop(unittest.TestCase):
         self.assertEqual(report["mail"]["added"], 0)
         self.assertEqual(self.journal.stats()["total"], 1)
 
+    def test_a_failed_source_leaves_a_note_for_status(self) -> None:
+        def broken(**_kwargs):
+            raise SourceError("grant Full Disk Access")
+
+        ingest.FETCHERS.clear()
+        ingest.FETCHERS["messages"] = broken
+        sync(self.journal)
+        self.assertFalse(self.journal.states()["messages"]["ok"])
+
+    def test_a_working_source_records_ok(self) -> None:
+        def fine(**_kwargs):
+            return Fetch([], None)
+
+        ingest.FETCHERS.clear()
+        ingest.FETCHERS["mail"] = fine
+        sync(self.journal)
+        self.assertTrue(self.journal.states()["mail"]["ok"])
+
     def test_only_the_named_sources_run(self) -> None:
         seen: list[str] = []
 
         def tracker(name: str):
-            def fetch():
+            def fetch(**kwargs):
                 seen.append(name)
                 return Fetch([], None)
 

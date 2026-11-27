@@ -13,6 +13,9 @@ hauhau = "hauhau.cli:main"
 
 [project.optional-dependencies]
 dev = ["ruff>=0.6"]
+# The --tui widget dashboard. Optional: the stream and full-screen interfaces
+# need only rich + prompt_toolkit.
+tui = ["textual>=0.80"]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -20,6 +23,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["hauhau*"]
+
+[tool.setuptools.package-data]
+hauhau = ["builtin_skills/*/SKILL.md"]
 
 [tool.ruff]
 line-length = 120

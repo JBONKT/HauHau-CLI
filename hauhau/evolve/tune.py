@@ -17,6 +17,7 @@ no improvement.
 from __future__ import annotations
 
 import json
+import os
 import re
 import statistics
 import time
@@ -210,8 +211,23 @@ def metric_for(key: str) -> str:
     return "gen" if key.startswith("model.") else "prompt"
 
 
-def _ctx_options(ram_gb: float) -> list[tuple[int, str]]:
-    """Context sizes worth trying, scaled by RAM (the KV cache lives in it)."""
+def _model_gb(cfg) -> float:
+    """Size of the configured .gguf, or 0 when it cannot be measured."""
+    path = getattr(getattr(cfg, "model", None), "gguf", "") or ""
+    try:
+        return os.path.getsize(os.path.expanduser(path)) / (1024**3)
+    except OSError:
+        return 0.0
+
+
+def _ctx_options(ram_gb: float, model_gb: float = 0.0) -> list[tuple[int, str]]:
+    """Context sizes worth trying, scaled by the RAM the KV cache can use.
+
+    The weights are resident in the same memory as the KV cache, so the tier is
+    chosen from what is left after the model, not from total RAM: on an 8 GB
+    machine a 1 GB model leaves room to try 32k where a 3.2 GB one does not.
+    """
+    ram_gb = max(0.0, ram_gb - model_gb)
     if ram_gb <= 4:
         return [(2048, "tiny RAM: smallest KV cache"), (4096, "4k context")]
     if ram_gb <= 8:
@@ -279,7 +295,7 @@ def log_tail(path: Path, offset: int = 0, limit: int = 200_000) -> str:
     """The part of a log written since ``offset`` (0 for the whole tail)."""
     try:
         size = path.stat().st_size
-        start = max(0, offset if offset else max(0, size - limit))
+        start = max(0, offset or max(0, size - limit))
         with path.open("rb") as fh:
             fh.seek(start)
             return fh.read().decode("utf-8", errors="replace")
@@ -304,7 +320,9 @@ def candidates(
             (max(2, cores), "every core"),
         ],
         "model.n_ctx": [
-            (value, why) for value, why in _ctx_options(ram_gb) if value >= ctx_floor(cfg)
+            (value, why)
+            for value, why in _ctx_options(ram_gb, _model_gb(cfg))
+            if value >= ctx_floor(cfg)
         ],
         "brain.top_k": [
             (3, "fewer memories in the prompt = faster prompt processing"),
@@ -435,6 +453,7 @@ def hill_climb(
     for option in options:
         by_key.setdefault(option.key, []).append(option)
 
+    stop_all = False
     for group in by_key.values():
         best: Candidate | None = None
         best_index: int | None = None
@@ -448,6 +467,7 @@ def hill_climb(
             except LLMError as exc:
                 result.trials.append(Trial(str(option), 0.0, time.monotonic() - started))
                 result.stopped = f"{option} failed: {exc}"
+                stop_all = True
                 break
             trial = Trial(str(option), score, time.monotonic() - started)
             result.trials.append(trial)
@@ -462,6 +482,10 @@ def hill_climb(
         if best is not None and best_index is not None:
             result.trials[best_index].adopted = True
             result.adopted.append(best)
+        if stop_all:
+            # The backend just failed; every later group would restart it and
+            # fail the same way, so end the whole search here.
+            break
     return result
 
 

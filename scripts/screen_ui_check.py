@@ -156,9 +156,14 @@ def main() -> int:
         try:
             pump(4)
             startup = snapshot()
+            early: list[str] = []
             for turn in range(1, TURNS + 1):
                 send(f"turn number {turn}\r")
                 pump(3)
+                if turn == 1:
+                    # The tool lines of the first turn: later turns may scroll
+                    # them out of the fixed frame, which is the point of it.
+                    early = snapshot()
             after = snapshot()
             send("\x1b[5~")  # PgUp
             pump(1.5)
@@ -179,13 +184,14 @@ def main() -> int:
             server.shutdown()
 
     transcript = "\n".join(after)
+    everything = "\n".join(after + early)
     checks = {
         "fixed size, no terminal scroll": len(startup) == ROWS
         and all(len(line) <= COLS for line in startup),
         "header on the first row": "Hauhau" in startup[0] and "ctx" in startup[0],
         "input pinned to the last row": startup[-1].strip().startswith("❯"),  # noqa: RUF001
         "turns stream into the chat": f"turn number {TURNS}" in transcript,
-        "tool call and result shown": "⚙ shell" in transcript and "✓ stub-tool-ran" in transcript,
+        "tool call and result shown": "⚙ shell" in everything and "✓ stub-tool-ran" in everything,
         "old turns leave the fixed frame": transcript.count("turn number") < TURNS + 2,
         "PgUp scrolls inside the frame": scrolled != after and "Hauhau" in scrolled[0],
         "typing returns to the newest line": f"turn number {TURNS}" in "\n".join(back),

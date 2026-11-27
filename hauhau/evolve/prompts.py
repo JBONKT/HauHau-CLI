@@ -110,8 +110,8 @@ class PromptStore:
         if not self.index_path.is_file():
             return []
         entries: list[dict] = []
-        for line in self.index_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
+        for raw in self.index_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
             if not line:
                 continue
             try:

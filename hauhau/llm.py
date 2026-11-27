@@ -149,7 +149,13 @@ class LlamaClient:
         req = self._request("/v1/chat/completions", payload)
         if not stream:
             with self._open(req) as resp:
-                return self._parse_full(json.loads(resp.read().decode("utf-8")))
+                raw = resp.read().decode("utf-8")
+            try:
+                return self._parse_full(json.loads(raw))
+            except json.JSONDecodeError as exc:
+                # A proxy error page or a non-llama server answers 200 with HTML;
+                # surface it as LLMError so the CLI shows a panel, not a traceback.
+                raise LLMError(f"backend returned non-JSON ({len(raw)} bytes): {raw[:200]!r}") from exc
         with self._open(req) as resp:
             return self._parse_stream(resp, on_token, on_reasoning)
 
@@ -212,6 +218,59 @@ class LlamaClient:
             for i, tc in enumerate(raw)
         ]
 
+    def _stream_event(
+        self,
+        out: Completion,
+        event: dict,
+        pending: dict[int, dict],
+        on_token: Callable[[str], None] | None,
+        on_reasoning: Callable[[str], None] | None,
+    ) -> None:
+        """Fold one SSE event into ``out``; ignore anything of another shape."""
+        if "timings" in event:
+            out.usage.tok_per_second = self._rate(event["timings"], "predicted_per_second")
+            out.usage.prompt_per_second = self._rate(event["timings"], "prompt_per_second")
+        usage = event.get("usage")
+        if isinstance(usage, dict) and usage:
+            out.usage.prompt_tokens = usage.get("prompt_tokens", out.usage.prompt_tokens)
+            out.usage.completion_tokens = usage.get("completion_tokens", out.usage.completion_tokens)
+        choices = event.get("choices") or []
+        if not isinstance(choices, list):
+            return
+        choice = choices[0] if choices else {}
+        if not isinstance(choice, dict):
+            return
+        if choice.get("finish_reason"):
+            out.finish_reason = choice["finish_reason"]
+        delta = choice.get("delta") or {}
+        if not isinstance(delta, dict):
+            return
+        if delta.get("content"):
+            out.content += delta["content"]
+            if on_token:
+                on_token(delta["content"])
+        if delta.get("reasoning_content"):
+            out.reasoning += delta["reasoning_content"]
+            if on_reasoning:
+                on_reasoning(delta["reasoning_content"])
+        for call in delta.get("tool_calls") or []:
+            if isinstance(call, dict):
+                self._stream_call(pending, call)
+
+    @staticmethod
+    def _stream_call(pending: dict[int, dict], call: dict) -> None:
+        """Tool calls arrive in pieces: id and name once, arguments by fragment."""
+        slot = pending.setdefault(
+            call.get("index", len(pending)), {"id": "", "name": "", "args": ""}
+        )
+        if call.get("id"):
+            slot["id"] = call["id"]
+        function = call.get("function") or {}
+        if function.get("name"):
+            slot["name"] += function["name"]
+        if function.get("arguments"):
+            slot["args"] += function["arguments"]
+
     def _parse_full(self, data: dict) -> Completion:
         choice, msg = self._shape(data)
         calls = self._calls(msg.get("tool_calls"))
@@ -254,47 +313,8 @@ class LlamaClient:
                 event = json.loads(chunk)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(event, dict):
-                continue
-            if "timings" in event:
-                out.usage.tok_per_second = self._rate(event["timings"], "predicted_per_second")
-                out.usage.prompt_per_second = self._rate(event["timings"], "prompt_per_second")
-            usage = event.get("usage")
-            if isinstance(usage, dict) and usage:
-                out.usage.prompt_tokens = usage.get("prompt_tokens", out.usage.prompt_tokens)
-                out.usage.completion_tokens = usage.get(
-                    "completion_tokens", out.usage.completion_tokens
-                )
-            choices = event.get("choices") or []
-            if not isinstance(choices, list):
-                continue
-            choice = choices[0] if choices else {}
-            if not isinstance(choice, dict):
-                continue
-            if choice.get("finish_reason"):
-                out.finish_reason = choice["finish_reason"]
-            delta = choice.get("delta") or {}
-            if not isinstance(delta, dict):
-                continue
-            if delta.get("content"):
-                out.content += delta["content"]
-                if on_token:
-                    on_token(delta["content"])
-            if delta.get("reasoning_content"):
-                out.reasoning += delta["reasoning_content"]
-                if on_reasoning:
-                    on_reasoning(delta["reasoning_content"])
-            for tc in delta.get("tool_calls") or []:
-                if not isinstance(tc, dict):
-                    continue
-                slot = pending.setdefault(tc.get("index", len(pending)), {"id": "", "name": "", "args": ""})
-                if tc.get("id"):
-                    slot["id"] = tc["id"]
-                fn = tc.get("function") or {}
-                if fn.get("name"):
-                    slot["name"] += fn["name"]
-                if fn.get("arguments"):
-                    slot["args"] += fn["arguments"]
+            if isinstance(event, dict):
+                self._stream_event(out, event, pending, on_token, on_reasoning)
         out.tool_calls = [
             ToolCall(id=slot["id"] or f"call_{i}", name=slot["name"], arguments=slot["args"])
             for i, slot in sorted(pending.items())

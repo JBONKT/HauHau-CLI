@@ -29,6 +29,7 @@ from __future__ import annotations
 import io
 import re
 import threading
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import Any
@@ -45,7 +46,7 @@ from rich.console import Console as RichConsole
 
 from .agent import Usage
 from .tools import ToolResult
-from .ui import ACCENT, MUTED_HEX, result_preview, summarize_args
+from .ui import ACCENT, MUTED_HEX, TOOLBAR_BG, result_preview, summarize_args
 
 # prompt_toolkit parses its own inline styles: hex colours and "ansi..." names.
 # Rich's names ("green", "grey58") are rejected here - they became, of all
@@ -66,7 +67,63 @@ STYLE_HEADER = f"bold fg:{ACCENT}"
 STYLE_STATUS = f"fg:{STYLE_MUTED}"
 STYLE_PROMPT = f"bold fg:{ACCENT}"
 
+# The chat frame. A box only reads as a chat window when its edges are quiet, so
+# the border is the dimmest thing on screen and the conversation is the only
+# high-contrast content.
+FRAME = "#3b4261"
+STYLE_FRAME = f"fg:{FRAME}"
+STYLE_FRAME_TITLE = f"fg:{MUTED_HEX}"
+# A user message is a bubble: its own background, right-aligned, so the eye can
+# separate "what was said" from "what was answered" without reading the text.
+BUBBLE_BG = "#2f334d"
+STYLE_BUBBLE = f"bg:{BUBBLE_BG} fg:#c8d3f5"
+STYLE_BAR = f"bg:{TOOLBAR_BG} fg:{MUTED_HEX}"
+STYLE_BAR_NAME = f"bg:{TOOLBAR_BG} bold fg:{ACCENT}"
+STYLE_BAR_KEY = f"bg:{TOOLBAR_BG} fg:{MUTED_HEX}"
+
+# Fragments whose style starts with this prefix are right-aligned bubbles. The
+# wrapper consumes the marker; it must never reach the renderer, which would
+# reject an unknown style attribute.
+RIGHT = "@right@"
+
+# Width below which the frame is dropped: on a narrow terminal two columns of
+# border cost more than they communicate.
+FRAME_MIN_WIDTH = 56
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+# A tool result renders as one line: preview plus "+N lines · /show". The budget
+# counts the indent and the "+N lines" suffix too, so at 90 columns - the width
+# of the framed window in a 94-column terminal - the row never reflows.
+PREVIEW_CHARS = 80
+
 _TOKEN = re.compile(r"\S+\s*|\s+")
+
+
+def _wrap_words(text: str, limit: int) -> list[str]:
+    """Greedy word wrap to ``limit`` columns, breaking words that cannot fit."""
+    words = text.split()
+    if not words:
+        return [""]
+    lines: list[str] = []
+    current = ""
+    for original in words:
+        word = original
+        while len(word) > limit:
+            if current:
+                lines.append(current)
+                current = ""
+            lines.append(word[:limit])
+            word = word[limit:]
+        if not current:
+            current = word
+        elif len(current) + 1 + len(word) <= limit:
+            current = f"{current} {word}"
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines or [""]
 
 
 class _Wrapper:
@@ -132,6 +189,9 @@ class _Wrapper:
 
     def _feed(self, fragments: list[tuple[str, str]]) -> None:
         for style, text in fragments:
+            if style.startswith(RIGHT):
+                self._feed_right(style[len(RIGHT) :], text)
+                continue
             for index, part in enumerate(text.split("\n")):
                 if index:
                     self._newline()
@@ -142,6 +202,30 @@ class _Wrapper:
                         self._wrap_word(style, word)
                     if pad and self.col + len(pad) <= self.width:
                         self._emit(style, pad)
+
+    def _feed_right(self, style: str, text: str) -> None:
+        """Wrap a bubble to at most 78% of the width and right-align each line.
+
+        Alignment happens here and not at append time because ``self.width`` is
+        only known during a repaint; a resize re-wraps the fragments, so the
+        bubbles follow the new edge instead of staying where they were drawn.
+        """
+        limit = max(12, min(self.width - 2, int(self.width * 0.78)))
+        for index, part in enumerate(text.split("\n")):
+            if index:
+                self._newline()
+            for segment_index, segment in enumerate(_wrap_words(part, limit)):
+                if segment_index:
+                    self._newline()
+                self._align_right(style, segment)
+
+    def _align_right(self, style: str, text: str) -> None:
+        inner = f" {text} "
+        pad = max(0, self.width - len(inner))
+        if pad:
+            self._emit("", " " * pad)
+        self._emit(style, inner)
+        self.col = self.width  # nothing else fits; force a newline next
 
     def _wrap_word(self, style: str, word: str) -> None:
         if self.col and self.col + len(word) > self.width:
@@ -198,6 +282,7 @@ class ScreenUI:
         self.ui_thread_id: int | None = None
         self._stream_open = False
         self._reasoning_open = False
+        self._after_tool = False
 
         self._router = _Router(self)
         self.console = RichConsole(
@@ -288,6 +373,11 @@ class ScreenUI:
             if not self._stream_open:
                 self._close_block()
                 self._break_line()
+                if self._after_tool:
+                    # Breathing room between "what the tool did" and "what it
+                    # means"; without it the answer reads as tool output.
+                    self._push("", "\n")
+                    self._after_tool = False
             self._stream_open = True
             self._push(STYLE_ANSWER, text)
 
@@ -321,15 +411,23 @@ class ScreenUI:
 
     def tool_result(self, name: str, result: ToolResult) -> None:
         preview, more = result_preview(result)
+        suffix = f"  +{more} lines · /show" if more else ""
+        # One line per result. The wrapper would otherwise reflow a long preview
+        # into three ragged rows and push the "+N lines" hint away from it.
+        budget = max(20, PREVIEW_CHARS - len(suffix))
+        if len(preview) > budget:
+            preview = preview[: budget - 1].rstrip() + "…"
+        style = STYLE_TOOL_OUT if result.ok else STYLE_ERROR
 
         def draw() -> None:
             self._close_block()
             self.recent.append((name, result))
             self._break_line()
+            self._after_tool = True
             self._push(STYLE_OK if result.ok else STYLE_ERR, f"    {'✓' if result.ok else '✗'} ")
-            self._push(STYLE_TOOL_OUT if result.ok else STYLE_ERROR, preview)
-            if more:
-                self._push(f"fg:{STYLE_MUTED}", f"  +{more} lines · /show")
+            self._push(style, preview)
+            if suffix:
+                self._push(STYLE_NOTE, suffix)
 
         self._call(draw)
         self.invalidate()
@@ -364,9 +462,9 @@ class ScreenUI:
     def echo(self, text: str) -> None:
         def draw() -> None:
             self._close_block()
-            self._push(STYLE_USER_MARK, "\n❯ ")  # noqa: RUF001 - the prompt glyph
-            self._push(STYLE_USER, text)
-            self._push("", "\n")
+            self._break_line()
+            self._push(RIGHT + STYLE_BUBBLE, text)
+            self._push("", "\n\n")
 
         self._call(draw)
         self.invalidate()
@@ -394,6 +492,7 @@ class ScreenApp:
         self.should_exit = should_exit
         self.stats = stats
         self._chat_height = (0, 0)  # (wrapped lines, window rows) of the last frame
+        self._running = False
         self._wrapper = _Wrapper()
 
         # multiline must be False: prompt_toolkit 3.0.53 defaults Buffer to
@@ -446,30 +545,24 @@ class ScreenApp:
             dont_extend_height=True,
             wrap_lines=False,
         )
+        self.chat_window = Window(
+            FormattedTextControl(self._chat_view, show_cursor=False),
+            wrap_lines=False,
+        )
         status_window = Window(
             FormattedTextControl(self._status, show_cursor=False),
             height=1,
             dont_extend_height=True,
             wrap_lines=False,
         )
-        self.chat_window = Window(
-            FormattedTextControl(self._chat_view, show_cursor=False),
-            wrap_lines=False,
-        )
-        hint_window = Window(
-            FormattedTextControl(self._hint, show_cursor=False),
-            height=1,
-            dont_extend_height=True,
-            wrap_lines=False,
-        )
         glyph_window = Window(
-            FormattedTextControl(lambda: "… " if self.ui.busy else "❯ "),  # noqa: RUF001 - the prompt glyph
+            FormattedTextControl(self._glyph),
             width=2,
             wrap_lines=False,
         )
         input_window = Window(BufferControl(buffer=self.input_buffer), wrap_lines=False, dont_extend_height=True)
         body = HSplit(
-            [header_window, status_window, self.chat_window, hint_window, VSplit([glyph_window, input_window])]
+            [header_window, self.chat_window, status_window, VSplit([glyph_window, input_window])]
         )
 
         self.app = Application(
@@ -538,23 +631,75 @@ class ScreenApp:
         return 100, 24
 
     def _chat_rows(self) -> int:
-        """Rows left for the transcript once the chrome is taken out."""
-        return max(3, self._output_size()[1] - 4)
+        """Rows for the whole chat area, frame included (header, status, input)."""
+        return max(3, self._output_size()[1] - 3)
+
+    def _framed(self) -> bool:
+        return self._output_size()[0] >= FRAME_MIN_WIDTH
+
+    def _rule(self, left: str, right: str, width: int, title: str = "") -> str:
+        """A horizontal frame edge exactly ``width`` cells wide."""
+        if not title:
+            return left + "─" * max(0, width - 2) + right
+        label = f" {title} "
+        return left + label + "─" * max(0, width - 2 - len(label)) + right
+
+    def _frame_title(self, start: int, total: int, window: int) -> str:
+        if self.ui.follow or total <= window:
+            return "hauhau"
+        # Off the bottom: say where we are, in the same terms the keys use.
+        return f"scrolled · {start + window}/{total}"
 
     def _chat_view(self) -> list[tuple[str, str]]:
-        """The one screenful of transcript the window shows."""
-        width = self._output_size()[0]
-        height = self._chat_rows()
-        lines = self._wrapper.wrap(self.ui.fragments, max(8, width))
-        self._chat_height = (len(lines), height)
-        bottom = max(0, len(lines) - height)
+        """The one screenful of transcript the window shows, inside its frame."""
+        width, _ = self._output_size()
+        rows = self._chat_rows()
+        framed = self._framed()
+        inner = max(8, width - 4) if framed else max(8, width)
+        lines = self._wrapper.wrap(self.ui.fragments, inner)
+        window = max(1, rows - 2) if framed else rows
+        self._chat_height = (len(lines), window)
+        bottom = max(0, len(lines) - window)
         start = bottom if self.ui.follow else max(0, min(self.ui.scroll_offset, bottom))
-        visible: list[tuple[str, str]] = []
-        for index, line in enumerate(lines[start : start + height]):
+
+        visible: list[list[tuple[str, str]]] = []
+        if framed:
+            visible.append(
+                [
+                    (
+                        STYLE_FRAME,
+                        self._rule("╭", "╮", width, self._frame_title(start, len(lines), window)),
+                    )
+                ]
+            )
+        for offset in range(window):
+            index = start + offset
+            line = lines[index] if index < len(lines) else None
+            if not framed:
+                if line is not None:
+                    visible.append(line)
+                continue
+            if line is None:
+                # Pad so the frame's bottom edge sits on the last row of the
+                # window; an unpadded box would close right under the text and
+                # float in the middle of the screen.
+                visible.append([(STYLE_FRAME, "│" + " " * (width - 2) + "│")])
+                continue
+            used = sum(len(text) for _style, text in line)
+            row: list[tuple[str, str]] = [(STYLE_FRAME, "│ ")]
+            row.extend(line)
+            row.append((STYLE_FRAME, " " * max(0, inner - used) + " │"))
+            visible.append(row)
+        if framed:
+            position = f"{start + 1}-{min(start + window, len(lines))} of {len(lines)}"
+            visible.append([(STYLE_FRAME, self._rule("╰", "╯", width, position))])
+
+        flat: list[tuple[str, str]] = []
+        for index, row in enumerate(visible):
             if index:
-                visible.append(("", "\n"))
-            visible.extend(line)
-        return visible
+                flat.append(("", "\n"))
+            flat.extend(row)
+        return flat
 
     def _bottom(self) -> int:
         content, window = self._chat_height
@@ -592,33 +737,49 @@ class ScreenApp:
         self.invalidate()
 
     # --- the chrome -------------------------------------------------------
+    def _width(self) -> int:
+        return self._output_size()[0]
+
     def _header(self) -> list[tuple[str, str]]:
+        """One bar across the top: who is talking, on what, and how big it is."""
         try:
             stats = self.stats()
         except Exception:
             stats = {}
-        parts: list[tuple[str, str]] = [(STYLE_HEADER, f" {stats.get('name', 'Hauhau')} ")]
-        for label, value in (
-            ("model", stats.get("model")),
-            ("ctx", stats.get("ctx")),
-            ("threads", stats.get("threads")),
-            ("ram", stats.get("ram")),
-            ("dir", stats.get("workspace")),
-        ):
-            if value:
-                parts.append((STYLE_STATUS, f"· {label} {value} "))
+        parts: list[tuple[str, str]] = [
+            (STYLE_BAR, " "),
+            (STYLE_BAR_NAME, str(stats.get("name", "Hauhau"))),
+        ]
+        chips = [
+            (label, stats[key])
+            for label, key in (
+                ("model", "model"),
+                ("ctx", "ctx"),
+                ("threads", "threads"),
+                ("ram", "ram"),
+                ("dir", "workspace"),
+                ("mem", "memories"),
+            )
+            if stats.get(key)
+        ]
+        for label, value in chips:
+            parts.append((STYLE_BAR, f" · {label} {value}"))
+        used = sum(len(text) for _style, text in parts)
+        parts.append((STYLE_BAR, " " * max(0, self._width() - used - 1)))
+        parts.append((STYLE_BAR, " "))
         return parts
 
     def _status(self) -> list[tuple[str, str]]:
+        """Left: what the agent is doing. Right: the keys worth knowing."""
         ui = self.ui
+        width = self._width()
         if ui.busy:
-            return [
-                (f"bold fg:{ACCENT}", f" {ui.busy_label or 'working…'}"),
-                (STYLE_STATUS, " · Ctrl-C restarts the backend"),
-            ]
-        usage = ui.last_usage
-        metrics: list[str] = []
-        if usage is not None:
+            left = f" {SPINNER[int(time.monotonic() * 12) % len(SPINNER)]} {ui.busy_label or 'working…'}"
+            left_style = f"fg:{ACCENT}"
+            right = "Ctrl-C stops "
+        elif ui.last_usage is not None:
+            usage = ui.last_usage
+            metrics: list[str] = []
             if ui.last_elapsed:
                 metrics.append(f"{ui.last_elapsed:.1f}s")
             if usage.completion_tokens:
@@ -627,17 +788,41 @@ class ScreenApp:
                 metrics.append(f"{usage.tok_per_second:.0f} tok/s")
             if usage.prompt_tokens:
                 metrics.append(f"prompt {usage.prompt_tokens}")
-        parts: list[tuple[str, str]] = (
-            [(STYLE_STATUS, " " + " · ".join(metrics))] if metrics else [(STYLE_STATUS, " ready")]
-        )
-        parts.append((STYLE_STATUS, " · /help for commands · Ctrl-D exits · PgUp/PgDn scrolls"))
-        return parts
+            left = " " + (" · ".join(metrics) if metrics else "ready")
+            left_style = STYLE_STATUS
+            right = "/help · PgUp scrolls · Ctrl-D quits "
+        else:
+            left = " ready"
+            left_style = STYLE_STATUS
+            right = "/help · PgUp scrolls · Ctrl-D quits "
+        if not ui.follow:
+            right = "scrolled up · PgDn or type to return "
+        gap = max(1, width - len(left) - len(right))
+        return [(left_style, left), (STYLE_STATUS, " " * gap), (STYLE_STATUS, right)]
 
-    def _hint(self) -> list[tuple[str, str]]:
-        if self.ui.follow:
-            return [(STYLE_STATUS, f" {self.stats().get('state', 'ready')} · write a message and press Enter")]
-        return [(STYLE_STATUS, " scrolled up - press PgDn or type to jump back to the newest line")]
+    def _glyph(self) -> list[tuple[str, str]]:
+        if self.ui.busy:
+            return [(STYLE_STATUS, "… ")]
+        return [(STYLE_PROMPT, "❯ ")]  # noqa: RUF001 - the prompt glyph
+
+    def _animate(self) -> None:
+        """Repaint while a turn runs, so the spinner turns.
+
+        ``Application(refresh_interval=...)`` repaints unconditionally, which
+        cost ~4% CPU on an idle M1 Air waiting for a keystroke. The transcript
+        invalidates itself on every fragment; the spinner is the only thing that
+        needs a clock, so the clock only runs while a turn is in flight.
+        """
+        while self._running:
+            time.sleep(0.1)
+            if self.ui.busy:
+                self.invalidate()
 
     def run(self) -> None:
         self.ui.ui_thread_id = threading.get_ident()
-        self.app.run()
+        self._running = True
+        threading.Thread(target=self._animate, daemon=True).start()
+        try:
+            self.app.run()
+        finally:
+            self._running = False

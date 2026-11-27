@@ -90,7 +90,98 @@ def _self_spawn(cmd: str) -> str | None:
             if pattern.match(segment):
                 return segment
     return None
+
+
+def _refusal(cfg, audit, cmd: str, confirm) -> ToolResult | None:
+    """Why this command must not run, or None. Never runs anything itself."""
+    hit = _denylist_hit(cmd, cfg.tools.denylist)
+    if hit:
+        audit.log("shell.denied", cmd=cmd, pattern=hit)
+        return fail(f"shell: NOT RUN - the command was blocked by denylist pattern {hit!r}.")
+    spawned = _self_spawn(cmd)
+    if spawned:
+        audit.log("shell.denied", cmd=cmd, why="would start another agent")
+        return fail(
+            f"shell: NOT RUN - {spawned!r} starts a second copy of this agent, which "
+            "loads another model and can recurse. Read config.toml with read_file, or "
+            "ask for the slash command in the conversation instead."
+        )
+    if not cfg.tools.shell_confirm:
+        return None
+    if confirm is None:
+        # Asking is the configured behaviour; with nobody to ask, the only safe
+        # answer is no.
+        audit.log("shell.denied", cmd=cmd, why="confirmation required but none available")
+        return fail(
+            "shell: NOT RUN - this session requires confirmation, but no prompt is "
+            "available to ask. Nothing executed; do not report any output."
+        )
+    if not confirm(cmd):
+        audit.log("shell.declined", cmd=cmd)
+        return fail(
+            "shell: NOT RUN - the user declined this command. Nothing executed; "
+            "do not report any output."
+        )
     return None
+
+
+def _collect(proc, deadline: float, limit: int) -> tuple[bytes | None, bool, bool, int]:
+    """Read the child's output until it exits or the deadline passes.
+
+    Returns (output, timed_out, background, dropped). ``output`` is None when the
+    pipe could not be read at all. The loop stops appending at ``limit`` bytes:
+    buffering everything a chatty command writes meant gigabytes in memory before
+    the single clip that happens after the process exits.
+    """
+    chunks: list[bytes] = []
+    kept = dropped = 0
+    timed_out = background = False
+    stream = proc.stdout
+    if stream is None:  # stdout=PIPE guarantees one; keep mypy honest
+        _kill_tree(proc)
+        return None, False, False, 0
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # The deadline can pass in the same breath as the exit.
+                timed_out = proc.poll() is None
+                break
+            ready, _, _ = select.select([stream], [], [], min(0.2, remaining))
+            if not ready:
+                if proc.poll() is not None:
+                    # The command finished and nothing is buffered: stop here rather
+                    # than waiting for an unrelated process to close the pipe.
+                    background = True
+                    break
+                continue
+            data = os.read(stream.fileno(), 65536)
+            if not data:
+                break
+            room = limit - kept
+            if room >= len(data):
+                chunks.append(data)
+                kept += len(data)
+            elif room > 0:
+                chunks.append(data[:room])
+                kept += room
+                dropped += len(data) - room
+            else:
+                dropped += len(data)
+    except BaseException:
+        # The child runs in its own session, so the terminal's Ctrl-C never
+        # reaches it: without this, an interrupted build or `sleep 600` kept
+        # running after the user stopped the turn. Reap it too, or the Popen
+        # object is collected while its child is still alive.
+        _kill_tree(proc)
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            proc.wait(timeout=2)
+        raise
+    finally:
+        # Drained or killed, the descriptor goes back now; leaving it to the GC
+        # leaked one fd per shell call (ResourceWarning: unclosed file).
+        stream.close()
+    return b"".join(chunks), timed_out, background, dropped
 
 
 def build(
@@ -115,35 +206,9 @@ def build(
             cwd = str(cfg.workspace)
         timeout = number(args, "timeout", cfg.tools.shell_timeout, minimum=0.1, maximum=3600.0)
 
-        hit = _denylist_hit(cmd, cfg.tools.denylist)
-        if hit:
-            audit.log("shell.denied", cmd=cmd, pattern=hit)
-            return fail(
-                f"shell: NOT RUN - the command was blocked by denylist pattern {hit!r}."
-            )
-        spawned = _self_spawn(cmd)
-        if spawned:
-            audit.log("shell.denied", cmd=cmd, why="would start another agent")
-            return fail(
-                f"shell: NOT RUN - {spawned!r} starts a second copy of this agent, which "
-                "loads another model and can recurse. Read config.toml with read_file, or "
-                "ask for the slash command in the conversation instead."
-            )
-        if cfg.tools.shell_confirm:
-            if confirm is None:
-                # Asking is the configured behaviour; with nobody to ask, the
-                # only safe answer is no.
-                audit.log("shell.denied", cmd=cmd, why="confirmation required but none available")
-                return fail(
-                    "shell: NOT RUN - this session requires confirmation, but no prompt is "
-                    "available to ask. Nothing executed; do not report any output."
-                )
-            if not confirm(cmd):
-                audit.log("shell.declined", cmd=cmd)
-                return fail(
-                    "shell: NOT RUN - the user declined this command. Nothing executed; "
-                    "do not report any output."
-                )
+        refusal = _refusal(cfg, audit, cmd, confirm)
+        if refusal is not None:
+            return refusal
 
         try:
             proc = subprocess.Popen(
@@ -165,31 +230,11 @@ def build(
         # started by the command (or by the shell profile) inherited our stdout
         # and the call blocked for the full timeout - the interactive REPL hung
         # on its first `shell` call while a piped run of the same command was fine.
-        chunks: list[bytes] = []
-        deadline = started + timeout
-        timed_out = False
-        background = False
-        stream = proc.stdout
-        if stream is None:  # stdout=PIPE guarantees one; keep mypy honest
-            _kill_tree(proc)
+        output, timed_out, background, dropped = _collect(
+            proc, started + timeout, max(4096, cfg.tools.max_output_chars * 4)
+        )
+        if output is None:
             return fail("shell: could not capture the command's output")
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                # The deadline can pass in the same breath as the exit.
-                timed_out = proc.poll() is None
-                break
-            ready, _, _ = select.select([stream], [], [], min(0.2, remaining))
-            if ready:
-                data = os.read(stream.fileno(), 65536)
-                if not data:
-                    break
-                chunks.append(data)
-            elif proc.poll() is not None:
-                # The command finished and nothing is buffered: stop here rather
-                # than waiting for an unrelated process to close the pipe.
-                background = True
-                break
         if timed_out:
             _kill_tree(proc)
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
@@ -203,16 +248,18 @@ def build(
         # the process itself is not an OSError if it overruns: TimeoutExpired is a
         # SubprocessError, and it used to escape the tool as a crash.
         try:
-            proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            proc.wait(timeout=max(0.1, started + timeout - time.monotonic()))
         except subprocess.TimeoutExpired:
             _kill_tree(proc)
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 proc.wait(timeout=2)
 
         duration = time.monotonic() - started
-        output = b"".join(chunks).decode("utf-8", "replace")
+        text_out = output.decode("utf-8", "replace")
         audit.log("shell", cmd=cmd, cwd=cwd, exit=proc.returncode, duration=round(duration, 3))
-        body = clip_text(output.rstrip(), cfg.tools.max_output_chars)
+        body = clip_text(text_out.rstrip(), cfg.tools.max_output_chars)
+        if dropped:
+            body += f"\n(the command wrote {dropped} more bytes; the rest was not kept)"
         result = f"exit={proc.returncode}\n{body}" if body else f"exit={proc.returncode}\n(no output)"
         if background:
             # The shell exited while a background process may still be writing.

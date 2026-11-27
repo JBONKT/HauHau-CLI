@@ -12,6 +12,7 @@ The loop is a plain OpenAI-style tool-call cycle. Two model-specific guards:
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,148 @@ from typing import Any
 from .llm import Completion, LlamaClient, LLMError, Usage
 from .tools import Registry, ToolResult, fail
 from .util import estimate_messages_tokens, estimate_tokens
+
+# --- autonomy -------------------------------------------------------------
+# Two things a small model does instead of working: ask the user for something it
+# could have looked up, or announce that it cannot do the task and stop. Both are
+# answerable inside the turn, so the loop nudges and continues rather than handing
+# the problem back. The rules are spelled out because a 2B model does not infer
+# "be autonomous" from one personality sentence.
+AUTONOMY_RULES = """\
+Work independently, and ask only as a last resort.
+- Missing a fact? Get it yourself: run the command, read `--help` or the man page,
+  grep the repo, find the file, or rag_query your own notes. Never ask for
+  something you can look up in one step.
+- Ambiguous request? Pick the most likely reading, do it, and state the assumption
+  in one short line ("assuming X"). Ask only when the action would destroy or
+  publish something.
+- Cannot do it? Do not stop at "I can't". Work out what is missing, learn it in
+  this turn - look it up, try it, read the error - and finish the job. Once it
+  works, record it with note_lesson so the next attempt is instant."""
+
+
+NUDGE_AMBIGUOUS = (
+    "You asked the user a question instead of acting. Do not ask again. Choose the most likely "
+    "reading of their request, carry it out with tools now, and state the assumption in one line. "
+    "Ask only when the action would destroy or publish something."
+)
+NUDGE_ACT = (
+    "You printed a command for the user to copy instead of running it. Run it yourself with the "
+    "shell tool now and report the result. If it would install, uninstall, delete or overwrite "
+    "something, say which command and why you stopped, and ask once - otherwise just run it."
+)
+NUDGE_STUCK = (
+    "You said you cannot do this. Do not stop there: work out what you are missing, look it up "
+    "yourself (run the command with --help, read the man page, grep the repo, rag_query your own "
+    "notes), try it, and finish the task. Then record what you learned with note_lesson."
+)
+
+# A refusal only reads as one at the start of a sentence and in the agent's own
+# voice. Matched anywhere, "the build said unable to find crate, then I fixed it"
+# and "du kan köra make om den inte är installerad" both looked like a refusal and
+# spent a step telling the model to go and finish work it had already finished.
+_EN_CANNOT = (
+    "i cannot",
+    "i can't",
+    "i can not",
+    "i'm unable to",
+    "i am unable to",
+    "unable to",
+    "not able to",
+    "i don't know how",
+    "i do not know how",
+    "i have no access",
+    "i don't have access",
+)
+
+# Swedish puts the pronoun inside the modal ("det kan jag inte"), so the subject
+# is optional and the phrase is matched by shape rather than by position.
+_SV_CANNOT = re.compile(
+    r"^(?:det |den |det här |jag |vi ){0,2}(?:kan|vet|har)\b[^.!?]{0,25}\binte\b"
+    r"|^jag saknar\b"
+)
+
+# Code spans, quotes and fenced blocks are evidence being described, not the
+# agent's own claim.
+_QUOTED = re.compile(r"```[\s\S]*?```|`[^`]*`|\"[^\"\n]*\"|'[^'\n]*'")
+_SENTENCE = re.compile(r"[^.!?\n]+")
+_LEAD = " \t-*•\u2013123456789.)>#"
+
+
+def asks_instead_of_acting(text: str) -> bool:
+    """A short reply that is nothing but a question hands the turn back.
+
+    An answer with a closing offer ("Klart, filen är borta. Vill du att jag
+    återställer den?") is an answer: only a reply whose every sentence asks
+    something is treated as one the user has to finish.
+    """
+    body = (text or "").strip()
+    if not body.endswith("?"):
+        return False
+    # A long answer that happens to end in "?" is an answer, not a question.
+    if len(body) > 300 or len(body.split()) > 45:
+        return False
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", body) if part.strip()]
+    return bool(sentences) and all(part.endswith("?") for part in sentences)
+
+
+_FENCED = re.compile(r"```[ \t]*([A-Za-z0-9_+-]*)[ \t]*\r?\n([\s\S]*?)```")
+_INLINE = re.compile(r"`([^`\n]+)`")
+_SHELL_LANGS = frozenset({"", "bash", "sh", "shell", "zsh", "console", "terminal", "fish"})
+
+# Enough of a whitelist to recognise a pasted command without flagging a file
+# name, a tool name or a phrase in backticks.
+_COMMAND_WORDS = """
+    awk bash brew cat cd chmod chown cp crontab curl cut defaults df dig diskutil
+    docker du echo env export find git grep head htop ifconfig kill kubectl launchctl
+    ln ls lsof make md5 mdfind mdls mkdir mount mv netstat node npm open patch pbpaste
+    pbcopy perl pgrep ping pip pkill pmset ps pytest python python3 readlink rm rsync
+    scp sed sh sleep sort source ssh stat sudo sw_vers sysctl system_profiler tail
+    tar tee top touch tr uname unzip vi wc wget which whoami xargs xattr yq zip
+"""
+
+_COMMANDS = frozenset(_COMMAND_WORDS.split())
+
+
+def _looks_like_command(code: str) -> bool:
+    for raw in code.splitlines():
+        line = raw.strip().lstrip("$ ").strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        first = parts[0].casefold()
+        if first in _COMMANDS:
+            return True
+        # "pmset -g" style: an unknown verb with a short flag is still a command.
+        return any(part.startswith("-") and 1 < len(part) <= 6 for part in parts[1:])
+    return False
+
+
+def commands_to_run(text: str) -> bool:
+    """Whether the reply pastes a shell command instead of executing it.
+
+    A small model answers "let's check" and quotes `du -sh *` - inline, or in a
+    fence with or without a language tag - leaving the work to the user. A pasted
+    command is only legitimate when it changes the system, and the nudge tells the
+    model to run it unless that is the case.
+    """
+    body = text or ""
+    for lang, code in _FENCED.findall(body):
+        if lang.casefold() in _SHELL_LANGS and _looks_like_command(code):
+            return True
+    return any(_looks_like_command(span) for span in _INLINE.findall(body))
+
+
+def says_it_cannot(text: str) -> bool:
+    """Whether the reply is a refusal dressed up as a finished answer."""
+    plain = _QUOTED.sub(" ", text or "")
+    for sentence in _SENTENCE.findall(plain):
+        stripped = sentence.strip(_LEAD).casefold()
+        if not stripped:
+            continue
+        if stripped.startswith(_EN_CANNOT) or _SV_CANNOT.search(stripped):
+            return True
+    return False
 
 
 class UI:
@@ -45,6 +188,7 @@ class Agent:
         audit=None,
         ui: UI | None = None,
         on_confirm=None,
+        skills: list | None = None,
     ) -> None:
         self.cfg = cfg
         self.client = client
@@ -53,10 +197,14 @@ class Agent:
         self.audit = audit
         self.ui = ui or UI()
         self.on_confirm = on_confirm
+        self.skills = skills or []
         self.messages: list[dict[str, Any]] = []
         self.summary = ""
         self.last_completion: Completion | None = None
         self._turn_usage = Usage()
+        self._nudge: str | None = None
+        self.nudges_this_turn = 0
+        self._tool_failed = False
 
     # --- prompt --------------------------------------------------------
     def system_prompt(self, query: str = "") -> str:
@@ -70,8 +218,20 @@ class Agent:
             "authoritative. If a command fails, read the error and adapt - do not repeat the same "
             "call. Keep final answers to a few lines unless asked for detail."
         )
+        if getattr(a, "autonomy", True):
+            parts.append(AUTONOMY_RULES)
+        if self._nudge:
+            # The nudge lives for exactly one request, so it cannot leak into the
+            # rest of the conversation or into the session summary.
+            parts.append(self._nudge)
         if self.brain is not None and self.cfg.brain.enabled:
             block = self.brain.context_block(query or self._last_user_text())
+            if block:
+                parts.append(block)
+        if self.skills:
+            from .skills import prompt_block
+
+            block = prompt_block(self.skills)
             if block:
                 parts.append(block)
         if self.summary:
@@ -98,6 +258,7 @@ class Agent:
 
     def _request(self, query: str, with_tools: bool) -> tuple[list[dict], list[dict] | None]:
         messages = [{"role": "system", "content": self.system_prompt(query)}, *self.messages]
+        self._nudge = None  # spent on this request
         return messages, (self.registry.schemas() if with_tools else None)
 
     # --- turn ----------------------------------------------------------
@@ -113,7 +274,16 @@ class Agent:
             self.ui.turn_end(self._turn_usage, time.monotonic() - started)
 
     def _run_steps(self, user_text: str) -> str:
+        self.nudges_this_turn = 0
+        self._tool_failed = False
+        # A nudge left over from a turn that was interrupted would otherwise be
+        # injected into the first request of the next one.
+        self._nudge = None
         for _ in range(self.cfg.agent.max_steps):
+            # Tool results are the bulk of what grows the context; checking only
+            # once per turn let a long tool loop overrun n_ctx mid-turn and the
+            # backend answered 400, killing the whole turn.
+            self.compress_if_needed()
             completion = self._chat(user_text, with_tools=True, stream=True)
             if completion.tool_calls:
                 self._record_assistant(completion)
@@ -126,15 +296,59 @@ class Agent:
             text = completion.content.strip()
             self.messages.append({"role": "assistant", "content": text})
             self._warn_if_truncated(completion)
+            if self._nudge_needed(text):
+                continue
             return text
 
         self.ui.status(f"step budget ({self.cfg.agent.max_steps}) reached - answering without tools")
         self.ui.newline()
+        # This call has no tools, so a nudge set by the last step ("carry it out
+        # with tools now") could not be obeyed and would only confuse the answer.
+        self._nudge = None
         completion = self._chat(user_text, with_tools=False, stream=True)
         text = completion.content.strip()
         self.messages.append({"role": "assistant", "content": text})
         self._warn_if_truncated(completion)
         return text
+
+    def _nudge_needed(self, text: str) -> bool:
+        """Whether to spend one more step instead of handing the turn back.
+
+        A small model answers "vill du att jag kollar diskarna?" or "det kan jag
+        inte" and stops - and the user, who asked for the thing to be *done*, has
+        to reply "ja, gör det". One nudge turns that into the work. Capped so a
+        model that keeps asking cannot loop, and skipped once a tool has failed:
+        then the question is about a real obstacle and the user must see it.
+        """
+        if not getattr(self.cfg.agent, "autonomy", True):
+            return False
+        if self._tool_failed:
+            # A tool already failed in this turn: whatever the model says now is
+            # about a real obstacle, and the user must get to see it.
+            return False
+        if self.nudges_this_turn >= 2:
+            return False
+        reason: str | None = None
+        if says_it_cannot(text):
+            reason = NUDGE_STUCK
+        elif commands_to_run(text):
+            reason = NUDGE_ACT
+        elif asks_instead_of_acting(text):
+            reason = NUDGE_AMBIGUOUS
+        if reason is None:
+            return False
+        self.nudges_this_turn += 1
+        self._nudge = reason
+        if self.audit:
+            # Visible in audit.jsonl, so "is it thinking for itself?" has an answer.
+            self.audit.log(
+                "nudge",
+                kind={NUDGE_STUCK: "stuck", NUDGE_ACT: "act"}.get(reason, "ambiguous"),
+                count=self.nudges_this_turn,
+                text=text[:200],
+            )
+        self.ui.status("not asking - working out what was meant and doing it")
+        return True
 
     def _warn_if_truncated(self, completion: Completion) -> None:
         """Never let a cut-off answer look complete."""
@@ -184,34 +398,57 @@ class Agent:
 
     def _execute(self, call, truncated: bool = False) -> None:
         self.ui.tool_call(call.name, call.arguments)
+        try:
+            result = self._call_tool(call, truncated)
+        except BaseException:
+            # The assistant message that announced this call is already in the
+            # history, so unwinding without a matching tool message leaves a
+            # transcript every later request rejects. Answer the call, then pass
+            # the interrupt on - Ctrl-C must still stop the turn.
+            self._append_tool_result(
+                call, fail(f"{call.name}: interrupted before it finished, nothing was reported")
+            )
+            raise
+        self._append_tool_result(call, result)
+
+    def _call_tool(self, call, truncated: bool) -> ToolResult:
         tool = self.registry.get(call.name)
         if truncated:
-            result = fail(
+            return fail(
                 f"{call.name}: this call was cut off at the {self.cfg.generation.max_tokens}-token "
                 "limit, so its arguments are incomplete and it was NOT run. Retry with less content "
                 "per call (for example write_file in several smaller writes)."
             )
-        elif tool is None:
-            result = fail(f"unknown tool {call.name!r}; available: {', '.join(self.registry.names())}")
-        else:
-            try:
-                args = call.parsed()
-            except LLMError as exc:
-                result = fail(str(exc))
-            else:
-                try:
-                    result = tool.run(args)
-                except Exception as exc:  # a tool crash must not kill the turn
-                    result = fail(f"{call.name} crashed: {exc.__class__.__name__}: {exc}")
-                if not isinstance(result, ToolResult):
-                    result = fail(f"{call.name} returned {type(result).__name__}, not a ToolResult")
-        content = result.clipped(self.cfg.tools.max_output_chars)
+        if tool is None:
+            return fail(f"unknown tool {call.name!r}; available: {', '.join(self.registry.names())}")
+        try:
+            args = call.parsed()
+        except LLMError as exc:
+            return fail(str(exc))
+        try:
+            result = tool.run(args)
+        except Exception as exc:  # a tool crash must not kill the turn
+            return fail(f"{call.name} crashed: {exc.__class__.__name__}: {exc}")
+        if not isinstance(result, ToolResult):
+            return fail(f"{call.name} returned {type(result).__name__}, not a ToolResult")
+        return result
+
+    def _append_tool_result(self, call, result: ToolResult) -> None:
+        if not result.ok:
+            self._tool_failed = True
         self.messages.append(
-            {"role": "tool", "tool_call_id": call.id, "name": call.name, "content": content}
+            {
+                "role": "tool",
+                "tool_call_id": call.id,
+                "name": call.name,
+                "content": result.clipped(self.cfg.tools.max_output_chars),
+            }
         )
         self.ui.tool_result(call.name, result)
         if self.audit:
-            self.audit.log("tool", name=call.name, ok=result.ok, args=call.arguments[:400])
+            # Arguments arrive as a string normally, but a model can send an
+            # object: slicing that raised KeyError out of the whole turn.
+            self.audit.log("tool", name=call.name, ok=result.ok, args=str(call.arguments)[:400])
 
     # --- context management --------------------------------------------
     def summary_cap_tokens(self) -> int:
@@ -226,10 +463,10 @@ class Agent:
     def compress_if_needed(self, force: bool = False) -> bool:
         a = self.cfg.agent
         budget = a.context_budget_tokens
-        used = estimate_messages_tokens(self.messages) + estimate_tokens(self.summary)
         # Fold an oversized summary first: trimming messages cannot help when
         # the summary alone is over budget, and that was a permanent dead end.
         folded = self._cap_summary()
+        used = estimate_messages_tokens(self.messages) + estimate_tokens(self.summary)
         if not force and used <= budget:
             return folded
         cut = self._safe_split(a.keep_recent_turns * 2)
@@ -294,10 +531,10 @@ class Agent:
         if not boundaries:
             return 0
         target = max(0, len(self.messages) - keep)
-        for index in boundaries:
-            if index >= target:
-                return index
-        return boundaries[0]
+        # The latest boundary that still keeps `keep` messages: taking the first
+        # one at or after the target kept a single message where ten were meant.
+        late = [index for index in boundaries if index <= target]
+        return late[-1] if late else boundaries[0]
 
     def _summarise(self, dropped: list[dict]) -> str:
         transcript = []

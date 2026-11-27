@@ -32,7 +32,7 @@ sys.path.insert(0, str(ROOT))
 
 from hauhau import config as config_mod  # noqa: E402
 from hauhau.brief import compose  # noqa: E402
-from hauhau.ingest import FETCHERS, SourceError, sync  # noqa: E402
+from hauhau.ingest import FETCHERS, sync  # noqa: E402
 from hauhau.journal import Journal  # noqa: E402
 
 LABEL_SYNC = "com.hauhau.sync"
@@ -134,15 +134,19 @@ def status() -> int:
         for label in (LABEL_SYNC, LABEL_BRIEF):
             target = agents_dir() / f"{label}.plist"
             print(f"{label}: {'installed' if target.exists() else 'not installed'}")
-        print("cursors:", info["cursors"] or "none")
-        # A permission problem is invisible until something tries to read.
+        # Recorded by the last real sync: probing here would take a minute
+        # (Mail has to launch) and would leave the permissions untested when
+        # nobody is watching.
+        states = journal.states()
+        print("sources (from the last sync — run --once to re-test):")
         for name in FETCHERS:
-            try:
-                result = sync(journal, [name])
-                error = result[name].get("error")
-                print(f"  {name:<10} " + (f"FAILS: {error}" if error else "readable"))
-            except SourceError as exc:
-                print(f"  {name:<10} FAILS: {exc}")
+            state = states.get(name)
+            if state is None:
+                print(f"  {name:<10} never synced")
+            elif state["ok"]:
+                print(f"  {name:<10} ok")
+            else:
+                print(f"  {name:<10} FAILS: {state['detail'][:120]}")
     finally:
         journal.close()
     return 0

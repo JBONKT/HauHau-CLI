@@ -33,6 +33,7 @@ def _snapshot(cfg, audit, path: Path) -> None:
     dest = dest_dir / f"{stamp}_{path.name}"
     # exists()-then-copy let two writers pick the same name and clobber each
     # other's pre-image; O_EXCL reserves the name first.
+    reserved: Path | None = None
     for counter in range(1000):
         dest = dest_dir / (f"{stamp}_{path.name}" if counter == 0 else f"{stamp}-{counter}_{path.name}")
         try:
@@ -40,9 +41,15 @@ def _snapshot(cfg, audit, path: Path) -> None:
         except FileExistsError:
             continue
         os.close(handle)
+        reserved = dest
         break
-    shutil.copy2(path, dest)
-    audit.log("snapshot", path=str(path), copy=str(dest))
+    if reserved is None:
+        # Every name was taken in the same second; skipping beats clobbering
+        # another writer's pre-image with copy2.
+        audit.log("snapshot_skipped", path=str(path), reason="1000 name collisions in one second")
+        return
+    shutil.copy2(path, reserved)
+    audit.log("snapshot", path=str(path), copy=str(reserved))
 
 
 def _read_window(path: Path, offset: int, limit: int) -> tuple[list[str], bool]:
@@ -120,7 +127,8 @@ def build(cfg, audit) -> list[Tool]:
             return fail(f"write_file: {exc}")
         written = len(content.encode("utf-8"))
         audit.log("write_file", path=str(path), bytes=written, existed=existed)
-        # Characters, not bytes: "日本語" was reported as 3 bytes and is 9.
+        # Bytes, not characters: "日本語" is 3 characters and 9 bytes, and the
+        # report used to say 3 while the file on disk was 9 bytes larger.
         return ok(f"wrote {written} bytes to {path}" + ("" if existed else " (new file)"))
 
     def edit_file(args: dict) -> ToolResult:

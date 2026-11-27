@@ -238,8 +238,8 @@ def _merge_tags(old: str, new: str, limit: int = 400) -> str:
     tag ("...tag056,t") into the row.
     """
     parts = [p.strip() for p in (old or "").split(",") if p.strip()]
-    for part in (new or "").split(","):
-        part = part.strip()
+    for raw in (new or "").split(","):
+        part = raw.strip()
         if part and part not in parts:
             parts.append(part)
     kept: list[str] = []

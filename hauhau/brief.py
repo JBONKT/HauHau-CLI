@@ -44,9 +44,12 @@ def _short(row, width: int = 92) -> str:
     return f"  {when} {label}{body}"[:width]
 
 
-def compose(journal: Journal, cfg, *, now: float | None = None, lookahead_days: int = 2) -> str:
+def compose(journal: Journal, cfg, *, now: float | None = None, lookahead_days: int | None = None) -> str:
     """The brief for today, as plain text."""
     now = time.time() if now is None else now
+    if lookahead_days is None:
+        journal_cfg = getattr(cfg, "journal", None) if cfg is not None else None
+        lookahead_days = int(getattr(journal_cfg, "brief_lookahead_days", 2))
     start = midnight(now)
     today = journal.between(start, now + 1, limit=400)
     tally = counts(today)
